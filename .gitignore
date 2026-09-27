@@ -1,0 +1,17 @@
+# Standalone checkout build products and local caches.
+/build*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/DartConfiguration.tcl
+/Testing/
+/Makefile
+/compile_commands.json
+*.o
+*.a
+*.so
+*.so.*
+*.log
+/.cache/
+/tests/results/
