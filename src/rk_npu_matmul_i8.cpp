@@ -722,6 +722,23 @@ int rknpu2_matmul_open::detail::run_i8(rk_npu_ctx* ctx, rk_npu_matmul_i8_plan* p
 
 namespace rknpu2_matmul_open::detail {
 
+int export_i8_n_group(const rk_npu_matmul_i8_plan* plan, int group,
+                       std::vector<I8GemmBody>& bodies) {
+    if (!plan || !plan->prebound_core_mask || group < 0)
+        return RK_NPU_ERR_PARAM;
+    const int groups = ceil_div(align_up(plan->cfg.N, 32), plan->n_tile);
+    if (group >= groups) return RK_NPU_ERR_PARAM;
+    const int count = plan->num_tasks / groups;
+    for (int ti = group * count; ti < (group + 1) * count; ++ti) {
+        I8GemmBody body;
+        body.regs.assign(plan->cmd + plan->base[ti],
+                         plan->cmd + plan->base[ti] + plan->body_size[ti]);
+        body.weight_offset = plan->weight_off[ti];
+        bodies.push_back(std::move(body));
+    }
+    return RK_NPU_OK;
+}
+
 static void patch_dcomp(rk_npu_matmul_i8_plan* plan, int ti,
                         const I8CompressedTile* tile) {
     const int base = plan->base[ti], addr = plan->dcomp_idx[ti];

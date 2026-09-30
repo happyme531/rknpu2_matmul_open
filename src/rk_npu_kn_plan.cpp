@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <type_traits>
 
 namespace rknpu2_matmul_open::detail {
 
@@ -45,6 +46,9 @@ int query_i8_kn_memory(const I8KnPlanConfig& config, I8KnMemoryInfo* out) {
         config.npu_core_mask == 5u || config.npu_core_mask == 6u ||
         config.timeout_ms == 0)
         return RK_NPU_ERR_PARAM;
+    // No signed INT32 overflow even for -128 * -128 in every term.
+    if ((config.npu_reduce && (config.M > 128 || config.K > 131071)) ||
+        (config.npu_dequant && !config.npu_reduce)) return RK_NPU_ERR_PARAM;
 
     const int align_n = std::max(MIN_CHANNEL_TILE,
                                  align_up(config.N, MIN_CHANNEL_TILE));
@@ -56,6 +60,7 @@ int query_i8_kn_memory(const I8KnPlanConfig& config, I8KnMemoryInfo* out) {
     I8KnMemoryInfo info{};
     uint64_t max_input_bytes = 0;
     uint64_t max_output_bytes = 0;
+    uint64_t gemm_commands = 0, gemm_tasks = 0;
     for (int offset = 0; offset < config.K; offset += config.k_tile) {
         const int kt = std::min(config.k_tile, config.K - offset);
         const rk_npu_matmul_i8_config mm = make_wave_config(config, kt);
@@ -66,15 +71,24 @@ int query_i8_kn_memory(const I8KnPlanConfig& config, I8KnMemoryInfo* out) {
         max_output_bytes = std::max(max_output_bytes, sizes.output_bytes);
         info.weight_bytes += sizes.weight_bytes;
         info.control_bytes += sizes.regcmd_bytes + sizes.task_bytes;
+        gemm_commands += sizes.regcmd_bytes;
+        gemm_tasks += sizes.task_bytes;
         ++info.wave_count;
         info.workspace_buffer_count += 2; /* regcmd + task for this wave */
     }
-    const uint32_t input_slots = std::min<uint32_t>(info.wave_count, 2);
+    const uint32_t input_slots = config.npu_reduce ? info.wave_count : std::min<uint32_t>(info.wave_count, 2);
     const uint32_t output_slots = std::min<uint32_t>(info.wave_count, 3);
     info.input_bytes = max_input_bytes * input_slots;
     info.output_bytes = max_output_bytes * output_slots;
     info.workspace_buffer_count += input_slots + output_slots;
     info.weight_buffer_count = 1; /* one packed-B arena per matrix */
+    if (config.npu_reduce) {
+        uint64_t control = 0, data = 0;
+        I8DpuChain::memory(config, gemm_commands, gemm_tasks, control, data);
+        info.control_bytes += control;
+        info.output_bytes += data;
+        info.workspace_buffer_count += 2 + (config.npu_dequant ? 2 : 0);
+    }
     *out = info;
     return RK_NPU_OK;
 }
@@ -106,6 +120,9 @@ I8KnPlan::~I8KnPlan() {
 
 int I8KnPlan::prepare(rk_npu_iommu_domain* domain,
                       const I8KnPlanConfig& config) {
+    I8KnMemoryInfo memory{};
+    if (query_i8_kn_memory(config, &memory) != RK_NPU_OK)
+        return RK_NPU_ERR_PARAM;
     if (!domain || !domain->ctx || ctx_ || config.M <= 0 || config.N <= 0 ||
         config.K <= 0 || config.k_tile <= 0 || config.k_tile > config.K ||
         config.n_tile <= 0 || config.npu_core_mask == 0 ||
@@ -144,7 +161,8 @@ int I8KnPlan::prepare(rk_npu_iommu_domain* domain,
         max_output_bytes = std::max(max_output_bytes, wave.sizes.output_bytes);
         offset += wave.kt;
     }
-    input_slot_count_ = std::min(count, 2);
+    input_slot_count_ = config_.npu_reduce ? count : std::min(count, 2);
+    input_slot_.resize(size_t(input_slot_count_));
     output_slot_count_ = std::min(count, 3);
     for (int slot = 0; rc == RK_NPU_OK && slot < input_slot_count_; ++slot)
         rc = input_slot_[slot].alloc(domain_, max_input_bytes);
@@ -163,8 +181,72 @@ int I8KnPlan::prepare(rk_npu_iommu_domain* domain,
             wave.plan, &wave.input, &wave.output, config_.npu_core_mask);
     }
     if (rc == RK_NPU_OK) wave_packed_.assign((size_t)count, 0);
+    if (rc == RK_NPU_OK && config_.npu_reduce) {
+        std::vector<rk_npu_matmul_i8_plan*> plans;
+        std::vector<rk_npu_mem> outputs;
+        for (auto& w : waves_) {
+            plans.push_back(w.plan);
+            outputs.push_back(w.output);
+            slice_k0_.push_back(w.k0);
+            slice_k_.push_back(w.kt);
+            slice_align_in_.push_back(align_up(w.kt, MIN_CHANNEL_TILE));
+            slice_dst_.push_back(static_cast<int8_t*>(w.input.vaddr));
+        }
+        chain_ = std::make_unique<I8DpuChain>();
+        rc = chain_->prepare(domain_, config_, plans, outputs);
+    }
     if (rc != RK_NPU_OK) release();
     return rc;
+}
+
+template<class T>
+int I8KnPlan::pack_chain_dynamic_impl(const T* A_rowmajor) {
+    if (!ctx_ || !chain_ || !A_rowmajor || waves_.empty())
+        return RK_NPU_ERR_PARAM;
+    std::fill(wave_packed_.begin(), wave_packed_.end(), 0);
+    int rc = RK_NPU_OK;
+    for (auto& slot : input_slot_) {
+        rc = slot.begin_cpu_write();
+        if (rc != RK_NPU_OK) break;
+    }
+    if (rc == RK_NPU_OK) {
+        const bool normal = config_.a_layout == RK_NPU_I8_A_LAYOUT_NORMAL;
+        if constexpr (std::is_same<T, uint16_t>::value) {
+            if (normal)
+                cpu::i8_pack_a_f16_dynamic_normal_split(config_.M, config_.K,
+                    wave_count(), slice_k0_.data(), slice_k_.data(), slice_align_in_.data(),
+                    A_rowmajor, a_scale_.data(), slice_dst_.data());
+            else
+                cpu::i8_pack_a_f16_dynamic_native_split(config_.M, config_.K,
+                    wave_count(), slice_k0_.data(), slice_k_.data(), slice_align_in_.data(),
+                    A_rowmajor, a_scale_.data(), slice_dst_.data(), a_panel_width());
+        } else {
+            if (normal)
+                cpu::i8_pack_a_f32_dynamic_normal_split(config_.M, config_.K,
+                    wave_count(), slice_k0_.data(), slice_k_.data(), slice_align_in_.data(),
+                    A_rowmajor, a_scale_.data(), slice_dst_.data());
+            else
+                cpu::i8_pack_a_f32_dynamic_native_split(config_.M, config_.K,
+                    wave_count(), slice_k0_.data(), slice_k_.data(), slice_align_in_.data(),
+                    A_rowmajor, a_scale_.data(), slice_dst_.data(), a_panel_width());
+        }
+    }
+    // Close every opened access interval, including on an earlier failure.
+    for (auto& slot : input_slot_) {
+        const int end_rc = slot.end_cpu_access();
+        if (rc == RK_NPU_OK) rc = end_rc;
+    }
+    if (rc == RK_NPU_OK)
+        std::fill(wave_packed_.begin(), wave_packed_.end(), 1);
+    return rc;
+}
+
+int I8KnPlan::pack_chain_dynamic(const uint16_t* A_rowmajor) {
+    return pack_chain_dynamic_impl(A_rowmajor);
+}
+
+int I8KnPlan::pack_chain_dynamic(const float* A_rowmajor) {
+    return pack_chain_dynamic_impl(A_rowmajor);
 }
 
 int I8KnPlan::pack_wave_i8_impl(Wave &wave, const int8_t *A_rowmajor) {
@@ -437,7 +519,27 @@ int I8KnPlan::output_slot_for_wave(int wave) const {
 }
 
 int I8KnPlan::input_slot_for_wave(int wave) const {
-    return wave & 1;
+    return config_.npu_reduce ? wave : wave & 1;
+}
+
+int I8KnPlan::run_chain(const I8KnWeights& weights, const float* a_scale,
+                        const float* w_scale, bool dequant) {
+    if (!chain_ || !weights.compatible(*this) || weights.compressed())
+        return RK_NPU_ERR_PARAM;
+    for (auto packed : wave_packed_) if (!packed) return RK_NPU_ERR_PARAM;
+    for (auto& input : input_slot_) {
+        int rc = input.end_cpu_access();
+        if (rc != RK_NPU_OK) return rc;
+    }
+    for (int slot = 0; slot < output_slot_count_; ++slot) {
+        int rc = output_slot_[slot].end_cpu_access();
+        if (rc != RK_NPU_OK) return rc;
+    }
+    return chain_->run(weights, a_scale, w_scale, dequant);
+}
+
+int I8KnPlan::copy_dequant(void* output, bool fp16) {
+    return chain_ ? chain_->copy_dequant(output, fp16) : RK_NPU_ERR_PARAM;
 }
 
 int I8KnPlan::begin_wave_output_cpu_read(int wave) {
@@ -477,6 +579,7 @@ int I8KnPlan::unpack_partial_i32(int wave_index,
 int I8KnPlan::release() {
     if (!ctx_) return RK_NPU_OK;
     int rc = RK_NPU_OK;
+    chain_.reset();
     for (auto it = waves_.rbegin(); it != waves_.rend(); ++it) {
         Wave& wave = *it;
         if (wave.plan) free_i8_plan(wave.plan);
@@ -492,7 +595,12 @@ int I8KnPlan::release() {
         if (rc == RK_NPU_OK && r != RK_NPU_OK) rc = r;
     }
     a_scale_.clear();
+    input_slot_.clear();
     wave_packed_.clear();
+    slice_k0_.clear();
+    slice_k_.clear();
+    slice_align_in_.clear();
+    slice_dst_.clear();
     ctx_ = nullptr;
     release_domain(domain_);
     domain_ = nullptr;

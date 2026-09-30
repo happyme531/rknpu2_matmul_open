@@ -15,6 +15,9 @@ Two executables sweep the `int8 × int8 → fp32` matmul over a wide M / N / K g
 | `test_cpu_kernels` | host-only correctness/perf check for the OpenMP A/B pack and C/D unpack kernels; use `--perf` for microbench output |
 | `test_batch` | verifies batched same-shape BMM and compares B single submits vs one batched submit |
 | `test_batch_f16` | verifies distinct-weight FP16 BMM, N/M tiling, output tails, and multicore submission |
+| `test_mm --cpu` / `--board` | FP16/BF16 MM/BMM: transpose/strides, broadcast, split-K, typed packed B reuse, device mode, conversion/range and ownership; only `--cpu` is registered with CTest |
+| `test_mm_tf32 --cpu` / `--board` | TF32 dtype with FP32 containers/output: byte-exact packing oracle, K16 tails, multi-core/BMM/split-K, truncation boundaries, ranges and mixed-weight rejection |
+| `test_mm_header_c` | new raw MM/BMM header alongside legacy C headers |
 | `bench_f16` | explicit FP16 shape benchmark with normal/native A/D, cacheable memory, batch, multicore, N tiling, and split-K |
 | `test_quant_matmul` | board correctness smoke for typed APIs, weight/workspace sharing, mismatch/BUSY guards, 100 domain switches, and autotuners |
 | `tune_quant_matmul` | CLI for single-call pipelined autotuning of `i8i8i32`, dynamic `f16i8f16`, or static-per-token `f16i8f16` |

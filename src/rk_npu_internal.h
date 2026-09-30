@@ -238,6 +238,15 @@ int query_i8_n_tiled(const rk_npu_matmul_i8_config* cfg, int n_tile,
 rk_npu_matmul_i8_plan* prepare_i8_n_tiled(
     rk_npu_iommu_domain* domain, const rk_npu_matmul_i8_config* cfg, int n_tile);
 
+/* Copy one prebound N group's existing GEMM recipe for a mixed task chain.
+ * B stays relocatable; A/C addresses and all layout registers are preserved. */
+struct I8GemmBody {
+    std::vector<uint64_t> regs;
+    uint64_t weight_offset = 0;
+};
+int export_i8_n_group(const rk_npu_matmul_i8_plan* plan, int group,
+                       std::vector<I8GemmBody>& bodies);
+
 void retain_domain(rk_npu_iommu_domain* domain);
 void release_domain(rk_npu_iommu_domain* domain);
 

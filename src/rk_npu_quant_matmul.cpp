@@ -6,6 +6,7 @@
 #include "rk_npu_internal.h"
 #include "rk_npu_kn_plan.h"
 #include "rk_npu_dcomp.h"
+#include "rk_npu_moe_regs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -50,7 +51,7 @@ constexpr uint64_t AUTOTUNE_SEED = 0x726b6e70755f6938ull;
 constexpr uint32_t AUTOTUNE_CACHE_FORMAT_VERSION = 2;
 /* TODO(tuning-cache-revision): bump whenever candidate generation, validation,
  * production pipeline behavior, or CPU kernels change strategy selection. */
-constexpr uint32_t AUTOTUNE_CACHE_TUNING_REVISION = 3; // fixed resources and panel recipes
+constexpr uint32_t AUTOTUNE_CACHE_TUNING_REVISION = 5; // fused chain input packing and scale cache
 constexpr const char* AUTOTUNE_CACHE_MAGIC = "rk_npu_matmul_tuning_cache_v2";
 
 double us_since(Clock::time_point t0) {
@@ -129,6 +130,19 @@ bool supported_op_kind(rk_npu_matmul_op_kind kind) {
     return op_traits(kind).valid;
 }
 
+// Read at workspace/tuner creation. Existing workspaces never change backend
+// when an environment variable changes. No public strategy ABI change.
+uint32_t execution_mode(rk_npu_matmul_op_kind kind) {
+    auto enabled = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value && std::strcmp(value, "1") == 0;
+    };
+    const bool dequant = kind != RK_NPU_MATMUL_I8I8I32 &&
+        enabled("RK_NPU_W8A8_NPU_DEQUANT");
+    return (enabled("RK_NPU_I8_NPU_REDUCE") || dequant ? 1u : 0u) |
+           (dequant ? 2u : 0u);
+}
+
 bool valid_weight_config(const rk_npu_matmul_weight_config* config) {
     return config && config->K > 0 && config->N > 0 &&
            config->k_tile > 0 && config->k_tile <= config->K;
@@ -188,6 +202,9 @@ bool make_cache_key(rk_npu_ctx* ctx,
                     AutotuneCacheKey& key) {
     if (!ctx || !valid_config(cfg) || !supported_op_kind(kind)) return false;
     key.driver_version = ctx->driver_version;
+    // Serialize and hash the backend along with the tuning revision, including
+    // explicit cache paths. CPU/reduce/dequant never reuse each other's scores.
+    key.tuning_revision |= execution_mode(kind) << 16;
     key.op_kind = (int)kind;
     key.M = cfg->M;
     key.N = cfg->N;
@@ -373,6 +390,9 @@ rknpu2_matmul_open::detail::I8KnPlanConfig plan_config(const rk_npu_matmul_strat
     cfg.timeout_ms = timeout_ms;
     cfg.a_layout = (rk_npu_matmul_i8_a_layout)s.a_layout;
     cfg.c_layout = (rk_npu_matmul_i8_c_layout)((int)s.c_layout + 1);
+    const uint32_t mode = execution_mode(s.op_kind);
+    cfg.npu_reduce = (mode & 1u) != 0;
+    cfg.npu_dequant = (mode & 2u) != 0;
     return cfg;
 }
 
@@ -656,7 +676,7 @@ public:
     ~SingleRunner() { stop(); }
 
     int start() {
-        int rc = npu_.start();
+        int rc = plan_->config().npu_reduce ? RK_NPU_OK : npu_.start();
         if (rc != RK_NPU_OK) return rc;
         try {
             worker_ = std::thread(&SingleRunner::worker_main, this);
@@ -801,6 +821,44 @@ private:
                     rknpu2_matmul_open::cpu::ActivationOp::None, job.C_f32, plan_->c_panel_width());
             }
         };
+
+        if (plan_->config().npu_reduce) {
+            if (job.weights->compressed()) return RK_NPU_ERR_PARAM;
+            if (traits.quant == QuantKind::Dynamic) {
+                const auto input0 = Clock::now();
+                rc = traits.input == HostDType::F16
+                    ? plan_->pack_chain_dynamic(job.A_f16)
+                    : plan_->pack_chain_dynamic(job.A_f32);
+                metrics.input_us += us_since(input0);
+            } else {
+                for (int w = 0; w < waves && rc == RK_NPU_OK; ++w) rc = pack(w);
+            }
+            if (rc != RK_NPU_OK) return rc;
+            const float* scale = traits.quant == QuantKind::Dynamic
+                               ? plan_->a_scale() : job.a_scale;
+            const auto npu0 = Clock::now();
+            rc = plan_->run_chain(*job.weights, scale, job.w_scale,
+                                   plan_->config().npu_dequant);
+            metrics.npu_us += us_since(npu0);
+            if (rc != RK_NPU_OK) return rc;
+            if (plan_->config().npu_dequant) {
+                const auto output0 = Clock::now();
+                rc = plan_->copy_dequant(traits.output == HostDType::F16
+                    ? static_cast<void*>(job.C_f16) : static_cast<void*>(job.C_f32),
+                    traits.output == HostDType::F16);
+                metrics.output_us += us_since(output0); // includes final cache sync
+                return rc;
+            }
+            const auto sync0 = Clock::now();
+            rc = plan_->begin_wave_output_cpu_read(0);
+            metrics.sync_us += us_since(sync0);
+            if (rc != RK_NPU_OK) return rc;
+            const int32_t* final[] = {plan_->partial_i32(0)};
+            const auto output0 = Clock::now();
+            write_output(1, final);
+            metrics.output_us += us_since(output0);
+            return plan_->end_wave_output_cpu_access(0);
+        }
 
         rc = pack(0);
         if (rc == RK_NPU_OK) rc = submit(0);
@@ -1080,6 +1138,31 @@ int autotune_impl(rk_npu_ctx *ctx, const rk_npu_matmul_autotune_config *cfg,
     }
     if (kind == RK_NPU_MATMUL_I8I8I32 && !equal_i32(exact_reference, expected.i32))
         return RK_NPU_ERR_PARAM;
+    if (anchor.config().npu_dequant) {
+        // Independent CPU oracle for the explicitly selected FP16-scale
+        // contract. Never validate DPU dequant solely against another DPU run.
+        try {
+            const float* a_scale = op_traits(kind).quant == QuantKind::Dynamic
+                                 ? anchor.a_scale() : data.a_scale.data();
+            for (int m = 0; m < cfg->M; ++m) {
+                const float sa = rknpu2_matmul_open::moe::half_value(
+                    rknpu2_matmul_open::moe::half_bits(a_scale[m]));
+                for (int n = 0; n < cfg->N; ++n) {
+                    const float sw = rknpu2_matmul_open::moe::half_value(
+                        rknpu2_matmul_open::moe::half_bits(data.w_scale[n]));
+                    const size_t i = size_t(m) * cfg->N + n;
+                    const float value = (float(exact_reference[i]) * sa) * sw;
+                    expected.f32[i] = value;
+#if defined(__aarch64__)
+                    const __fp16 half = value;
+#else
+                    const _Float16 half = value;
+#endif
+                    std::memcpy(&expected.f16[i], &half, 2);
+                }
+            }
+        } catch (const std::exception&) { return RK_NPU_ERR_PARAM; }
+    }
     if (cfg->verbose)
         std::fprintf(stderr, "autotune: fixed npu=0x%x cpu=0x%llx/%d anchor Kt=%d Nt=%d\n",
                      npu_mask, (unsigned long long)cpu_mask, cpu_count, anchor_kt, anchor_s.n_tile);

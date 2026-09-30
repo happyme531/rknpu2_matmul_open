@@ -3,6 +3,7 @@
 
 #include "rk_npu_internal.h"
 #include "rk_npu_matmul.h"
+#include "rk_npu_i8_dpu_chain.h"
 
 #include <cstdint>
 #include <vector>
@@ -22,6 +23,8 @@ struct I8KnPlanConfig {
     uint32_t timeout_ms = 500;
     rk_npu_matmul_i8_a_layout a_layout = RK_NPU_I8_A_LAYOUT_NORMAL;
     rk_npu_matmul_i8_c_layout c_layout = RK_NPU_I8_C_LAYOUT_NATIVE_N4_M4;
+    bool npu_reduce = false;
+    bool npu_dequant = false; // explicit FP16 coefficient precision opt-in
 };
 
 struct I8KnWeightConfig {
@@ -72,7 +75,14 @@ public:
     int pack_wave_f32_dynamic(int wave, const float* A_fp32_rowmajor);
     int pack_wave_f32_static(int wave, const float* A_fp32_rowmajor,
                              const float* per_token_scale);
+    // Device chains retain every A slice, so dynamic quantization can pack
+    // them together in one OpenMP region without changing any slice layout.
+    int pack_chain_dynamic(const uint16_t* A_fp16_rowmajor);
+    int pack_chain_dynamic(const float* A_fp32_rowmajor);
     int run_wave(int wave, const I8KnWeights& weights);
+    int run_chain(const I8KnWeights& weights, const float* a_scale,
+                   const float* w_scale, bool dequant);
+    int copy_dequant(void* output, bool fp16);
     int begin_wave_output_cpu_read(int wave);
     int begin_wave_output_cpu_readwrite(int wave);
     int end_wave_output_cpu_access(int wave);
@@ -110,13 +120,15 @@ private:
     int input_slot_for_wave(int wave) const;
     int output_slot_for_wave(int wave) const;
     int pack_wave_i8_impl(Wave& wave, const int8_t* A_rowmajor);
+    template<class T> int pack_chain_dynamic_impl(const T* A_rowmajor);
 
     rk_npu_ctx* ctx_ = nullptr;
     rk_npu_iommu_domain* domain_ = nullptr;
     I8KnPlanConfig config_{};
     std::vector<Wave> waves_;
     /* Two A slots let the CPU pack wave i+1 while the NPU reads wave i. */
-    DomainDataBuffer input_slot_[2];
+    // The CPU pipeline uses two slots; a device chain retains all K inputs.
+    std::vector<DomainDataBuffer> input_slot_;
     int input_slot_count_ = 0;
     /* ACC plus two ping-pong partials.  Separate dma-bufs are required so a
      * CPU access interval on one partial can overlap an NPU write to another. */
@@ -124,6 +136,9 @@ private:
     int output_slot_count_ = 0;
     std::vector<float> a_scale_;
     std::vector<uint8_t> wave_packed_;
+    std::vector<int> slice_k0_, slice_k_, slice_align_in_;
+    std::vector<int8_t*> slice_dst_;
+    std::unique_ptr<I8DpuChain> chain_;
 };
 
 /* One immutable packed-weight arena. Compatibility depends only on K/N and the

@@ -26,6 +26,7 @@ set(RK_NPU_SRCS
   src/rk_npu_cpu_kernels.cpp   # CPU-side layout pack/unpack kernels
   src/rk_npu_dcomp.cpp         # standalone lossless normal codec + basic RTN
   src/rk_npu_kn_plan.cpp       # persistent split-K / multi-core-N plan
+  src/rk_npu_i8_dpu_chain.cpp  # optional SDK-style INT32 reduce + NPU dequant
   src/rk_npu_autotune_common.cpp # shared resources, timing and ranking
   src/rk_npu_autotune_cache.cpp  # shared cache paths and atomic I/O
   src/rk_npu_quant_matmul.cpp  # typed single-GEMM autotune/execution API
@@ -53,6 +54,7 @@ set(RK_NPU_SRCS
   src/rk_npu_w4a8_tune.cpp        # W4 complete-call tuning
   src/rk_npu_w4a8_tune_family.cpp # shared K selection across M values
   src/rk_npu_matmul_f16.cpp    # fp16 x fp16 -> fp16 matmul + fused MUL/ADD
+  src/rk_npu_mm.cpp           # additive raw MM/BMM descriptor and FP16 executor
   src/rk_npu_add_rmsnorm_f16.cpp)
 
 set(RK_NPU_PUBLIC_HEADERS
@@ -65,6 +67,7 @@ set(RK_NPU_PUBLIC_HEADERS
   include/rk_npu_w4a8_tune.h
   include/rk_npu_quant_matmul.h
   include/rk_npu_matmul_f16.h
+  include/rk_npu_mm.h
   include/rk_npu_add_rmsnorm_f16.h)
 
 # ---- the C-ABI shared library (callable like librknnrt.so) ----
@@ -139,6 +142,17 @@ target_link_libraries(test_batch PRIVATE rk_npu_matmul)
 add_executable(test_batch_f16 tests/test_batch_f16.cpp)
 target_link_libraries(test_batch_f16 PRIVATE rk_npu_matmul)
 
+add_executable(test_mm tests/test_mm.cpp)
+target_link_libraries(test_mm PRIVATE rk_npu_matmul)
+add_executable(test_mm_tf32 tests/test_mm_tf32.cpp)
+target_link_libraries(test_mm_tf32 PRIVATE rk_npu_matmul)
+add_library(test_mm_header_c OBJECT tests/test_mm_header.c)
+target_include_directories(test_mm_header_c PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(BUILD_TESTING)
+  add_test(NAME mm_cpu COMMAND test_mm --cpu)
+  add_test(NAME mm_tf32_cpu COMMAND test_mm_tf32 --cpu)
+endif()
+
 add_executable(bench_f16 tests/bench_f16.cpp)
 target_link_libraries(bench_f16 PRIVATE rk_npu_matmul)
 
@@ -153,6 +167,9 @@ endif()
 
 add_executable(test_quant_matmul tests/test_quant_matmul.cpp)
 target_link_libraries(test_quant_matmul PRIVATE rk_npu_matmul)
+
+add_executable(test_i8_dpu_chain tests/test_i8_dpu_chain.cpp)
+target_link_libraries(test_i8_dpu_chain PRIVATE rk_npu_matmul)
 
 add_executable(test_moe_w8 tests/test_moe_w8.cpp)
 target_link_libraries(test_moe_w8 PRIVATE rk_npu_matmul)
@@ -258,4 +275,4 @@ add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_w4a8_reduction test_i4_bounds test_autotune_cpu test_panel_layout
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
   test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c
-  test_w4a4_linear_header_c test_moe_w8_header_c)
+  test_w4a4_linear_header_c test_moe_w8_header_c test_mm test_mm_header_c test_mm_tf32)

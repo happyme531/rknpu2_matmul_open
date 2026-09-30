@@ -7,7 +7,7 @@ Fully open source high-performance matrix multiplication library for LLM inferen
 
 ## Features
 
-- fp16 batched matmul kernel
+- fp16/bf16/tf32 batched matmul kernels
 - w8a8 int8 per-channel per-token quantized matmul kernel, with hardware weight (de)compression support
 - w4a8 per-channel per-token quantized matmul kernel implemented with Mixed-precision Split-activation Decomposition
 - w4a4 FlatQuant linear kernel
@@ -27,7 +27,6 @@ Since this library is 100% coded by LLM, just clone this repo then fire up your 
 
 ## TODO
 
-- bf16/tf32 matmul
 - Optimized internal memory usage
 - More fused kernels
 - Finding if more existing CPU processing can be offloaded to NPU
@@ -74,6 +73,22 @@ The NPU executes matrix products; CPU OpenMP/NEON kernels handle packing,
 quantization, split-K reduction and output conversion. Prepared weights and
 workspaces can be reused across calls.
 
+Typed W8A8 also has optional NPU split-K reduction and dequantization, both
+disabled by default. Set `RK_NPU_I8_NPU_REDUCE=1` before tuning and creating
+workspaces to use an INT32 DPU accumulation chain. Add
+`RK_NPU_W8A8_NPU_DEQUANT=1` to perform dequantization on the NPU using
+**FP16-rounded scales**; enabling dequantization also enables the chain.
+The switches apply to uncompressed W8 weights with `M<=128`, `K<=131071`;
+raw INT8 output supports the reduction switch. Existing layout recipes remain
+available, and each backend has a distinct tuning cache identity. For limits
+and precision details, see [the typed API header](include/rk_npu_quant_matmul.h).
+The optional chain packs all dynamic FP16/FP32 K slices in one CPU parallel
+region. NPU dequantization reuses synchronized channel coefficients while
+their contents remain unchanged; switching weights refreshes them. See the
+optimization measurements in the parent research workspace
+(`w8a8_dpu_simple_opt_2026-09-29.md`).
+Every variable the library reads is listed in [ENV.md](ENV.md).
+
 ## Supported interfaces
 
 | Interface | Public header | Notes |
@@ -85,6 +100,7 @@ workspaces can be reused across calls.
 | FlatQuant W4A4 Linear | [rk_npu_w4a4_linear.h](include/rk_npu_w4a4_linear.h) | NPU FP16 transforms followed by INT4 execution |
 | Routed W8 MoE | [rk_npu_moe_w8.h](include/rk_npu_moe_w8.h) | SwiGLU experts and optional shared expert; [MoE guide](MOE.md) |
 | Raw FP16 GEMM/BMM | [rk_npu_matmul_f16.h](include/rk_npu_matmul_f16.h) | Optional fused MUL/ADD and explicit split-K |
+| Unified raw MM/BMM (new) | [rk_npu_mm.h](include/rk_npu_mm.h) | FP16/BF16/TF32, transpose/strides, dynamic or typed packed B, multicore and default-enabled automatic split-K; [guide](MM.md) |
 | Legacy INT8 BMM | [rk_npu_matmul.h](include/rk_npu_matmul.h) | Distinct weights per batch item |
 | Add + RMSNorm | [rk_npu_add_rmsnorm_f16.h](include/rk_npu_add_rmsnorm_f16.h) | Fixed shapes: M=1/128, D=4096, eps=1e-5 |
 
@@ -147,7 +163,7 @@ cmake --build build-host --target rknpu2_matmul_open_cpu_tests -j4
 OMP_NUM_THREADS=4 ctest --test-dir build-host --output-on-failure
 ```
 
-This target builds all 11 registered CPU tests and the public C header checks.
+This target builds all 13 registered CPU tests and the public C header checks.
 It does not require an NPU. Use this target on x86: several hardware-only FP16
 programs in the default full build use the AArch64 `__fp16` type.
 NPU tests are explicit executables, not part of CTest; see the

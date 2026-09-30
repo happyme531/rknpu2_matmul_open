@@ -32,7 +32,7 @@ static void w8_cache(rk_npu_ctx& ctx,const std::string& path) {
     CHECK(!rk_npu_matmul_autotune_cache_save(&ctx,path.c_str(),s.op_kind,&c,&s,&s));
     std::ifstream in(path);std::string magic,key;std::getline(in,magic);std::getline(in,key);
     CHECK(magic=="rk_npu_matmul_tuning_cache_v2");
-    std::ostringstream expected;expected<<"key 2 3 "<<ctx.driver_version<<" 0 1 64 64 1 "
+    std::ostringstream expected;expected<<"key 2 5 "<<ctx.driver_version<<" 0 1 64 64 1 "
         <<c.allowed_cpu_core_mask<<" 2 8 3 500 0";
     CHECK(key==expected.str());
     rk_npu_matmul_strategy f{},stable{};
@@ -40,6 +40,23 @@ static void w8_cache(rk_npu_ctx& ctx,const std::string& path) {
     CHECK(f.total_us==3.5 && stable.robust_us==4.5);
     {std::ofstream out(path,std::ios::app);out<<"junk";}
     CHECK(rk_npu_matmul_autotune_cache_load(&ctx,path.c_str(),s.op_kind,&c,&f,&stable)==RK_NPU_ERR_CACHE_MISS);
+    // Floating CPU / DPU-reduce / FP16-scale DPU-dequant caches are distinct,
+    // including when callers deliberately use the same filename.
+    s.op_kind=RK_NPU_MATMUL_F32I8F32_DYNAMIC;
+    auto mode=[](int m) {
+        setenv("RK_NPU_I8_NPU_REDUCE",m==1?"1":"0",1);
+        setenv("RK_NPU_W8A8_NPU_DEQUANT",m==2?"1":"0",1);
+    };
+    for(int saved=0;saved<3;++saved) {
+        mode(saved);
+        CHECK(!rk_npu_matmul_autotune_cache_save(&ctx,path.c_str(),s.op_kind,&c,&s,&s));
+        for(int loaded=0;loaded<3;++loaded) {
+            mode(loaded);
+            const int rc=rk_npu_matmul_autotune_cache_load(&ctx,path.c_str(),s.op_kind,&c,&f,&stable);
+            CHECK(rc==(loaded==saved?RK_NPU_OK:RK_NPU_ERR_CACHE_MISS));
+        }
+    }
+    mode(0);
 }
 static void w4_policy_cache(rk_npu_ctx& ctx,const std::string& path) {
     rk_npu_w4a8_autotune_config c;rk_npu_w4a8_autotune_config_init(&c,4,1,2048);

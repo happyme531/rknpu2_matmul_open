@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <functional>
@@ -224,6 +225,8 @@ int main() {
     const uint64_t cpu_mask = take_cpus(
         allowed, std::min(2, __builtin_popcountll(allowed)));
     bool ok = true;
+    const char* reduce_env = std::getenv("RK_NPU_I8_NPU_REDUCE");
+    const bool npu_reduce = reduce_env && std::strcmp(reduce_env, "1") == 0;
 
     for (auto s : {strategy(RK_NPU_MATMUL_I8I8I32, M, N, K, K, N, 1, cpu_mask),
                    strategy(RK_NPU_MATMUL_I8I8I32, M, N, K, 32, 32, 7, cpu_mask),
@@ -241,12 +244,12 @@ int main() {
               weight_memory.packed_b_bytes == (uint64_t)K * N &&
               weight_memory.scale_bytes == 0 &&
               workspace_memory.input_bytes ==
-                  (uint64_t)std::min(s.wave_count, 2) * M *
+                  (uint64_t)(npu_reduce ? s.wave_count : std::min(s.wave_count, 2)) * M *
                   ((std::min(s.k_tile, K) + 31) / 32 * 32) &&
               workspace_memory.output_bytes ==
                   (uint64_t)std::min(s.wave_count, 3) * M * N * sizeof(int32_t) &&
               workspace_memory.buffer_count ==
-                  (uint32_t)(2 * s.wave_count + std::min(s.wave_count, 2) +
+                  (uint32_t)(2 * s.wave_count + (npu_reduce ? s.wave_count + 2 : std::min(s.wave_count, 2)) +
                              std::min(s.wave_count, 3)) &&
               weight_memory.buffer_count == 1;
         rk_npu_matmul_workspace* workspace =
@@ -478,6 +481,10 @@ int main() {
             ok &= loaded.c_layout==RK_NPU_MATMUL_C_LAYOUT_PANEL8 &&
                   loaded_stable.c_layout==RK_NPU_MATMUL_C_LAYOUT_PANEL8 &&
                   loaded.total_us==panel_strategy.total_us;
+            // An explicit cache filename must still reject another backend.
+            setenv("RK_NPU_I8_NPU_REDUCE", npu_reduce ? "0" : "1", 1);
+            ok &= rk_npu_matmul_autotune_cache_load(ctx,path,kind,&cfg,&loaded,&loaded_stable)!=RK_NPU_OK;
+            setenv("RK_NPU_I8_NPU_REDUCE", npu_reduce ? "1" : "0", 1);
             (void)::unlink(path);
         }
     }

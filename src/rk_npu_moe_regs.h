@@ -74,7 +74,8 @@ inline float half_value(uint16_t bits) {
 }
 inline std::vector<uint64_t> middle_body(int rows,int channels,uint64_t input,
                                          uint64_t coeff,uint64_t output,float scale,bool gate) {
-    if(rows<1 || rows>128 || channels!=512 || (input|coeff|output)>UINT32_MAX ||
+    if(rows<1 || rows>128 || channels<32 || channels>1024 || channels%32 ||
+       (gate && channels!=512) || (input|coeff|output)>UINT32_MAX ||
        ((input|coeff|output)&15))throw std::runtime_error("DPU middle geometry/address");
     const uint32_t c=uint32_t(channels-1);
     const uint32_t hs=uint32_t(half_bits(scale))<<16;

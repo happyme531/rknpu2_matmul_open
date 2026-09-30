@@ -19,6 +19,18 @@
  * shared across workspaces for changing sequence lengths. A and C are compact
  * row-major host tensors supplied to each blocking run call. FP16 tensors use
  * raw IEEE binary16 bits stored in uint16_t.
+ *
+ * Optional W8/raw-INT8 execution backends (read when creating a workspace or
+ * tuning; default off; set before those calls and keep stable during tuning):
+ *   RK_NPU_I8_NPU_REDUCE=1: one multi-core PC chain with offline DPU INT32
+ *     split-K accumulation; CPU dequant keeps the original FP32 scales.
+ *   RK_NPU_W8A8_NPU_DEQUANT=1: implies the above for floating operators and
+ *     applies NPU dequant with FP16-rounded row/channel coefficients. This is
+ *     an explicit precision tradeoff, not bit-equivalent to FP32 scales.
+ * Both currently require M<=128, K<=131071 and uncompressed W8 weights.
+ * Existing A/C layout recipes are retained. An unsupported configuration or
+ * coefficient that rounds to zero/infinity fails instead of falling back.
+ * Workspace memory queries and tuning cache keys include the selected mode.
  */
 #ifndef RK_NPU_QUANT_MATMUL_H
 #define RK_NPU_QUANT_MATMUL_H
