@@ -145,9 +145,30 @@ struct rk_npu_iommu_domain {
 };
 struct rk_npu_matmul_i8_config;
 struct rk_npu_matmul_i8_plan;
+struct rk_npu_matmul_f16_batch_plan;
+struct rk_npu_matmul_f16_config;
 
 /* ----------------------------------------------- shared core helpers */
 namespace rknpu2_matmul_open::detail {
+
+/* Experimental same-core graph assembly. Copy a prepared plain FP16 batch's
+ * register bodies with bound addresses; the caller owns the final single PC
+ * allocation and all cache synchronization. No submit or plan mutation. */
+struct RegisterTask {
+    std::vector<uint64_t> body;
+    uint32_t op_idx = 0;
+    uint32_t enable_mask = 0xd;
+};
+int export_f16_batch_tasks(const rk_npu_matmul_f16_batch_plan* plan,
+                           const rk_npu_mem* input, const rk_npu_mem* weight,
+                           const rk_npu_mem* output,
+                           std::vector<RegisterTask>& tasks);
+// Emit the same bound register bodies directly in host memory. No temporary
+// GEM register/descriptor allocations, device sync or submit.
+int emit_f16_batch_tasks(rk_npu_iommu_domain* domain,int batch,
+                        const rk_npu_matmul_f16_config* cfg,
+                        const rk_npu_mem* input,const rk_npu_mem* weight,
+                        const rk_npu_mem* output,std::vector<RegisterTask>& tasks);
 
 /* Private single-GEMM INT8 surface used by typed plans and low-level tests. */
 int query_i8(const rk_npu_matmul_i8_config* cfg, rk_npu_matmul_sizes* out);

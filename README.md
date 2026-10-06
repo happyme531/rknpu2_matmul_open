@@ -12,6 +12,8 @@ Fully open source high-performance matrix multiplication library for LLM inferen
 - w4a8 per-channel per-token quantized matmul kernel implemented with Mixed-precision Split-activation Decomposition
 - w4a4 FlatQuant linear kernel
 - w8a8/w4a8 quantized MoE kernel with fused SwiGLU activation
+- Very fast fused fp16 GQA (MHA, MQA) kernel
+- Fast fused fp16 MLA/gated MLA kernel, supporting both expanded and absorbed mode
 - Optimized performance (at least I tried to do so)
 - Some of these kernels support auto-tuning for even better performance
 
@@ -22,12 +24,13 @@ Since this library is 100% coded by LLM, just clone this repo then fire up your 
 ## Note
 
 - This is a very experimental project and all the things and APIs could change.
-- The code is guarranted to be buggy.
+- The code may be buggy.
 - Memory usage may be larger than needed (shouldn't be disastrous)
 
 ## TODO
 
 - Optimized internal memory usage
+- Add support for mainline `rocket` kernel driver
 - More fused kernels
 - Finding if more existing CPU processing can be offloaded to NPU
 - Write a research paper if possible
@@ -85,8 +88,7 @@ and precision details, see [the typed API header](include/rk_npu_quant_matmul.h)
 The optional chain packs all dynamic FP16/FP32 K slices in one CPU parallel
 region. NPU dequantization reuses synchronized channel coefficients while
 their contents remain unchanged; switching weights refreshes them. See the
-optimization measurements in the parent research workspace
-(`w8a8_dpu_simple_opt_2026-09-29.md`).
+optimization measurements (historical parent-workspace note: `w8a8_dpu_simple_opt_2026-09-29.md`).
 Every variable the library reads is listed in [ENV.md](ENV.md).
 
 ## Supported interfaces
@@ -98,15 +100,17 @@ Every variable the library reads is listed in [ENV.md](ENV.md).
 | Floating W4A8 | [rk_npu_w4a8.h](include/rk_npu_w4a8.h) | Packed INT4 weights, dynamic INT8 activations, FP16/FP32 output |
 | W4A8 autotuning | [rk_npu_w4a8_tune.h](include/rk_npu_w4a8_tune.h) | Weight-aware tile/layout search and strategy caches |
 | FlatQuant W4A4 Linear | [rk_npu_w4a4_linear.h](include/rk_npu_w4a4_linear.h) | NPU FP16 transforms followed by INT4 execution |
-| Routed W8 MoE | [rk_npu_moe_w8.h](include/rk_npu_moe_w8.h) | SwiGLU experts and optional shared expert; [MoE guide](MOE.md) |
+| Routed W8 MoE | [rk_npu_moe_w8.h](include/rk_npu_moe_w8.h) | SwiGLU experts and optional shared expert; [MoE guide](docs/MOE.md) |
 | Raw FP16 GEMM/BMM | [rk_npu_matmul_f16.h](include/rk_npu_matmul_f16.h) | Optional fused MUL/ADD and explicit split-K |
-| Unified raw MM/BMM (new) | [rk_npu_mm.h](include/rk_npu_mm.h) | FP16/BF16/TF32, transpose/strides, dynamic or typed packed B, multicore and default-enabled automatic split-K; [guide](MM.md) |
+| Experimental FP16 Attention | [rk_npu_attention_f16.h](include/rk_npu_attention_f16.h) | Causal/no-mask/broadcast boolean GQA, shared workspace and growing native KV; [guide](docs/ATTENTION.md) |
+| Experimental FP16 Gated MLA | [rk_npu_mla_f16.h](include/rk_npu_mla_f16.h) | Ling tiny H16/QK192/V128, expanded or absorbed latent512 KV; [guide](docs/MLA.md) |
+| Unified raw MM/BMM (new) | [rk_npu_mm.h](include/rk_npu_mm.h) | FP16/BF16/TF32, transpose/strides, dynamic or typed packed B, multicore and default-enabled automatic split-K; [guide](docs/MM.md) |
 | Legacy INT8 BMM | [rk_npu_matmul.h](include/rk_npu_matmul.h) | Distinct weights per batch item |
 | Add + RMSNorm | [rk_npu_add_rmsnorm_f16.h](include/rk_npu_add_rmsnorm_f16.h) | Fixed shapes: M=1/128, D=4096, eps=1e-5 |
 
-See [API and implementation notes](API.md) for ownership, layouts, tuning,
+See [API and implementation notes](docs/API.md) for ownership, layouts, tuning,
 compression, execution examples and detailed limits. Experimental private W4
-MoE support is described separately in the [MoE guide](MOE.md).
+MoE support is described separately in the [MoE guide](docs/MOE.md).
 
 ## Build on RK3588
 
@@ -163,7 +167,7 @@ cmake --build build-host --target rknpu2_matmul_open_cpu_tests -j4
 OMP_NUM_THREADS=4 ctest --test-dir build-host --output-on-failure
 ```
 
-This target builds all 13 registered CPU tests and the public C header checks.
+This target builds all 15 registered CPU tests and the public C header checks.
 It does not require an NPU. Use this target on x86: several hardware-only FP16
 programs in the default full build use the AArch64 `__fp16` type.
 NPU tests are explicit executables, not part of CTest; see the

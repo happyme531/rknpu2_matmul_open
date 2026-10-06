@@ -12,6 +12,7 @@
  *     rk_npu_matmul_f16.h  fp16 x fp16 -> fp16 matmul, optionally fused with an
  *                          elementwise MUL/ADD against a third operand (ConvMul/ConvAdd)
  *     rk_npu_add_rmsnorm_f16.h  fp16 native residual Add + RMSNorm
+ *     rk_npu_attention_f16.h   experimental GQA and native KV cache
  */
 #ifndef RK_NPU_COMMON_H
 #define RK_NPU_COMMON_H
@@ -41,6 +42,7 @@ extern "C" {
 #define RK_NPU_MEM_CACHEABLE       0x2   /* cached CPU mapping; call rk_npu_mem_sync around NPU use */
 #define RK_NPU_MEM_KERNEL_MAPPING  0x8   /* required for the task buffer                        */
 #define RK_NPU_MEM_IOMMU           0x10  /* explicitly request IOMMU-visible storage           */
+#define RK_NPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT 0x400 /* page-align IOVA instead of allocation-size alignment */
 
 /* CACHEABLE alone selects the driver's force-contiguous dma_alloc_attrs path,
  * whose CPU reads are slow on RK3588.  Production CPU-visible data uses the

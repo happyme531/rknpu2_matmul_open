@@ -1,7 +1,7 @@
 # 原始 MM/BMM 接口
 
-新增入口为 [`include/rk_npu_mm.h`](include/rk_npu_mm.h)，实现位于
-[`src/rk_npu_mm.cpp`](src/rk_npu_mm.cpp)。旧头文件、函数和默认行为保持不变。
+新增入口为 [`include/rk_npu_mm.h`](../include/rk_npu_mm.h)，实现位于
+[`src/rk_npu_mm.cpp`](../src/rk_npu_mm.cpp)。旧头文件、函数和默认行为保持不变。
 
 实现 FP16 × FP16 → FP16、BF16 × BF16 → BF16、TF32 × TF32 → FP32，
 统一计算 `C[b] = op(A[b]) @ op(B[b])`。

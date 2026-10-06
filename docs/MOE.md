@@ -1,6 +1,6 @@
 # Routed W8A8 MoE API
 
-Public C header: [`include/rk_npu_moe_w8.h`](include/rk_npu_moe_w8.h).
+Public C header: [`include/rk_npu_moe_w8.h`](../include/rk_npu_moe_w8.h).
 The operator implements routed SwiGLU experts plus an optional shared expert.
 The caller computes routing IDs and coefficients; NPU gather is the default
 and only dispatch implementation in this API.

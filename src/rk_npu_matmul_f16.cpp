@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <new>
 #include <climits>
+#include <iterator>
 
 namespace {
 using FloatPrecision = rknpu2_matmul_open::detail::FloatPrecision;
@@ -1184,6 +1185,74 @@ int run_common(rk_npu_ctx* ctx, F16Prepared& p,
 } /* anonymous namespace */
 
 namespace rknpu2_matmul_open::detail {
+int emit_f16_batch_tasks(rk_npu_iommu_domain* domain,int batch,
+                        const rk_npu_matmul_f16_config* cfg,
+                        const rk_npu_mem* input,const rk_npu_mem* weight,
+                        const rk_npu_mem* output,std::vector<RegisterTask>& tasks){
+    if(!domain || !domain->ctx || !cfg || batch<1 || !input || !weight || !output ||
+       cfg->op!=RK_NPU_FUSE_NONE ||
+       (cfg->core_mask!=1 && cfg->core_mask!=2 && cfg->core_mask!=4))return RK_NPU_ERR_PARAM;
+    for(const auto* mem:{input,weight,output}){
+        if(mem->ctx_id!=domain->ctx->id)return RK_NPU_ERR_PARAM;
+        if(mem->iommu_domain_id!=domain->id)return RK_NPU_ERR_DOMAIN;
+        if(mem->dma_addr>UINT32_MAX || !mem->size || mem->size-1>UINT32_MAX-mem->dma_addr)return RK_NPU_ERR_PARAM;
+    }
+    rk_npu_matmul_sizes s{};const int rc=float_batch_query(batch,cfg,FloatPrecision::F16,&s);
+    if(rc)return rc;
+    if(input->size<s.input_bytes || weight->size<s.weight_bytes || output->size<s.output_bytes)return RK_NPU_ERR_NOMEM;
+    std::vector<uint64_t> words(s.regcmd_bytes/8);
+    std::vector<rknpu_task> descriptors(s.num_tasks);
+    rk_npu_mem regs{},desc{};regs.vaddr=words.data();regs.size=s.regcmd_bytes;
+    desc.vaddr=descriptors.data();desc.size=s.task_bytes;
+    BuildMeta meta;const int status=build_regcmd(*cfg,input->dma_addr,weight->dma_addr,output->dma_addr,0,
+        &regs,&desc,&meta,batch,FloatPrecision::F16);
+    if(status)return status;
+    std::vector<RegisterTask> copy;copy.reserve(meta.num_tasks);
+    for(int i=0;i<meta.num_tasks;++i){
+        RegisterTask task;task.body.assign(words.begin()+meta.base[i],words.begin()+meta.base[i]+meta.body_size[i]);
+        task.op_idx=descriptors[i].op_idx;task.enable_mask=descriptors[i].enable_mask;copy.push_back(std::move(task));
+    }
+    tasks.insert(tasks.end(),std::make_move_iterator(copy.begin()),std::make_move_iterator(copy.end()));return 0;
+}
+int export_f16_batch_tasks(const rk_npu_matmul_f16_batch_plan* plan,
+                           const rk_npu_mem* input, const rk_npu_mem* weight,
+                           const rk_npu_mem* output,
+                           std::vector<RegisterTask>& tasks) {
+    if (!plan || !input || !weight || !output) return RK_NPU_ERR_PARAM;
+    const auto& p = plan->p;
+    if (!p.ctx || (p.core_mask != 1 && p.core_mask != 2 && p.core_mask != 4) || p.cfg.op != RK_NPU_FUSE_NONE)
+        return RK_NPU_ERR_PARAM;
+    for (const auto* mem : {input, weight, output}) {
+        if (mem->ctx_id != p.ctx->id) return RK_NPU_ERR_PARAM;
+        if (mem->iommu_domain_id != p.iommu_domain_id) return RK_NPU_ERR_DOMAIN;
+        if (mem->dma_addr > UINT32_MAX || mem->size == 0 ||
+            mem->size - 1 > UINT32_MAX - mem->dma_addr)
+            return RK_NPU_ERR_PARAM;
+    }
+    if (input->size < p.input_bytes || weight->size < p.weight_bytes ||
+        output->size < p.output_bytes) return RK_NPU_ERR_NOMEM;
+    const auto* descriptors = static_cast<const rknpu_task*>(p.task.vaddr);
+    std::vector<RegisterTask> copy;
+    copy.reserve(p.num_tasks);
+    for (int i = 0; i < p.num_tasks; ++i) {
+        const auto& desc = descriptors[i];
+        const size_t base = (desc.regcmd_addr - p.regcmd.dma_addr) / 8;
+        RegisterTask task;
+        task.body.assign(p.cmd + base, p.cmd + base + desc.regcfg_amount);
+        task.op_idx = desc.op_idx;
+        task.enable_mask = desc.enable_mask;
+        task.body.at(p.feat_idx[i] - base) =
+            E(T_CNA, R_CNA_FEATURE_DATA_ADDR, uint32_t(input->dma_addr + p.input_off[i]));
+        task.body.at(p.dcomp_idx[i] - base) =
+            E(T_CNA, R_CNA_DCOMP_ADDR0, uint32_t(weight->dma_addr + p.weight_off[i]));
+        task.body.at(p.dst_idx[i] - base) =
+            E(T_DPU, R_DST_BASE_ADDR, uint32_t(output->dma_addr + p.output_off[i]));
+        copy.push_back(std::move(task));
+    }
+    tasks.insert(tasks.end(), std::make_move_iterator(copy.begin()), std::make_move_iterator(copy.end()));
+    return RK_NPU_OK;
+}
+
 int float_batch_query(int batch_count, const rk_npu_matmul_f16_config* cfg,
     FloatPrecision precision, rk_npu_matmul_sizes* out) {
     if (batch_count <= 0 || !cfg || cfg->op != RK_NPU_FUSE_NONE || !out)

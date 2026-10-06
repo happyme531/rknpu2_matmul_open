@@ -1,6 +1,6 @@
 # API and implementation notes
 
-See [README](README.md) for building, testing and the namespace convention.
+See [README](../README.md) for building, testing and the namespace convention.
 Historical measurement notes named below belong to the parent lowlevel research
 workspace and are not bundled with this standalone library. Their measurements
 are configuration-specific historical results, not fresh release benchmarks.

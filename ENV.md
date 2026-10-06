@@ -28,7 +28,7 @@
 TF32 partial/输出均为 FP32，其 K 分块按 16 对齐；FP16/BF16 按 32 对齐。
 只在创建 plan 时读取并固化，运行时不重新读取；options.split_k 的显式 0/1/2/3
 覆盖环境变量。现有 FP16、INT8、INT4 和量化接口均不读取此变量。
-完整语义、预打包 B 兼容条件和例子见 [MM.md](MM.md)。
+完整语义、预打包 B 兼容条件和例子见 [MM.md](docs/MM.md)。
 
 ## W8A8：`RK_NPU_I8_NPU_REDUCE` 和 `RK_NPU_W8A8_NPU_DEQUANT`
 

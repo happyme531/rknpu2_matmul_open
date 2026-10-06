@@ -54,6 +54,9 @@ set(RK_NPU_SRCS
   src/rk_npu_w4a8_tune.cpp        # W4 complete-call tuning
   src/rk_npu_w4a8_tune_family.cpp # shared K selection across M values
   src/rk_npu_matmul_f16.cpp    # fp16 x fp16 -> fp16 matmul + fused MUL/ADD
+  src/rk_npu_attention_f16.cpp # experimental causal/no-mask/boolean GQA workspace
+  src/rk_npu_attention_f16_cache.cpp # persistent native KV and tail staging
+  src/rk_npu_mla_f16.cpp      # Ling tiny gated MLA: expanded / absorbed latent cache
   src/rk_npu_mm.cpp           # additive raw MM/BMM descriptor and FP16 executor
   src/rk_npu_add_rmsnorm_f16.cpp)
 
@@ -67,6 +70,8 @@ set(RK_NPU_PUBLIC_HEADERS
   include/rk_npu_w4a8_tune.h
   include/rk_npu_quant_matmul.h
   include/rk_npu_matmul_f16.h
+  include/rk_npu_attention_f16.h
+  include/rk_npu_mla_f16.h
   include/rk_npu_mm.h
   include/rk_npu_add_rmsnorm_f16.h)
 
@@ -141,6 +146,35 @@ target_link_libraries(test_batch PRIVATE rk_npu_matmul)
 
 add_executable(test_batch_f16 tests/test_batch_f16.cpp)
 target_link_libraries(test_batch_f16 PRIVATE rk_npu_matmul)
+
+add_executable(test_attention_f16 tests/test_attention_f16.cpp)
+target_compile_options(test_attention_f16 PRIVATE ${RK_NPU_AARCH64_FP16_FLAGS})
+target_link_libraries(test_attention_f16 PRIVATE rk_npu_matmul)
+add_library(test_attention_f16_header_c OBJECT tests/test_attention_f16_header.c)
+target_include_directories(test_attention_f16_header_c PRIVATE include)
+if(BUILD_TESTING)
+  add_test(NAME attention_f16_cpu COMMAND test_attention_f16)
+endif()
+add_executable(bench_attention_f16 tests/bench_attention_f16.cpp)
+target_link_libraries(bench_attention_f16 PRIVATE rk_npu_matmul)
+add_executable(bench_attention_f16_multicore tests/bench_attention_f16_multicore.cpp)
+target_link_libraries(bench_attention_f16_multicore PRIVATE rk_npu_matmul)
+add_executable(test_mla_f16 tests/test_mla_f16.cpp)
+target_link_libraries(test_mla_f16 PRIVATE rk_npu_matmul)
+add_library(test_mla_f16_header_c OBJECT tests/test_mla_f16_header.c)
+target_include_directories(test_mla_f16_header_c PRIVATE include)
+add_executable(bench_mla_f16 tests/bench_mla_f16.cpp)
+target_link_libraries(bench_mla_f16 PRIVATE rk_npu_matmul)
+add_executable(compare_mla_f16 tests/compare_mla_f16.cpp)
+target_link_libraries(compare_mla_f16 PRIVATE rk_npu_matmul ${CMAKE_DL_LIBS})
+add_executable(profile_attention_stable tests/profile_attention_stable.cpp)
+target_include_directories(profile_attention_stable PRIVATE src)
+target_link_libraries(profile_attention_stable PRIVATE rk_npu_matmul)
+add_executable(compare_attention_decode tests/compare_attention_decode.cpp)
+target_link_libraries(compare_attention_decode PRIVATE rk_npu_matmul ${CMAKE_DL_LIBS})
+if(BUILD_TESTING)
+  add_test(NAME mla_f16_cpu COMMAND test_mla_f16)
+endif()
 
 add_executable(test_mm tests/test_mm.cpp)
 target_link_libraries(test_mm PRIVATE rk_npu_matmul)
@@ -275,4 +309,5 @@ add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_w4a8_reduction test_i4_bounds test_autotune_cpu test_panel_layout
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
   test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c
-  test_w4a4_linear_header_c test_moe_w8_header_c test_mm test_mm_header_c test_mm_tf32)
+  test_w4a4_linear_header_c test_moe_w8_header_c test_mm test_mm_header_c test_mm_tf32
+  test_attention_f16 test_attention_f16_header_c test_mla_f16 test_mla_f16_header_c)
