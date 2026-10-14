@@ -91,7 +91,7 @@ extern "C" rk_npu_iommu_domain* rk_npu_iommu_domain_create(
     rk_npu_ctx* ctx, uint32_t domain_id) {
     if (!ctx || domain_id >= RK_NPU_IOMMU_DOMAIN_COUNT) return nullptr;
     /* Driver version encoding is major*10000 + minor*100 + patch. */
-    if (domain_id != 0 && (!ctx->iommu_enabled || ctx->driver_version < 908))
+    if (domain_id != 0 && (!ctx->iommu_enabled || ctx->driver_version < 900))
         return nullptr;
     rk_npu_iommu_domain* domain = new (std::nothrow) rk_npu_iommu_domain();
     if (!domain) return nullptr;
