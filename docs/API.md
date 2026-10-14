@@ -264,7 +264,9 @@ register values:
 2. Estimate the CBUF transition and derive the small aligned K-tile grid.
    Add a <=2048-wave anchor, respecting `required_k_tile`. The interval
    `(3072,4096)`, containing the recorded K3840 submit failure, is conservatively
-   excluded for M>4, including K tails.
+   excluded for M>4, including K tails. Split K tiles above 2048 also use
+   1024-aligned partitions. `rk_npu_matmul_k_partition_query(M,K,k_tile)` exposes
+   this same CPU-only policy to callers selecting a shared packed-weight partition.
    This conservative policy is not a universal hardware safety formula.
 3. Derive N tiles from the fixed core count and `Ntile <= 3072`.
 4. Enumerate complete layout recipes: normal A/native C, native A/native C,

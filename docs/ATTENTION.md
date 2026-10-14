@@ -1,6 +1,6 @@
 # Experimental FP16 Attention
 
-The public [C API](include/rk_npu_attention_f16.h) is part of the shared and static
+The public [C API](../include/rk_npu_attention_f16.h) is part of the shared and static
 `rk_npu_matmul` libraries. It borrows the caller's device context and IOMMU domain,
 retains domain references, and accepts one selected NPU core (mask 1, 2 or 4),
 two cores (mask 3), or three cores (mask 7).
@@ -11,7 +11,7 @@ Set `RK_NPU_ATTENTION_F16_FIXED_SHIFT_EXPERIMENTAL` in `config.flags`; there is 
 automatic selection or hidden fallback. Numerical range handling and model quality
 validation remain deferred. No RKNN runtime, compiler, model or `.tasks` file is
 needed at build or run time. The DPU-RDMA mask registers are generated from dimensions,
-using rules verified against the earlier native Softmax captures.
+using tested native Softmax layout rules.
 
 ## Supported shapes and mask semantics
 
@@ -113,7 +113,7 @@ repacking retain full synchronization; reloading a shorter cache reapplies the g
 
 The default tile512 is unchanged. A length gate does not choose a tile or imply a
 performance win: measured stripe gains mainly concern large PV tiles. See the
-[experiment and validation](../tools/mla_probe/DIRTY_SYNC.md).
+experiment and validation.
 
 ## Multi-core execution
 
@@ -218,7 +218,7 @@ Linear/Attention alternation. KV head counts 1/8/32 and query length greater tha
 KV length are covered. C header, host shared/static builds and CPU sizing checks pass.
 The exp approximation remains the existing one; model PPL/TPOT is not measured.
 
-The later [multi-core study](../tools/attention_prefill_probe/MULTICORE.md) measures
+The later multi-core study measures
 identical operands with masks 1/3/7 interleaved. With K512, 4K cached decode takes
 1.790/0.941/0.763 ms; append+decode takes 1.892/1.030/0.847 ms. A 32-query prefill
 chunk against 4K KV takes 3.847/3.077/2.676 ms. These are complete calls, including
@@ -231,16 +231,16 @@ limit on scaling, without claiming measured DDR saturation. Triple-core no-mask
 prefill saves about 9% here, despite the earlier single-core decode result.
 
 Sources, binary hashes, clocks, raw samples and checks:
-[public API report](../tools/attention_prefill_probe/results/attention_api_final/report.json).
+public API report.
 Reproduce on the board after building `test_attention_f16` and `bench_attention_f16`:
 
 ```bash
-sudo chmod 777 /sys/class/devfreq/fdab0000.npu/min_freq /sys/class/devfreq/dmc/min_freq /sys/devices/system/cpu/cpufreq/policy4/scaling_min_freq
-python3 tools/attention_prefill_probe/run_api.py --output tools/attention_prefill_probe/results/attention_api_recheck
-sudo chmod 644 /sys/class/devfreq/fdab0000.npu/min_freq /sys/class/devfreq/dmc/min_freq /sys/devices/system/cpu/cpufreq/policy4/scaling_min_freq
+./build/test_attention_f16 --board 1
+./build/test_attention_f16 --board 7 --long 512
+./build/bench_attention_f16 --length 4096 --capacity 8192 --core-mask 7 --key-tile 512 --loops 50 --warmup 5
 ```
 
-Scripts run as the normal user and restore frequency limits in `finally`.
+Record actual board frequencies and restore externally changed governors or limits after testing.
 
 ## Workspace 几何更新（2026-10-04）
 
@@ -266,11 +266,11 @@ PV 仍使用配置中的 `kv_tile`，不改变默认值 512。`query()` 包含�
 末尾 Q1 causal decode 内部可跳过冗余 mask RDMA；较早的 causal query 仍保留 mask。
 回归覆盖长上下文、三种 mask、Q1/5/32、单/多核、完整输出 oracle、guard、
 增长/rebind 和每个选定物理核的 INT8 交错。详细证据及 decode 测量见
-[长上下文修复记录](../tools/mla_probe/LONG_CONTEXT.md)。
+长上下文修复记录。
 
 `RK_NPU_ATTENTION_F16_STABLE_SOFTMAX` 与 MLA 共用稳定路径：原始 QK 写回后，CPU
 排除无效 keys、以 FP32 减行最大值并计算 exp，再提交 PV。大 score 在 V 幅值
 允许时利用 PV 的 denominator 延后归一化，短 score/大 V 保留归一化概率；
 stable 无需 native mask tensor，`mask_bytes=0`，boolean 的逻辑 ABI 保留。
 公开 GQA 的 causal 前缀规则不变。具体 bound、舍入和计时范围见
-[稳定路径性能记录](../tools/mla_probe/STABLE_OPTIMIZATION.md)。
+稳定路径性能记录。

@@ -12,6 +12,7 @@ void rk_npu_quant_header_c_compile_test(void) {
     rk_npu_matmul_weight_requirements weight_memory;
     rk_npu_matmul_weight_config weight = {32, 32, 32};
     rk_npu_matmul_autotune_config_init(&config, 1, 32, 32);
+    (void)rk_npu_matmul_k_partition_query(64, 8192, 4096);
     rk_npu_matmul_family_autotune_config_init(
         &family_config, 32, 32, 1, m_values);
     fastest.a_layout = RK_NPU_MATMUL_A_LAYOUT_NATIVE_K16_M16;

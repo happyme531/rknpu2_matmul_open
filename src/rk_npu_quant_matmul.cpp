@@ -52,7 +52,7 @@ constexpr uint64_t AUTOTUNE_SEED = 0x726b6e70755f6938ull;
 constexpr uint32_t AUTOTUNE_CACHE_FORMAT_VERSION = 2;
 /* TODO(tuning-cache-revision): bump whenever candidate generation, validation,
  * production pipeline behavior, or CPU kernels change strategy selection. */
-constexpr uint32_t AUTOTUNE_CACHE_TUNING_REVISION = 5; // fused chain input packing and scale cache
+constexpr uint32_t AUTOTUNE_CACHE_TUNING_REVISION = 6; // shared conservative K-partition policy
 constexpr const char* AUTOTUNE_CACHE_MAGIC = "rk_npu_matmul_tuning_cache_v2";
 
 double us_since(Clock::time_point t0) {
@@ -1125,12 +1125,14 @@ bool same_tune_output(rk_npu_matmul_op_kind kind, const TuneOutput &expected,
     return true;
 }
 
-// Full-K 3840 at M64 is a recorded submit failure. Keep uncertain intermediate
-// large K out of online tuning rather than using a failed submit as a probe.
-// This is a conservative policy, not a complete silicon safety formula.
+// Online tuning uses conservative large K waves: avoid (3072,4096), and use
+// 1024-aligned tiles when splitting with tiles above 2048. This is a tuning
+// policy, not a complete silicon safety formula.
 bool tune_k_partition_safe(int M, int K, int kt) {
     if (M <= 4)
         return true;
+    if (K > kt && kt > 2048 && align_up(kt, MIN_CHANNEL_TILE) % 1024)
+        return false;
     for (int k0 = 0; k0 < K; k0 += kt) {
         const int k = align_up(std::min(kt, K - k0), MIN_CHANNEL_TILE);
         if (k > 3072 && k < 4096)
@@ -1689,6 +1691,12 @@ extern "C" int rk_npu_matmul_autotune_family_cached(
         fastest_summary, fastest_strategies,
         stable_summary, stable_strategies,
         true, cache_directory, refresh, cache_hits, cache_misses);
+}
+
+extern "C" int rk_npu_matmul_k_partition_query(int M, int K, int k_tile) {
+    if (M < 1 || K < 1 || k_tile < 1 || k_tile > K)
+        return RK_NPU_ERR_PARAM;
+    return tune_k_partition_safe(M, K, k_tile) ? RK_NPU_OK : RK_NPU_ERR_PARAM;
 }
 
 extern "C" int rk_npu_matmul_workspace_memory_query(

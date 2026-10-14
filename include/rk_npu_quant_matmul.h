@@ -183,6 +183,10 @@ void rk_npu_matmul_family_autotune_config_init(
     rk_npu_matmul_family_autotune_config* cfg, int N, int K,
     int m_count, const int* m_values);
 
+/* Pure CPU query of the library's conservative online-tuning K partition
+ * policy. Returns OK for an eligible partition, PARAM otherwise. */
+int rk_npu_matmul_k_partition_query(int M, int K, int k_tile);
+
 /* Autotune searches K/N tiles and validated A/C layout recipes, with fixed
  * resources selected from the masks. It is shape/mask-only: callers do not
  * provide A, B, or scales.
