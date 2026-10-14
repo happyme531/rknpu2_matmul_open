@@ -27,18 +27,23 @@ DirtySyncPolicy experimental_dirty_sync_policy()noexcept{
     return policy;
 }
 int validate(const rk_npu_attention_f16_config& c){
-    if(c.kv_heads<1 || c.kv_heads>32 || c.query_heads!=4*c.kv_heads || c.head_dim!=128 ||
-       c.max_query_rows<1 || c.max_query_rows>32 || c.initial_capacity<32 ||
+    if(c.kv_heads<1 || c.kv_heads>32 || c.query_heads<c.kv_heads ||
+       c.query_heads%c.kv_heads || c.head_dim<32 || c.head_dim%32 ||
+       !std::isfinite(c.softmax_scale) || c.softmax_scale<0 ||
+       c.max_query_rows<1 || c.max_query_rows>128 || c.initial_capacity<32 ||
        c.initial_capacity%32 || c.max_capacity<c.initial_capacity || c.max_capacity>32768 ||
        c.max_capacity%32 || (c.kv_tile!=256 && c.kv_tile!=512 && c.kv_tile!=1024 &&
        c.kv_tile!=2048 && c.kv_tile!=4096) ||
-       (core_mask(c)!=1 && core_mask(c)!=2 && core_mask(c)!=3 && core_mask(c)!=4 && core_mask(c)!=7) ||
-       c.kv_heads<__builtin_popcount(core_mask(c)) ||
+       (c.core_mask!=0 && c.core_mask!=1 && c.core_mask!=2 && c.core_mask!=3 && c.core_mask!=4 && c.core_mask!=7) ||
        (c.flags!=RK_NPU_ATTENTION_F16_FIXED_SHIFT_EXPERIMENTAL && c.flags!=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX) || !std::isfinite(c.exp_shift) ||
        (c.mask_mode!=RK_NPU_ATTENTION_F16_CAUSAL && c.mask_mode!=RK_NPU_ATTENTION_F16_NO_MASK &&
         c.mask_mode!=RK_NPU_ATTENTION_F16_BOOLEAN_MASK))
         return RK_NPU_ERR_PARAM;
     return RK_NPU_OK;
+}
+Shape gqa_shape(const rk_npu_attention_f16_config& c){
+    return {c.head_dim,c.head_dim,c.query_heads/c.kv_heads,false,
+        c.softmax_scale?c.softmax_scale:1/std::sqrt(float(c.head_dim))};
 }
 
 static void ones(Buffer& b,int heads,int blocks,int n,int tile,int d,int length){

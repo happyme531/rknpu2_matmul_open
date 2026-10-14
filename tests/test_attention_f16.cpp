@@ -35,34 +35,35 @@ Work work(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c){rk_npu_at
 std::vector<uint16_t> random_data(size_t n,int seed,float sigma=.7f){std::mt19937 rng(seed);std::normal_distribution<float> dist(0,sigma);std::vector<uint16_t> v(n);for(auto& x:v)x=bits::float_to_half(dist(rng));return v;}
 std::vector<uint16_t> prefix(const std::vector<uint16_t>& full,int stride,int n){std::vector<uint16_t> out(size_t(8)*n*128);if(n)for(int h=0;h<8;++h)std::copy_n(full.data()+size_t(h)*stride*128,size_t(n)*128,out.data()+size_t(h)*n*128);return out;}
 std::vector<float> reference(const std::vector<uint16_t>& q,const std::vector<uint16_t>& k,const std::vector<uint16_t>& v,
-    int rows,int length,int start,rk_npu_attention_f16_mask_mode mode,const rk_npu_attention_f16_boolean_mask* mask,int heads=32){
-    std::vector<float> out(size_t(heads)*rows*128),scores(length),qf(128);
+    int rows,int length,int start,rk_npu_attention_f16_mask_mode mode,const rk_npu_attention_f16_boolean_mask* mask,int heads=32,int kv_heads=8,int dimension=128,float scale=0){
+    const float divisor=scale>0?1/scale:std::sqrt(float(dimension));
+    std::vector<float> out(size_t(heads)*rows*dimension),scores(length),qf(dimension);
     for(int h=0;h<heads;++h)for(int r=0;r<rows;++r){
-        for(int c=0;c<128;++c)qf[c]=bits::half_to_float(q[(size_t(h)*rows+r)*128+c])/std::sqrt(128.f);
+        for(int c=0;c<dimension;++c)qf[c]=bits::half_to_float(q[(size_t(h)*rows+r)*dimension+c])/divisor;
         float mx=-INFINITY;std::vector<int> valid;
         for(int j=0;j<length;++j){
             bool keep=mode==RK_NPU_ATTENTION_F16_CAUSAL?j<=start+r:true;
             if(mask){int hi=mask->heads==1?0:h,ri=mask->query_rows==1?0:mask->query_offset+r,ki=mask->key_length==1?0:j;
                 keep=mask->data[uint64_t(hi)*mask->head_stride+uint64_t(ri)*mask->query_stride+uint64_t(ki)*mask->key_stride]!=0;}
-            if(!keep)continue;float sum=0;const auto* src=k.data()+(size_t(h/4)*length+j)*128;
+            if(!keep)continue;float sum=0;const auto* src=k.data()+(size_t(h/(heads/kv_heads))*length+j)*dimension;
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
             auto a=vdupq_n_f32(0),b=a;
-            for(int c=0;c<128;c+=8){auto x=vreinterpretq_f16_u16(vld1q_u16(src+c));a=vfmaq_f32(a,vld1q_f32(qf.data()+c),vcvt_f32_f16(vget_low_f16(x)));b=vfmaq_f32(b,vld1q_f32(qf.data()+c+4),vcvt_f32_f16(vget_high_f16(x)));}
+            for(int c=0;c<dimension;c+=8){auto x=vreinterpretq_f16_u16(vld1q_u16(src+c));a=vfmaq_f32(a,vld1q_f32(qf.data()+c),vcvt_f32_f16(vget_low_f16(x)));b=vfmaq_f32(b,vld1q_f32(qf.data()+c+4),vcvt_f32_f16(vget_high_f16(x)));}
             sum=vaddvq_f32(vaddq_f32(a,b));
 #else
-            for(int c=0;c<128;++c)sum+=qf[c]*bits::half_to_float(src[c]);
+            for(int c=0;c<dimension;++c)sum+=qf[c]*bits::half_to_float(src[c]);
 #endif
             scores[j]=sum;mx=std::max(mx,sum);valid.push_back(j);
         }
-        if(valid.empty())continue;float z=0;auto* dst=out.data()+(size_t(h)*rows+r)*128;
-        for(int j:valid){float e=std::exp(scores[j]-mx);z+=e;const auto* src=v.data()+(size_t(h/4)*length+j)*128;
+        if(valid.empty())continue;float z=0;auto* dst=out.data()+(size_t(h)*rows+r)*dimension;
+        for(int j:valid){float e=std::exp(scores[j]-mx);z+=e;const auto* src=v.data()+(size_t(h/(heads/kv_heads))*length+j)*dimension;
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-            for(int c=0;c<128;c+=8){auto x=vreinterpretq_f16_u16(vld1q_u16(src+c));vst1q_f32(dst+c,vfmaq_n_f32(vld1q_f32(dst+c),vcvt_f32_f16(vget_low_f16(x)),e));vst1q_f32(dst+c+4,vfmaq_n_f32(vld1q_f32(dst+c+4),vcvt_f32_f16(vget_high_f16(x)),e));}
+            for(int c=0;c<dimension;c+=8){auto x=vreinterpretq_f16_u16(vld1q_u16(src+c));vst1q_f32(dst+c,vfmaq_n_f32(vld1q_f32(dst+c),vcvt_f32_f16(vget_low_f16(x)),e));vst1q_f32(dst+c+4,vfmaq_n_f32(vld1q_f32(dst+c+4),vcvt_f32_f16(vget_high_f16(x)),e));}
 #else
-            for(int c=0;c<128;++c)dst[c]+=e*bits::half_to_float(src[c]);
+            for(int c=0;c<dimension;++c)dst[c]+=e*bits::half_to_float(src[c]);
 #endif
         }
-        for(int c=0;c<128;++c)dst[c]/=z;
+        for(int c=0;c<dimension;++c)dst[c]/=z;
     }return out;
 }
 double error(const std::vector<float>& a,const std::vector<float>& b){double d=0,n=0;require(a.size()==b.size(),"length mismatch");for(size_t i=0;i<a.size();++i){require(std::isfinite(a[i]),"nonfinite output");double x=a[i]-b[i];d+=x*x;n+=double(b[i])*b[i];}return std::sqrt(d/std::max(n,1e-30));}
@@ -102,6 +103,27 @@ void dirty_policy_cpu(){
     std::puts("attention dirty sync environment/threshold CPU contract PASS");
 }
 void cpu(){
+    for(int dimension:{32,64,96,128,160,192,256})for(int ratio:{1,2,3,4,5,8,16}){
+        rk_npu_attention_f16_config c;rk_npu_attention_f16_config_init(&c);
+        c.head_dim=dimension;c.kv_heads=2;c.query_heads=2*ratio;c.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;c.max_query_rows=128;
+        for(int rows:{1,3,32,64,128})for(float scale:{0.f,1.f/dimension}){
+            c.softmax_scale=scale;rk_npu_attention_f16_sizes s{};
+            check(rk_npu_attention_f16_query(&c,256,rows,129,&s));
+            require(s.physical_rows<=((ratio*rows+3)/4*4) && s.physical_rows>=((ratio+3)/4*4),"generic grouped row sizing");
+            require(s.key_bytes==uint64_t(2)*256*dimension*2,"generic KV sizing");
+            require(s.output_bytes==uint64_t(c.query_heads)*rows*dimension*4,"generic output sizing");
+        }
+        ++c.query_heads;rk_npu_attention_f16_sizes s{};
+        require(rk_npu_attention_f16_query(&c,256,1,129,&s)==RK_NPU_ERR_PARAM,"integer GQA grouping");
+    }
+    {
+        rk_npu_attention_f16_config c;rk_npu_attention_f16_config_init(&c);
+        c.head_dim=192;c.kv_heads=1;c.query_heads=16;c.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;
+        rk_npu_attention_f16_sizes s{};
+        check(rk_npu_attention_f16_query(&c,256,32,129,&s));
+        require(s.physical_rows==256 && s.output_bytes==uint64_t(16)*32*192*4,"internal query-row splitting sizing");
+    }
+    std::puts("generic GQA dimensions/grouping/scale CPU contract PASS");
     dirty_policy_cpu();
     // Check every dirty stripe (including denominator), base offsets, bounds,
     // merging and K32 edges without a device. Widths cover compact tails too.
@@ -138,9 +160,9 @@ void cpu(){
     for(int core:{1,2,3,4,7}){c.core_mask=core;check(rk_npu_attention_f16_query(&c,8192,32,4096,&s));}
     for(int core:{5,6,8}){c.core_mask=core;require(rk_npu_attention_f16_query(&c,8192,1,129,&s)==RK_NPU_ERR_PARAM,"unsupported core mask");}
     c.core_mask=7;c.kv_heads=2;c.query_heads=8;
-    require(rk_npu_attention_f16_query(&c,8192,1,129,&s)==RK_NPU_ERR_PARAM,"one KV head per core");
+    check(rk_npu_attention_f16_query(&c,8192,1,129,&s));require(s.active_core_mask==3,"active cores bounded by KV heads");
     c.kv_heads=8;c.query_heads=32;
-    c.core_mask=1;c.head_dim=64;require(rk_npu_attention_f16_query(&c,8192,1,129,&s)==RK_NPU_ERR_PARAM,"shape gate");
+    c.core_mask=1;c.head_dim=80;require(rk_npu_attention_f16_query(&c,8192,1,129,&s)==RK_NPU_ERR_PARAM,"head dimension alignment");
     rk_npu_attention_f16_workspace* ws=reinterpret_cast<rk_npu_attention_f16_workspace*>(1);
     require(rk_npu_attention_f16_prepare(nullptr,&c,&ws)==RK_NPU_ERR_PARAM && !ws,"create failure output");
     std::puts("attention CPU contract PASS");
@@ -388,7 +410,76 @@ void dirty_sync_board(int core,int tile){
     }
     std::puts("CHECK dirty sync multi-token/tile/K32/reserve/reload/earlier-query board PASS");
 }
-int main(int argc,char** argv)try{cpu();if(argc>1 && std::string(argv[1])=="--mixed-canary")mixed_canary(argc>2?std::stoi(argv[2]):7,argc>3?std::stoi(argv[3]):4096);
+void generic_board(){
+    Lock l1("/tmp/rknpu_lowlevel_submit.lock"),l2("/tmp/rk3588_npu_submit.lock");Device dev;
+    struct Geometry {int qh,kh,d;float scale;};
+    for(auto geometry:{Geometry{4,4,32,0},Geometry{12,4,96,0},Geometry{20,4,160,0},
+        Geometry{16,1,192,0},Geometry{16,4,256,0},Geometry{32,8,128,0},
+        Geometry{40,8,64,1.f/64},Geometry{16,2,128,0}}){
+        const auto [qh,kh,d,scale]=geometry;const int length=129;
+        rk_npu_attention_f16_config cfg;rk_npu_attention_f16_config_init(&cfg);
+        cfg.query_heads=qh;cfg.kv_heads=kh;cfg.head_dim=d;cfg.softmax_scale=scale;
+        cfg.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;cfg.initial_capacity=32;cfg.max_capacity=512;cfg.kv_tile=256;cfg.max_query_rows=128;cfg.core_mask=7;
+        auto c=cache(dev.domain,cfg);auto w=work(dev.domain,cfg);
+        auto k=random_data(size_t(kh)*length*d,111),v=random_data(k.size(),112,.5f);
+        check(rk_npu_attention_f16_cache_load(dev.ctx,c.get(),k.data(),v.data(),length));
+        double maximum=0;
+        for(int rows:{1,3,31,32,64,128}){
+            auto q=random_data(size_t(qh)*rows*d,120+rows);std::vector<float> out(q.size());
+            check(rk_npu_attention_f16_prepare_query(dev.ctx,w.get(),c.get(),rows,length-rows));
+            rk_npu_attention_f16_timings timing{};
+            check(rk_npu_attention_f16_run(dev.ctx,w.get(),c.get(),q.data(),rows,length-rows,out.data(),&timing,nullptr));
+            const auto expected=reference(q,k,v,rows,length,length-rows,RK_NPU_ATTENTION_F16_CAUSAL,nullptr,qh,kh,d,scale);
+            const double relative=error(out,expected);maximum=std::max(maximum,relative);
+            require(relative<.01 && timing.total_us>0 && timing.tasks>0,"generic GQA CPU reference and full-call timings");
+        }
+        for(auto mode:{RK_NPU_ATTENTION_F16_NO_MASK,RK_NPU_ATTENTION_F16_BOOLEAN_MASK}){
+            auto masked_cfg=cfg;masked_cfg.mask_mode=mode;auto masked_work=work(dev.domain,masked_cfg);
+            const int rows=65;auto q=random_data(size_t(qh)*rows*d,190+int(mode));std::vector<float> out(q.size());
+            std::vector<uint8_t> visible(size_t(qh)*(rows+3)*length);
+            for(size_t i=0;i<visible.size();++i)visible[i]=(i%7)!=0;
+            rk_npu_attention_f16_boolean_mask mask{};
+            rk_npu_attention_f16_boolean_mask_init(&mask,visible.data(),visible.size(),qh,rows+3,length);
+            mask.query_offset=3;mask.version=1;
+            const auto* active=mode==RK_NPU_ATTENTION_F16_BOOLEAN_MASK?&mask:nullptr;
+            check(rk_npu_attention_f16_run(dev.ctx,masked_work.get(),c.get(),q.data(),rows,0,out.data(),nullptr,active));
+            const double relative=error(out,reference(q,k,v,rows,length,0,mode,active,qh,kh,d,scale));
+            maximum=std::max(maximum,relative);require(relative<.01,"generic split no-mask/boolean reference");
+        }
+        rk_npu_attention_f16_cache_info before{},after{};
+        check(rk_npu_attention_f16_cache_get_info(c.get(),&before));
+        check(rk_npu_attention_f16_cache_truncate(c.get(),17));
+        check(rk_npu_attention_f16_cache_get_info(c.get(),&after));
+        require(after.length==17 && after.capacity==before.capacity &&
+            after.generation==before.generation && after.key_bytes==before.key_bytes &&
+            after.value_bytes==before.value_bytes && after.tail_bytes==before.tail_bytes,"truncate retains allocation");
+        auto q=random_data(size_t(qh)*d,130);std::vector<float> out(q.size());
+        std::vector<uint16_t> retained_k(size_t(kh)*19*d),retained_v(retained_k.size());
+        for(int h=0;h<kh;++h){
+            std::copy_n(k.data()+size_t(h)*length*d,17*d,retained_k.data()+size_t(h)*19*d);
+            std::copy_n(v.data()+size_t(h)*length*d,17*d,retained_v.data()+size_t(h)*19*d);
+        }
+        auto new_k=random_data(size_t(kh)*2*d,140),new_v=random_data(new_k.size(),141,.5f);
+        check(rk_npu_attention_f16_cache_append(dev.ctx,c.get(),new_k.data(),new_v.data(),2));
+        for(int h=0;h<kh;++h){
+            std::copy_n(new_k.data()+size_t(h)*2*d,2*d,retained_k.data()+(size_t(h)*19+17)*d);
+            std::copy_n(new_v.data()+size_t(h)*2*d,2*d,retained_v.data()+(size_t(h)*19+17)*d);
+        }
+        check(rk_npu_attention_f16_run(dev.ctx,w.get(),c.get(),q.data(),1,18,out.data(),nullptr,nullptr));
+        const auto expected=reference(q,retained_k,retained_v,1,19,18,RK_NPU_ATTENTION_F16_CAUSAL,nullptr,qh,kh,d,scale);
+        const double relative=error(out,expected);maximum=std::max(maximum,relative);
+        require(relative<.01,"generic GQA replacement append reference");
+        check(rk_npu_attention_f16_cache_truncate(c.get(),0));
+        check(rk_npu_attention_f16_cache_append(dev.ctx,c.get(),new_k.data(),new_v.data(),2));
+        check(rk_npu_attention_f16_run(dev.ctx,w.get(),c.get(),q.data(),1,1,out.data(),nullptr,nullptr));
+        const double reset_error=error(out,reference(q,new_k,new_v,1,2,1,RK_NPU_ATTENTION_F16_CAUSAL,nullptr,qh,kh,d,scale));
+        maximum=std::max(maximum,reset_error);require(reset_error<.01,"generic GQA reset and reuse reference");
+        std::printf("CHECK generic GQA Hq=%d Hkv=%d D=%d scale=%g M1/3/31/32/64/128 grow/truncate/append/reset max_relative_l2=%g PASS\n",qh,kh,d,scale,maximum);
+        std::fflush(stdout);
+    }
+}
+int main(int argc,char** argv)try{cpu();if(argc>1 && std::string(argv[1])=="--generic-gqa")generic_board();
+else if(argc>1 && std::string(argv[1])=="--mixed-canary")mixed_canary(argc>2?std::stoi(argv[2]):7,argc>3?std::stoi(argv[3]):4096);
 else if(argc>1 && std::string(argv[1])=="--dirty-sync-regression")dirty_sync_board(argc>2?std::stoi(argv[2]):7,argc>3?std::stoi(argv[3]):512);
 else if(argc>1 && std::string(argv[1])=="--attention-mixed")attention_mixed_canary(argc>2?std::stoi(argv[2]):7,argc>3?std::stoi(argv[3]):8191,argc>4);
 else if(argc>1 && std::string(argv[1])=="--board"){

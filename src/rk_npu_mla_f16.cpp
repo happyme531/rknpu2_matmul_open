@@ -32,7 +32,7 @@ rk_npu_attention_f16_config engine_config(const rk_npu_mla_f16_config& c,int row
     const int groups=c.mode==RK_NPU_MLA_F16_ABSORBED && rows==1?
         __builtin_popcount(c.core_mask?c.core_mask:1):H/group(c,rows);
     return {H,groups,QK,c.max_query_rows,c.kv_tile,c.initial_capacity,c.max_capacity,
-        c.core_mask,c.timeout_ms,c.flags,c.exp_shift,c.mask_mode};
+        c.core_mask,c.timeout_ms,c.flags,c.exp_shift,c.mask_mode,0.f};
 }
 Shape engine_shape(const rk_npu_mla_f16_config& c,int rows=32){
     return {c.mode==RK_NPU_MLA_F16_ABSORBED?C+R:QK,

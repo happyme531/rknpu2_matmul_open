@@ -267,17 +267,18 @@ void Graph::update_mask(int start,const rk_npu_attention_f16_boolean_mask* b,int
     if(!incremental)mask.range(0,size_t(cfg.kv_heads)*span*m*2);
     mask_start=length;saved_mask=*b;
 }
-void Graph::pack_q(const uint16_t* query){
+void Graph::pack_q(const uint16_t* query,int tensor_rows,int tensor_offset){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.query_pack", "query_rows", rows);
 #ifdef ATTENTION_NEON
     const auto scale=vdupq_n_f16(float16_t(shape.scale));
 #endif
+    const int query_stride=tensor_rows?tensor_rows:rows;
     for(int hi=0;hi<cfg.kv_heads;++hi){
-    const int real_rows=shape.heads(cfg,hi)*rows,first=shape.first_head(cfg,hi)*rows;
+    const int real_rows=shape.heads(cfg,hi)*rows,first=shape.first_head(cfg,hi);
     for(int kb=0;kb<shape.key_dim/8;++kb)for(int r=0;r<m;++r){
         auto* dst=q.data()+((size_t(hi)*(shape.key_dim/8)+kb)*m+r)*8;
         if(r>=real_rows){std::fill_n(dst,8,0);continue;}
-        const auto* src=query+(size_t(first)+r)*shape.key_dim+kb*8;
+        const auto* src=query+((size_t(first)+r/rows)*query_stride+tensor_offset+r%rows)*shape.key_dim+kb*8;
 #ifdef ATTENTION_NEON
         vst1q_u16(dst,vreinterpretq_u16_f16(vmulq_f16(vreinterpretq_f16_u16(vld1q_u16(src)),scale)));
 #else
@@ -556,9 +557,10 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
     else scan(std::integral_constant<int,32>{});
     if(!finite.load())throw Error{RK_NPU_ERR_PARAM};
 }
-void Graph::finish(float* output){
+void Graph::finish(float* output,int tensor_rows,int tensor_offset){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.output_finish", "query_rows", rows);
     const size_t stride=size_t(shape.value_dim+32)*m,count=sum.size();
+    const int output_stride=tensor_rows?tensor_rows:rows;
     for(int hi=0;hi<cfg.kv_heads;++hi){
         for(int block=0;block<blocks;++block){
             const auto* src=partial.data()+size_t(hi*blocks+block)*stride;
@@ -575,7 +577,8 @@ void Graph::finish(float* output){
         for(int r=0;r<shape.heads(cfg,hi)*rows;++r){
             const float z=sum[size_t(shape.value_dim/8)*m*8+r*8],inverse=z==0?0:1.f/z;
             for(int cb=0;cb<shape.value_dim/8;++cb){
-                const auto* src=sum.data()+size_t(cb)*m*8+r*8;auto* dst=output+(size_t(shape.first_head(cfg,hi))*rows+r)*shape.value_dim+cb*8;
+                const auto* src=sum.data()+size_t(cb)*m*8+r*8;
+                auto* dst=output+((size_t(shape.first_head(cfg,hi))+r/rows)*output_stride+tensor_offset+r%rows)*shape.value_dim+cb*8;
 #ifdef ATTENTION_NEON
                 vst1q_f32(dst,vmulq_n_f32(vld1q_f32(src),inverse));vst1q_f32(dst+4,vmulq_n_f32(vld1q_f32(src+4),inverse));
 #else
@@ -615,7 +618,7 @@ void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_ti
     t.tail_stage_us=elapsed(a,b);t.prepare_us=elapsed(b,Clock::now());t.compute_length=span;t.tasks=graph->tasks;
 }
 rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,int rows,int start,float* output,
-    const rk_npu_attention_f16_boolean_mask* mask){
+    const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows,int tensor_offset){
     RK_NPU_TRACE_EVENT("rknpu", "attention.run", "query_rows", rows, "query_start", start,
         "query_heads", cfg.query_heads, "kv_heads", cfg.kv_heads,
         "head_dim", cfg.head_dim, "kv_length", cache.length,
@@ -626,7 +629,7 @@ rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,i
     geometry(cache,rows,start,t);auto prepared=Clock::now();
     const bool stable=cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;
     if(!stable)graph->update_mask(start,mask,cache.length);auto masked=Clock::now();
-    graph->pack_q(query);auto packed=Clock::now();
+    graph->pack_q(query,tensor_rows,tensor_offset);auto packed=Clock::now();
     try{
         if(stable) {
             RK_NPU_TRACE_EVENT("rknpu.detail", "attention.qk_submit");
@@ -649,7 +652,7 @@ rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,i
     { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.output_sync");
       graph->partial.range(0,size_t(cfg.kv_heads)*graph->blocks*(shape.value_dim+32)*graph->m*2,RK_NPU_SYNC_FROM_DEVICE); }
     auto synced=Clock::now();
-    graph->finish(output);auto done=Clock::now();t.mask_update_us=elapsed(prepared,masked);t.query_pack_us=elapsed(masked,packed);
+    graph->finish(output,tensor_rows,tensor_offset);auto done=Clock::now();t.mask_update_us=elapsed(prepared,masked);t.query_pack_us=elapsed(masked,packed);
     t.submit_us=elapsed(packed,computed);t.output_sync_us=elapsed(computed,synced);t.finish_us=elapsed(synced,done);t.total_us=elapsed(begin,done);return t;
 }
 
@@ -666,16 +669,68 @@ int query_engine(const rk_npu_attention_f16_config& config,const Shape& shape,
     // mask tensor or DPU mask RDMA is used by either NPU submit.
     result.mask_bytes=c->flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX || c->mask_mode==RK_NPU_ATTENTION_F16_NO_MASK?0:result.score_bytes;
     result.partial_bytes=size_t(h)*ceil_div(s,c->kv_tile)*n*m*2;result.output_bytes=size_t(c->query_heads)*rows*shape.value_dim*4;
-    result.compute_length=s;result.physical_rows=m;
+    result.compute_length=s;result.physical_rows=m;result.active_core_mask=core_mask(*c);
     rk_npu_matmul_f16_config f{};rk_npu_matmul_f16_config_init(&f,m,s,shape.key_dim,RK_NPU_FUSE_NONE);
     f.a_layout=RK_NPU_F16_A_LAYOUT_NATIVE_K8_M8;f.d_layout=RK_NPU_F16_D_LAYOUT_NATIVE_N8_M8;f.core_mask=core_mask(*c)&-core_mask(*c);
     f.n_tile=std::min(s,QK_CHANNEL_TILE);
-    rk_npu_matmul_sizes sizes{};int rc=rk_npu_matmul_f16_batch_query(h,&f,&sizes);if(rc)return rc;result.tasks=sizes.num_tasks;
+    rk_npu_matmul_sizes sizes{};int rc=rk_npu_matmul_f16_batch_query(h,&f,&sizes);if(rc)return rc;
+    // Each graph binds whole grouped QK row tiles. The GQA entrypoint splits
+    // logical query rows internally when native FP16 needs another M tile.
+    if(sizes.num_tasks!=h*ceil_div(s,QK_CHANNEL_TILE))return RK_NPU_ERR_PARAM;
+    result.tasks=sizes.num_tasks;
     for(int k=0;k<2;++k){const int count=k?s%c->kv_tile:s/c->kv_tile;
         if(!count)continue;f.N=shape.value_dim+1;f.K=k?count:c->kv_tile;f.n_tile=0;
         rc=rk_npu_matmul_f16_batch_query(k?h:h*count,&f,&sizes);if(rc)return rc;result.tasks+=sizes.num_tasks;
     }
     if(result.tasks>4095)return RK_NPU_ERR_PARAM;out=result;return 0;
+}
+
+int query_gqa(const rk_npu_attention_f16_config& cfg,int capacity,int rows,int length,
+    rk_npu_attention_f16_sizes& out,int& block_rows){
+    if(rows<1 || rows>cfg.max_query_rows)return RK_NPU_ERR_PARAM;
+    const auto shape=gqa_shape(cfg);block_rows=std::min(rows,32);
+    int rc=query_engine(cfg,shape,capacity,block_rows,length,out);
+    while(rc && block_rows>1){block_rows=(block_rows+1)/2;rc=query_engine(cfg,shape,capacity,block_rows,length,out);}
+    if(rc)return rc;
+    out.output_bytes=uint64_t(cfg.query_heads)*rows*cfg.head_dim*sizeof(float);
+    out.tasks*=ceil_div(rows,block_rows);
+    return RK_NPU_OK;
+}
+static void add_timings(rk_npu_attention_f16_timings& sum,const rk_npu_attention_f16_timings& part){
+    for(auto field:{&rk_npu_attention_f16_timings::reserve_us,&rk_npu_attention_f16_timings::kv_update_us,
+        &rk_npu_attention_f16_timings::prepare_us,&rk_npu_attention_f16_timings::tail_stage_us,
+        &rk_npu_attention_f16_timings::mask_update_us,&rk_npu_attention_f16_timings::query_pack_us,
+        &rk_npu_attention_f16_timings::submit_us,&rk_npu_attention_f16_timings::hardware_us,
+        &rk_npu_attention_f16_timings::output_sync_us,&rk_npu_attention_f16_timings::finish_us})sum.*field+=part.*field;
+    sum.compute_length=std::max(sum.compute_length,part.compute_length);sum.tasks+=part.tasks;
+}
+void Workspace::prepare_gqa(Cache& cache,int rows,int start){
+    compatible(*this,cache);const int length=prefix_length(cfg,cache,rows,start);
+    int block_rows;rk_npu_attention_f16_sizes sizes{};
+    check(query_gqa(cfg,cache.capacity,rows,length,sizes,block_rows));
+    for(int first=0;first<rows;first+=block_rows){
+        rk_npu_attention_f16_timings part{};geometry(cache,std::min(block_rows,rows-first),start+first,part);
+    }
+}
+rk_npu_attention_f16_timings Workspace::run_gqa(Cache& cache,const uint16_t* query,int rows,int start,float* output,
+    const rk_npu_attention_f16_boolean_mask* mask){
+    if(rows==1)return run(cache,query,rows,start,output,mask);
+    if(!query || !output)throw Error{RK_NPU_ERR_PARAM};
+    compatible(*this,cache);validate_mask(cfg,mask,rows,cache.length);const auto begin=Clock::now();
+    const int length=prefix_length(cfg,cache,rows,start);int block_rows;rk_npu_attention_f16_sizes sizes{};
+    check(query_gqa(cfg,cache.capacity,rows,length,sizes,block_rows));
+    const double planning_us=elapsed(begin,Clock::now());
+    if(block_rows==rows){auto t=run(cache,query,rows,start,output,mask);
+        t.prepare_us+=planning_us;t.total_us=elapsed(begin,Clock::now());return t;}
+    rk_npu_attention_f16_timings total{};
+    total.prepare_us=planning_us;
+    for(int first=0;first<rows;first+=block_rows){
+        const int count=std::min(block_rows,rows-first);
+        auto view=mask?*mask:rk_npu_attention_f16_boolean_mask{};
+        if(mask && view.query_rows!=1)view.query_offset+=first;
+        add_timings(total,run(cache,query,count,start+first,output,mask?&view:nullptr,rows,first));
+    }
+    total.total_us=elapsed(begin,Clock::now());return total;
 }
 
 template<class F>int api(F&& f)noexcept{try{f();return RK_NPU_OK;}catch(Error e){return e.code;}catch(const std::bad_alloc&){return RK_NPU_ERR_NOMEM;}catch(...){return RK_NPU_ERR_PARAM;}}
@@ -684,7 +739,7 @@ template<class F>int api(F&& f)noexcept{try{f();return RK_NPU_OK;}catch(Error e)
 using namespace rknpu2_matmul_open::attention;
 extern "C" {
 void rk_npu_attention_f16_config_init(rk_npu_attention_f16_config* c){
-    if(!c)return;*c={32,8,128,32,512,128,32768,1,2000,0,4.f,RK_NPU_ATTENTION_F16_CAUSAL};
+    if(!c)return;*c={32,8,128,32,512,128,32768,1,2000,0,4.f,RK_NPU_ATTENTION_F16_CAUSAL,0.f};
 }
 void rk_npu_attention_f16_boolean_mask_init(rk_npu_attention_f16_boolean_mask* b,const uint8_t* data,uint64_t bytes,int h,int q,int k){
     if(!b)return;*b={};b->data=data;b->bytes=bytes;b->heads=h;b->query_rows=q;b->key_length=k;
@@ -692,11 +747,11 @@ void rk_npu_attention_f16_boolean_mask_init(rk_npu_attention_f16_boolean_mask* b
 }
 int rk_npu_attention_f16_query(const rk_npu_attention_f16_config* c,int capacity,int rows,int length,rk_npu_attention_f16_sizes* out){
     if(!c || !out || validate(*c))return RK_NPU_ERR_PARAM;
-    return query_engine(*c,Shape{},capacity,rows,length,*out);
+    int block_rows;return query_gqa(*c,capacity,rows,length,*out,block_rows);
 }
 int rk_npu_attention_f16_cache_create(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config* c,rk_npu_attention_f16_cache** out){
     if(!out)return RK_NPU_ERR_PARAM;*out=nullptr;if(!d || !c || validate(*c))return RK_NPU_ERR_PARAM;
-    return api([&]{*out=new rk_npu_attention_f16_cache(d,*c);});
+    return api([&]{*out=new rk_npu_attention_f16_cache(d,*c,gqa_shape(*c));});
 }
 void rk_npu_attention_f16_cache_free(rk_npu_attention_f16_cache* c){delete c;}
 int rk_npu_attention_f16_cache_get_info(rk_npu_attention_f16_cache* c,rk_npu_attention_f16_cache_info* out){
@@ -716,16 +771,16 @@ int rk_npu_attention_f16_cache_truncate(rk_npu_attention_f16_cache* c,int length
 }
 int rk_npu_attention_f16_prepare(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config* c,rk_npu_attention_f16_workspace** out){
     if(!out)return RK_NPU_ERR_PARAM;*out=nullptr;if(!d || !c || validate(*c))return RK_NPU_ERR_PARAM;
-    return api([&]{*out=new rk_npu_attention_f16_workspace(d,*c);});
+    return api([&]{*out=new rk_npu_attention_f16_workspace(d,*c,gqa_shape(*c));});
 }
 void rk_npu_attention_f16_workspace_free(rk_npu_attention_f16_workspace* w){delete w;}
 int rk_npu_attention_f16_prepare_query(rk_npu_ctx* ctx,rk_npu_attention_f16_workspace* w,rk_npu_attention_f16_cache* c,int rows,int start){
-    if(!w || !c)return RK_NPU_ERR_PARAM;return api([&]{context(ctx,w->lease.domain);Lock a(w->busy),b(c->busy);rk_npu_attention_f16_timings t{};w->geometry(*c,rows,start,t);});
+    if(!w || !c)return RK_NPU_ERR_PARAM;return api([&]{context(ctx,w->lease.domain);Lock a(w->busy),b(c->busy);w->prepare_gqa(*c,rows,start);});
 }
 int rk_npu_attention_f16_run(rk_npu_ctx* ctx,rk_npu_attention_f16_workspace* w,rk_npu_attention_f16_cache* c,
     const uint16_t* q,int rows,int start,float* output,rk_npu_attention_f16_timings* timings,const rk_npu_attention_f16_boolean_mask* mask){
     if(!w || !c)return RK_NPU_ERR_PARAM;return api([&]{context(ctx,w->lease.domain);Lock a(w->busy),b(c->busy);
-        const auto t=w->run(*c,q,rows,start,output,mask);if(timings)*timings=t;});
+        const auto t=w->run_gqa(*c,q,rows,start,output,mask);if(timings)*timings=t;});
 }
 int rk_npu_attention_f16_decode_step(rk_npu_ctx* ctx,rk_npu_attention_f16_workspace* w,rk_npu_attention_f16_cache* c,
     const uint16_t* q,const uint16_t* k,const uint16_t* v,float* output,rk_npu_attention_f16_timings* timings,const rk_npu_attention_f16_boolean_mask* mask){

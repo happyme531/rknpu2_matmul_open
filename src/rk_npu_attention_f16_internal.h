@@ -26,7 +26,6 @@ inline double elapsed(Clock::time_point a,Clock::time_point b){return std::chron
 inline uint16_t half(float x){return bits::float_to_half(x);}
 inline float widen(uint16_t x){return bits::half_to_float(x);}
 int validate(const rk_npu_attention_f16_config& cfg);
-// Private engine geometry. The public GQA contract keeps its original shape;
 // MLA uses independent QK/V dimensions and optionally one shared latent KV.
 struct Shape {
     int key_dim=128,value_dim=128,group=4;
@@ -41,11 +40,16 @@ struct Shape {
         return balanced_heads?index*(c.query_heads/c.kv_heads)+std::min(index,c.query_heads%c.kv_heads):index*group;
     }
 };
+Shape gqa_shape(const rk_npu_attention_f16_config& cfg);
 int query_engine(const rk_npu_attention_f16_config& cfg,const Shape& shape,
     int capacity,int rows,int length,rk_npu_attention_f16_sizes& out);
 void validate_boolean_mask(const rk_npu_attention_f16_config& cfg,
     const rk_npu_attention_f16_boolean_mask* mask,int rows,int length);
-inline uint32_t core_mask(const rk_npu_attention_f16_config& c){return c.core_mask?c.core_mask:1;}
+inline uint32_t core_mask(const rk_npu_attention_f16_config& c){
+    uint32_t selected=c.core_mask?c.core_mask:1;
+    while(c.kv_heads>0 && __builtin_popcount(selected)>c.kv_heads)selected&=~(1u<<(31-__builtin_clz(selected)));
+    return selected;
+}
 inline uint64_t next_identity(){static std::atomic<uint64_t> serial{1};return serial.fetch_add(1);}
 struct Lease {
     rk_npu_iommu_domain* domain;
@@ -154,10 +158,10 @@ struct Graph {
     explicit Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,int s,Cache& cache,Shape shape,Graph* reuse=nullptr);
     void bind(Cache& cache);
     void update_mask(int start,const rk_npu_attention_f16_boolean_mask* boolean,int length);
-    void pack_q(const uint16_t* query);
+    void pack_q(const uint16_t* query,int tensor_rows=0,int tensor_offset=0);
     double submit(int stage=0);
     void stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
-    void finish(float* output);
+    void finish(float* output,int tensor_rows=0,int tensor_offset=0);
 };
 struct Workspace {
     Lease lease;
@@ -170,7 +174,10 @@ struct Workspace {
     Workspace(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,Shape s={}):lease(d),cfg(c),shape(s){}
     void geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t);
     rk_npu_attention_f16_timings run(Cache& cache,const uint16_t* q,int rows,int start,float* output,
+        const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows=0,int tensor_offset=0);
+    rk_npu_attention_f16_timings run_gqa(Cache& cache,const uint16_t* q,int rows,int start,float* output,
         const rk_npu_attention_f16_boolean_mask* mask);
+    void prepare_gqa(Cache& cache,int rows,int start);
 };
 inline void context(rk_npu_ctx* ctx,rk_npu_iommu_domain* d){if(!ctx || ctx!=d->ctx)throw Error{RK_NPU_ERR_PARAM};}
 inline void compatible(const Workspace& w,const Cache& c){

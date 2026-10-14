@@ -29,8 +29,8 @@ typedef struct {
 void rk_npu_attention_f16_boolean_mask_init(rk_npu_attention_f16_boolean_mask* mask,
     const uint8_t* data, uint64_t bytes, int heads, int query_rows, int key_length);
 typedef struct {
-    int query_heads, kv_heads, head_dim;
-    int max_query_rows;       /* 1..32 */
+    int query_heads, kv_heads, head_dim; /* Hq is a positive multiple of Hkv; D is a positive multiple of 32 */
+    int max_query_rows;       /* logical rows per call, 1..128; default 32 */
     int kv_tile;              /* 256/512/1024/2048/4096 */
     int initial_capacity;     /* multiple of 32 */
     int max_capacity;         /* multiple of 32, <=32768 */
@@ -40,11 +40,13 @@ typedef struct {
     uint32_t flags;           /* select FIXED_SHIFT_EXPERIMENTAL or STABLE_SOFTMAX */
     float exp_shift;
     rk_npu_attention_f16_mask_mode mask_mode;
+    float softmax_scale;      /* positive; zero selects 1/sqrt(head_dim) */
 } rk_npu_attention_f16_config;
 typedef struct {
     uint64_t key_bytes, value_bytes, tail_bytes;
     uint64_t query_bytes, score_bytes, mask_bytes, partial_bytes, output_bytes;
     int compute_length, physical_rows, tasks;
+    uint32_t active_core_mask; /* requested cores bounded by KV heads */
 } rk_npu_attention_f16_sizes;
 typedef struct {
     int length, capacity, max_capacity;
@@ -63,7 +65,8 @@ typedef struct rk_npu_attention_f16_workspace rk_npu_attention_f16_workspace;
 /* Defaults describe Hq/Hkv=32/8,d128. flags defaults to zero: opt in explicitly. */
 void rk_npu_attention_f16_config_init(rk_npu_attention_f16_config* cfg);
 /* Pure CPU sizing/validation. kv_length is the causal prefix to compute, not
- * allocated cache capacity. Output tensor is [query_heads,query_rows,128]. */
+ * allocated cache capacity. Buffer sizes describe the largest internal segment;
+ * output_bytes covers [query_heads,query_rows,head_dim], tasks sums all segments. */
 int rk_npu_attention_f16_query(const rk_npu_attention_f16_config* cfg,
     int capacity, int query_rows, int kv_length, rk_npu_attention_f16_sizes* sizes);
 
@@ -79,10 +82,10 @@ int rk_npu_attention_f16_cache_get_info(rk_npu_attention_f16_cache* cache,
 /* Native KV survives reserve; automatic geometric growth is bounded by max_capacity. */
 int rk_npu_attention_f16_cache_reserve(rk_npu_ctx* ctx,
     rk_npu_attention_f16_cache* cache, int capacity);
-/* K/V are compact [kv_heads,length,128]. length=0 accepts NULL pointers. */
+/* K/V are compact [kv_heads,length,head_dim]. length=0 accepts NULL pointers. */
 int rk_npu_attention_f16_cache_load(rk_npu_ctx* ctx,
     rk_npu_attention_f16_cache* cache, const uint16_t* k, const uint16_t* v, int length);
-/* K/V are compact [kv_heads,count,128]; NULL is accepted only for count=0. */
+/* K/V are compact [kv_heads,count,head_dim]; NULL is accepted only for count=0. */
 int rk_npu_attention_f16_cache_append(rk_npu_ctx* ctx,
     rk_npu_attention_f16_cache* cache, const uint16_t* k, const uint16_t* v, int count);
 /* Retain a prefix, 0<=length<=current length, without copying/clearing native
@@ -98,15 +101,16 @@ void rk_npu_attention_f16_workspace_free(rk_npu_attention_f16_workspace* workspa
 int rk_npu_attention_f16_prepare_query(rk_npu_ctx* ctx,
     rk_npu_attention_f16_workspace* workspace, rk_npu_attention_f16_cache* cache,
     int query_rows, int query_start);
-/* Q/O are [query_heads,query_rows,128]. query_start is the first absolute
+/* Q/O are [query_heads,query_rows,head_dim]. query_start is the first absolute
  * query position for causal mode. Each causal row attends through query_start+row.
  * No-mask/boolean modes use all valid KV; query rows can exceed KV length.
- * Computing an earlier prefill chunk never reads the entire reserved capacity. */
+ * The library splits query rows for native layout limits and restores compact
+ * output order. Computing an earlier prefill chunk never reads reserved padding. */
 int rk_npu_attention_f16_run(rk_npu_ctx* ctx,
     rk_npu_attention_f16_workspace* workspace, rk_npu_attention_f16_cache* cache,
     const uint16_t* q, int query_rows, int query_start, float* output,
     rk_npu_attention_f16_timings* timings, const rk_npu_attention_f16_boolean_mask* mask);
-/* Append one K/V[Hkv,128] then run Q[Hq,128]. Includes growth, graph updates,
+/* Append one K/V[Hkv,head_dim] then run Q[Hq,head_dim]. Includes growth, graph updates,
  * cache sync and output processing. Submit/sync failures poison the affected
  * cache; reload it before reuse. Failed submits require a new workspace. */
 int rk_npu_attention_f16_decode_step(rk_npu_ctx* ctx,
