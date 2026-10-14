@@ -1,15 +1,10 @@
 # Ling3 Tiny FP16 Gated MLA
 
-Historical measurement notes named below belong to the parent research workspace;
-raw reports and helper scripts are not bundled with this standalone library.
-The figures describe those experiments, not a fresh release benchmark.
-
 接口：[rk_npu_mla_f16.h](../include/rk_npu_mla_f16.h)。这是直接用户态驱动上的实验性
 Attention 核心，不需要 RKNN runtime、转换器或模型文件。固定维度针对
 [Ling-3.0-tiny 官方配置](https://huggingface.co/inclusionAI/Ling-3.0-tiny/blob/405ba96/config.json)：
 H=16，Q/K=192（内容 128 + RoPE 64），V=128，KV rank=512，Q rank=256。
 MLA 出现在零起始层 3/7/11/15/19/23；其余 Attention 层是 KDA。
-代码依据与原文件 SHA 见 source.json (historical parent-workspace note: `source.json`)。
 
 ## 输入输出与门控位置
 
@@ -67,7 +62,7 @@ K 为 576 channels，PV 为 512+32 channels（包括 denominator 与 padding）�
 大于 N 才启用 V/增量 tail 的脏 stripe 同步。仅设阈值默认 stripe1，
 `RK_NPU_ATTN_DIRTY_SYNC_GROUPS=0` 强制关闭；粒度和阈值在 cache 创建时固定。
 两个变量均未设时仍用原同步，默认 tile512 不变。长上下文不保证小 tile 有收益；
-参数优先级、边界验证及合成性能见 脏同步实验 (historical parent-workspace note: `DIRTY_SYNC.md`)。
+参数优先级、边界验证及合成性能见 脏同步实验。
 
 ## 调用示例
 
@@ -118,7 +113,7 @@ KV capacity 为 32 的倍数且不超过 32768；tile 支持
 选用 4096 而非字段最大值 8192，还避免了板测发现的宽 FP16 任务之后 INT8 超时；
 这一状态切换的硬件内部原因未证实，不改公共 GEMM 的默认策略。
 32K、三种 mask、多 query、cache 增长与 INT8 交错的结果及复现命令见
-长上下文修复记录 (historical parent-workspace note: `LONG_CONTEXT.md`)。
+长上下文修复记录。
 
 末尾的单 query causal decode 看见所有有效 KV，内部跳过冗余 mask RDMA；
 padding 的 V 和 denominator 为零，输出保持逐位一致。预加载未来 KV 后的较早
@@ -169,17 +164,17 @@ NPU fused softmax。此模式忽略 `exp_shift`，保留 FP16 QK/PV 和中间 e/
 stable 多 query causal prefill 按可见前缀裁剪并尽量对齐完整 PV tile；无需 native
 mask tensor，`query().mask_bytes=0`。缓存格式、默认 tile512 和公开 C ABI 保留。
 范围推导、32K及极值回归、同一稳定补丁的反序对照和整模型验证见
-稳定路径性能记录 (historical parent-workspace note: `STABLE_OPTIMIZATION.md`)。
+稳定路径性能记录。
 
 expanded cache 支持 `cache_load_expanded` / `cache_append_expanded`：调用方传
 head-major FP16 `K[16,count,192]`、`V[16,count,128]`，保留既有投影/量化策略。
 只有 expanded 的 create/prepare 可以传 NULL weights；此时非空 latent
 load/append 被拒绝。MindNano 用这两个入口维护六层 native KV 镜像，完整状态
 仍保存原有 BF16 K/V。接入与真实模型基准见
-MindNano MLA 记录 (historical parent-workspace note: `README.md`)。
+MindNano MLA 记录。
 
-验证与板端测量见 tools/mla_probe (historical parent-workspace note: `README.md`)及
-优化后的交错对照 (historical parent-workspace note: `OPTIMIZATION.md`)。
+验证与板端测量见 tools/mla_probe及
+优化后的交错对照。
 与 MindNano 已有实现的实际逐 token 比较见
-decode 曲线与范围 (historical parent-workspace note: `MINDNANO_DECODE.md`)；SDK/raw-driver 混跑的
+decode 曲线与范围；SDK/raw-driver 混跑的
 timeout 仍待集成验证，目前只完成两个独立连续轨迹的性能/输出对照。

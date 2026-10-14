@@ -130,6 +130,7 @@ struct Cache {
     void reserve(int requested);
     void load(const uint16_t* k,const uint16_t* v,int count);
     void append(const uint16_t* k,const uint16_t* v,int count,double* reserve_time=nullptr);
+    void truncate(int count);
     void stage_tail(int span);
     void write(int position,const uint16_t* k,const uint16_t* v,int source_stride,int source_position);
 };

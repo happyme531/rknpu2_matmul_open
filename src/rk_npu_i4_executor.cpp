@@ -1,4 +1,5 @@
 #include "rk_npu_i4_executor.h"
+#include "rk_npu_trace.h"
 #include <chrono>
 
 namespace rknpu2_matmul_open::detail {
@@ -22,16 +23,29 @@ void I4Executor::worker() {
         cv_.wait(lock,[&] { return pending_ || stop_; });
         if (stop_) return;
         const int w=wave_; pending_=false;
+#if RK_NPU_ENABLE_TRACE
+        const uint64_t run_id=trace_run_id_, wave_id=trace_wave_id_;
+#endif
         lock.unlock();
-        const auto start=Clock::now(); const int rc=plan_.submit(w); const double us=elapsed(start);
+        const auto start=Clock::now(); int rc;
+        { RK_NPU_TRACE_EVENT("rknpu.detail", "i4.submit_worker", "wave", w,
+            "run_id", run_id, perfetto::TerminatingFlow::ProcessScoped(wave_id));
+          rc=plan_.submit(w); }
+        const double us=elapsed(start);
         lock.lock(); result_=rc; submit_us_=us; done_=true; cv_.notify_all();
     }
 }
 void I4Executor::submit(int w) {
     std::lock_guard<std::mutex> lock(mutex_);
+#if RK_NPU_ENABLE_TRACE
+    trace_wave_id_=rk_npu_trace::next_id();
+#endif
+    RK_NPU_TRACE_EVENT("rknpu.detail", "i4.submit_dispatch", "wave", w,
+        "run_id", trace_run_id_, perfetto::Flow::ProcessScoped(trace_wave_id_));
     wave_=w; done_=false; pending_=true; cv_.notify_all();
 }
 int I4Executor::wait(rk_npu_i4_timings& times) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "i4.submit_wait", "run_id", trace_run_id_);
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait(lock,[&] { return done_; });
     times.submit_us+=submit_us_;
@@ -44,6 +58,12 @@ int I4Executor::run(const I4Weights& weights, rk_npu_i4_input_producer producer,
         (plan_.retains_partials() && (C || consumer))) return RK_NPU_ERR_PARAM;
     if (busy_.test_and_set(std::memory_order_acquire)) return RK_NPU_ERR_BUSY;
     struct Unlock { std::atomic_flag& f; ~Unlock() { f.clear(std::memory_order_release); } } unlock{busy_};
+#if RK_NPU_ENABLE_TRACE
+    trace_run_id_=rk_npu_trace::next_id();
+#endif
+    RK_NPU_TRACE_EVENT("rknpu.detail", "i4.execute", "run_id", trace_run_id_,
+        "physical_M", plan_.config().M, "K", plan_.config().K, "N", plan_.config().N,
+        "pipeline", plan_.config().pipeline, "cpu_threads", plan_.config().cpu_threads);
     const auto start=Clock::now(); rk_npu_i4_timings times{};
     int rc=plan_.bind(weights);
     const int count=plan_.wave_count();

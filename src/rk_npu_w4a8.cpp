@@ -2,7 +2,9 @@
 #include "rk_npu_w4a8_internal.h"
 #include "rk_npu_i4_executor.h"
 #include "rk_npu_w4a8_cpu.h"
+#include "rk_npu_w4a8_chain.h"
 #include "rk_npu_w4a8_npu_reduce.h"
+#include "rk_npu_trace.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,8 +27,10 @@ struct rk_npu_w4a8_workspace {
     uint32_t domain_id = 0;
     std::vector<float> scales, inverse;
     std::vector<int32_t> accumulator;
+    std::vector<rknpu2_matmul_open::detail::W4A8SwiGLUPair> swiglu_pairs;
     std::atomic_flag busy = ATOMIC_FLAG_INIT;
     rknpu2_matmul_open::detail::I4Executor executor;
+    std::unique_ptr<rknpu2_matmul_open::detail::W4A8Chain> chain;
     rknpu2_matmul_open::detail::W4A8NpuReduce reducer;
     rknpu2_matmul_open::detail::I4InputLayout layout = rknpu2_matmul_open::detail::I4InputLayout::Native;
     bool npu_reduce = false;
@@ -52,16 +56,19 @@ int options_config(const rk_npu_w4a8_options* opt, int M, rknpu2_matmul_open::de
 int backend_config(const rk_npu_w4a8_config &cfg, rk_npu_i4_config &out,
                    rknpu2_matmul_open::detail::I4InputLayout layout = rknpu2_matmul_open::detail::I4InputLayout::Native) {
     if (!valid_shape(cfg.K, cfg.N) || cfg.M < 1 || cfg.M > INT_MAX / 2 || cfg.m_tile < 1 ||
-        cfg.m_tile > (layout == rknpu2_matmul_open::detail::I4InputLayout::Panel8 ? 256 : 64))
+        cfg.m_tile > (layout == rknpu2_matmul_open::detail::I4InputLayout::Panel8 ? 256 : 64) ||
+        cfg.pipeline<RK_NPU_W4A8_SERIAL || cfg.pipeline>RK_NPU_W4A8_CHAIN)
         return RK_NPU_ERR_PARAM;
     out = {cfg.M * 2,         cfg.N,          cfg.K,        cfg.m_tile * 2, cfg.k_tile, cfg.n_tile,
-           cfg.npu_core_mask, cfg.timeout_ms, cfg.pipeline, cfg.cpu_threads};
+           cfg.npu_core_mask, cfg.timeout_ms, cfg.pipeline==RK_NPU_W4A8_CHAIN?0:cfg.pipeline, cfg.cpu_threads};
     return RK_NPU_OK;
 }
 
 int run(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *weights, const void *A, void *C,
-        bool half, rk_npu_w4a8_timings *metrics) {
+        bool half, rk_npu_w4a8_timings *metrics, bool swiglu = false) {
     if (!ws || !weights || !A || !C || A == C)
+        return RK_NPU_ERR_PARAM;
+    if (swiglu && (half || ws->npu_reduce || ws->config.N % 64))
         return RK_NPU_ERR_PARAM;
     if (ws->busy.test_and_set(std::memory_order_acquire))
         return RK_NPU_ERR_BUSY;
@@ -70,6 +77,13 @@ int run(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *weights, const voi
         ~Unlock() { f.clear(std::memory_order_release); }
     } unlock{ws->busy};
     const auto &c = ws->config;
+    RK_NPU_TRACE_EVENT("rknpu", "w4a8.run", "M", c.M, "K", c.K, "N", c.N,
+        "m_tile", c.m_tile, "k_tile", c.k_tile, "n_tile", c.n_tile,
+        "pipeline", c.pipeline, "cpu_threads", c.cpu_threads,
+        "waves", (c.K+c.k_tile-1)/c.k_tile,
+        "npu_mask", c.npu_core_mask, "input_layout", int(ws->layout),
+        "npu_reduce", ws->npu_reduce, "fp16_input", half,
+        "swiglu_output", swiglu, "output_N", swiglu ? c.N / 2 : c.N);
     const auto &wc = weights->packed.config();
     const auto &mem = weights->packed.memory();
     if (mem.ctx_id != ws->ctx_id || mem.iommu_domain_id != ws->domain_id)
@@ -78,15 +92,20 @@ int run(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *weights, const voi
         return RK_NPU_ERR_PARAM;
     const auto start = Clock::now();
     rk_npu_w4a8_timings t{};
-    int rc =
-        rknpu2_matmul_open::detail::w4a8_scales(A, half, c.M, c.K, c.cpu_threads, ws->scales.data(), ws->inverse.data());
+    int rc;
+    {
+        RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.activation_scan", "M", c.M, "K", c.K);
+        rc = rknpu2_matmul_open::detail::w4a8_scales(A, half, c.M, c.K, c.cpu_threads, ws->scales.data(), ws->inverse.data());
+    }
     t.activation_scan_us = elapsed(start);
     if (!rc) {
         rknpu2_matmul_open::detail::W4A8Input input{A, half, c.M, c.K, ws->scales.data(), ws->inverse.data(), c.cpu_threads, ws->layout};
         rknpu2_matmul_open::detail::W4A8Reduction reduction{ws->accumulator.data(), weights->correction.data(),
-                                       ws->scales.data(), weights->scales.data(), C, half};
+                                       ws->scales.data(), weights->scales.data(), C, half,
+                                       swiglu ? &ws->swiglu_pairs : nullptr};
         rk_npu_i4_timings inner{};
-        rc = ws->executor.run(weights->packed, rknpu2_matmul_open::detail::w4a8_pack, &input, nullptr, &inner,
+        if(ws->chain) rc=ws->chain->run(weights->packed,input,reduction,inner);
+        else rc = ws->executor.run(weights->packed, rknpu2_matmul_open::detail::w4a8_pack, &input, nullptr, &inner,
                               ws->npu_reduce ? nullptr : rknpu2_matmul_open::detail::w4a8_reduce, &reduction);
         t.quant_pack_us = inner.pack_us;
         t.sync_us = inner.sync_us;
@@ -117,7 +136,11 @@ extern "C" int rk_npu_w4a8_memory_query_ex(const rk_npu_w4a8_config* cfg,
     rc=backend_config(*cfg,inner,layout); if(rc) return rc;
     rk_npu_w4a8_memory_info_ex info{};
     info.effective_reduce_backend=npu?RK_NPU_W4A8_REDUCE_NPU:RK_NPU_W4A8_REDUCE_CPU;
-    rc=rknpu2_matmul_open::detail::query_i4(inner,info.base.backend,layout); if(rc) return rc;
+    if(cfg->pipeline==RK_NPU_W4A8_CHAIN) {
+        if(npu)return RK_NPU_ERR_PARAM;
+        rc=rknpu2_matmul_open::detail::W4A8Chain::query(inner,layout,info.base.backend);
+    } else rc=rknpu2_matmul_open::detail::query_i4(inner,info.base.backend,layout);
+    if(rc) return rc;
     info.base.weight_metadata_bytes=uint64_t(cfg->N)*(sizeof(float)+sizeof(int32_t));
     info.base.cpu_scratch_bytes=uint64_t(cfg->M)*sizeof(float)*2;
     if(npu) {
@@ -223,9 +246,18 @@ extern "C" rk_npu_w4a8_workspace *rk_npu_w4a8_workspace_create_ex(rk_npu_iommu_d
         if(!ws->npu_reduce)
             ws->accumulator.resize(size_t(cfg->M)*((size_t(cfg->N)+63)/64*64));
         rk_npu_i4_config inner{};
-        if (backend_config(*cfg,inner,ws->layout) ||
-            ws->executor.prepare(domain,inner,ws->npu_reduce,ws->layout)) return nullptr;
+        if (backend_config(*cfg,inner,ws->layout)) return nullptr;
+        if(cfg->pipeline==RK_NPU_W4A8_CHAIN) {
+            if(ws->npu_reduce)return nullptr;
+            ws->chain=std::make_unique<rknpu2_matmul_open::detail::W4A8Chain>();
+            if(ws->chain->prepare(domain,inner,ws->layout))return nullptr;
+        } else if(ws->executor.prepare(domain,inner,ws->npu_reduce,ws->layout))return nullptr;
         if(ws->npu_reduce && ws->reducer.prepare(domain,ws->executor.plan())) return nullptr;
+        if(!ws->npu_reduce && cfg->N % 64 == 0) {
+            uint32_t starts[3]{}, counts[3]{};
+            ws->swiglu_pairs = rknpu2_matmul_open::detail::w4a8_swiglu_pairs(
+                cfg->N, rknpu2_matmul_open::detail::i4_tiles(inner, starts, counts, ws->layout));
+        }
         return ws.release();
     } catch (...) { return nullptr; }
 }
@@ -241,4 +273,9 @@ extern "C" int rk_npu_w4a8_run_f32(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_
 extern "C" int rk_npu_w4a8_run_f16(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *w,
                                    const uint16_t *A, uint16_t *C, rk_npu_w4a8_timings *t) {
     return run(ws, w, A, C, true, t);
+}
+
+extern "C" int rk_npu_w4a8_run_swiglu_f32(rk_npu_w4a8_workspace *ws,
+    const rk_npu_w4a8_weights *w, const float *A, float *middle, rk_npu_w4a8_timings *t) {
+    return run(ws, w, A, middle, false, t, true);
 }

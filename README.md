@@ -1,8 +1,5 @@
 # rknpu2_matmul_open
 
-[![Proudly Vibe Coded - Plasma Mix](https://vibecoded.fyi/badges/flat/main/proudly-vibe-coded-plasma-mix.svg)](https://vibecoded.fyi/)
-[![Coded with Codex](https://vibecoded.fyi/badges/flat/agents/codex.svg)](https://vibecoded.fyi/)
-
 Fully open source high-performance matrix multiplication library for LLM inference for the RK3588 RKNPU2.
 
 ## Features
@@ -11,19 +8,26 @@ Fully open source high-performance matrix multiplication library for LLM inferen
 - w8a8 int8 per-channel per-token quantized matmul kernel, with hardware weight (de)compression support
 - w4a8 per-channel per-token quantized matmul kernel implemented with Mixed-precision Split-activation Decomposition
 - w4a4 FlatQuant linear kernel
-- w8a8/w4a8 quantized MoE kernel with fused SwiGLU activation
+- Fused W4A8 gate/up projection and SwiGLU epilogue
+- w8a8/w4a8 quantized MoE kernel
 - Very fast fused fp16 GQA (MHA, MQA) kernel
 - Fast fused fp16 MLA/gated MLA kernel, supporting both expanded and absorbed mode
+- Native FP16 KV cache load, append, reserve and stable-softmax truncation
+- Optional Perfetto tracing for operator, submission and CPU-stage profiling
 - Optimized performance (at least I tried to do so)
 - Some of these kernels support auto-tuning for even better performance
 
 ## Usage
 
-Since this library is 100% coded by LLM, just clone this repo then fire up your coding agents like OpenAI Codex, Claude Code, Cursor, OpenCode, dsh etc. They will know what to do next.
+Build on RK3588 using the commands below. See [MM/BMM](docs/MM.md),
+[Attention](docs/ATTENTION.md), [MLA](docs/MLA.md) and
+[typed GEMM](docs/API.md) for API examples and tensor layouts.
+The [kernel programming Wiki](https://github.com/happyme531/rknpu2_matmul_open/wiki)
+describes register configuration and kernel development.
 
-## Note
+## Limitations
 
-- This is a very experimental project and all the things and APIs could change.
+- This is a experimental project; APIs and supported configurations may change.
 - The code may be buggy.
 - Memory usage may be larger than needed (shouldn't be disastrous)
 
@@ -65,7 +69,7 @@ outstanding upstream licensing clarification.
 - [ONNC](https://github.com/ONNC/onnc) — ONNX compilation framework for deep learning accelerators, including an NVDLA backend.
 
 ---
-# AI maintained documentation start (they're not good at writing documentation)
+## Implementation overview
 
 Open userspace matrix multiplication for the **RK3588 RKNPU2**, with direct
 register programming through the Linux `rknpu` DRM driver. The library does
@@ -88,8 +92,8 @@ and precision details, see [the typed API header](include/rk_npu_quant_matmul.h)
 The optional chain packs all dynamic FP16/FP32 K slices in one CPU parallel
 region. NPU dequantization reuses synchronized channel coefficients while
 their contents remain unchanged; switching weights refreshes them. See the
-optimization measurements (historical parent-workspace note: `w8a8_dpu_simple_opt_2026-09-29.md`).
-Every variable the library reads is listed in [ENV.md](ENV.md).
+the historical optimization measurements (`w8a8_dpu_simple_opt_2026-09-29.md`).
+Runtime settings are described in [ENV.md](ENV.md) and the operator guides.
 
 ## Supported interfaces
 
@@ -100,9 +104,10 @@ Every variable the library reads is listed in [ENV.md](ENV.md).
 | Floating W4A8 | [rk_npu_w4a8.h](include/rk_npu_w4a8.h) | Packed INT4 weights, dynamic INT8 activations, FP16/FP32 output |
 | W4A8 autotuning | [rk_npu_w4a8_tune.h](include/rk_npu_w4a8_tune.h) | Weight-aware tile/layout search and strategy caches |
 | FlatQuant W4A4 Linear | [rk_npu_w4a4_linear.h](include/rk_npu_w4a4_linear.h) | NPU FP16 transforms followed by INT4 execution |
+| Fused W4A8 gate/up + SwiGLU | [rk_npu_w4a8.h](include/rk_npu_w4a8.h) | `rk_npu_w4a8_run_swiglu_f32`: packed gate/up columns, compact FP32 output, serial/pipeline/task-chain execution |
 | Routed W8 MoE | [rk_npu_moe_w8.h](include/rk_npu_moe_w8.h) | SwiGLU experts and optional shared expert; [MoE guide](docs/MOE.md) |
 | Raw FP16 GEMM/BMM | [rk_npu_matmul_f16.h](include/rk_npu_matmul_f16.h) | Optional fused MUL/ADD and explicit split-K |
-| Experimental FP16 Attention | [rk_npu_attention_f16.h](include/rk_npu_attention_f16.h) | Causal/no-mask/broadcast boolean GQA, shared workspace and growing native KV; [guide](docs/ATTENTION.md) |
+| Experimental FP16 Attention | [rk_npu_attention_f16.h](include/rk_npu_attention_f16.h) | GQA/MHA/MQA, causal/no-mask/boolean masks, fixed-shift or stable softmax, growing and truncatable native KV; [guide](docs/ATTENTION.md) |
 | Experimental FP16 Gated MLA | [rk_npu_mla_f16.h](include/rk_npu_mla_f16.h) | Ling tiny H16/QK192/V128, expanded or absorbed latent512 KV; [guide](docs/MLA.md) |
 | Unified raw MM/BMM (new) | [rk_npu_mm.h](include/rk_npu_mm.h) | FP16/BF16/TF32, transpose/strides, dynamic or typed packed B, multicore and default-enabled automatic split-K; [guide](docs/MM.md) |
 | Legacy INT8 BMM | [rk_npu_matmul.h](include/rk_npu_matmul.h) | Distinct weights per batch item |
@@ -111,6 +116,41 @@ Every variable the library reads is listed in [ENV.md](ENV.md).
 See [API and implementation notes](docs/API.md) for ownership, layouts, tuning,
 compression, execution examples and detailed limits. Experimental private W4
 MoE support is described separately in the [MoE guide](docs/MOE.md).
+
+W4A8 latency tuning fixes the NPU core mask and CPU affinity. Small batches
+compare one/max CPU threads and serial/pipelined execution. Set
+`RK_NPU_W4A8_CHAIN_MAX_M` to control the all-K task-chain candidate ceiling
+(integer 0..64, default 8; 0 disables chain candidates). Eligible shapes with
+multiple K waves also try `pipeline=2`; every shape selects by complete-call
+latency. M2/4/8 are supported for speculative decoding. Use the returned
+`config.cpu_threads` and `config.pipeline` instead of assuming either value.
+One CPU thread can run within the same four-core affinity mask. W4 tuning
+revision 5 invalidates older W4 scores and records the chain ceiling; W8 cache
+identity is unchanged. Explicit `RK_NPU_W4A8_CHAIN` workspaces allocate all
+packed A and partials and submit once, without consulting the environment.
+See [execution and autotuning](docs/API.md) and [environment settings](ENV.md).
+
+## W4A8 fused SwiGLU
+
+`rk_npu_w4a8_run_swiglu_f32` combines the gate/up projection's final reduction,
+dequantization and SwiGLU epilogue. Pack weight columns as `[gate(F), up(F)]`,
+set `N=2*F`, and receive compact FP32 `[M,F]` output. It avoids materializing a
+complete floating gate/up tensor. Down projection remains a separate GEMM.
+The entry point supports CPU reduction with native/panel8 inputs and
+serial, pipelined or task-chain execution. Its AArch64 SIMD exponential can
+round slightly differently from scalar `expf`; see the public header.
+
+## Attention and KV cache
+
+GQA and MLA offer an explicit fixed-shift experimental softmax path and a
+stable path using CPU FP32 row-max/exp with NPU QK/PV products. Long-sequence
+softmax uses NEON polynomial evaluation. Set the corresponding config flag;
+see [Attention](docs/ATTENTION.md) and [MLA](docs/MLA.md) for numerical scope.
+
+`rk_npu_attention_f16_cache_truncate(cache, length)` removes the active KV
+suffix while retaining the prefix and allocated capacity. It requires stable
+softmax, permits truncation to zero, and subsequent appends replace the removed
+suffix. Active length and allocated capacity are available through the cache query API.
 
 ## Build on RK3588
 
@@ -147,6 +187,24 @@ The existing install rule installs the shared library and public headers:
 cmake --install build --prefix /your/install/prefix
 ```
 
+### Optional Perfetto tracing
+
+The default build has tracing disabled. To enable in-process recording:
+
+```bash
+python3 tools/bootstrap_perfetto.py
+cmake -S . -B build-trace -DCMAKE_BUILD_TYPE=Release -DRK_NPU_ENABLE_TRACE=ON
+cmake --build build-trace -j4
+```
+
+The bootstrap tool requires `gh` and downloads the pinned Perfetto v58.2 C++
+SDK and its license. A trace-enabled build provides `librk_npu_trace.so`;
+include `rk_npu_trace.h`, call `rk_npu_trace::start("run.pftrace")` before the
+measured work, then `rk_npu_trace::stop()` afterward. Open the file in
+[Perfetto UI](https://ui.perfetto.dev/). Categories cover complete operator
+calls, submissions, layout stages and worker handoffs. Trace-enabled and
+default builds should be measured separately because recording adds overhead.
+
 ### Cross-compilation
 
 ```bash
@@ -167,7 +225,7 @@ cmake --build build-host --target rknpu2_matmul_open_cpu_tests -j4
 OMP_NUM_THREADS=4 ctest --test-dir build-host --output-on-failure
 ```
 
-This target builds all 15 registered CPU tests and the public C header checks.
+This target builds all 16 registered CPU tests and the public C header checks.
 It does not require an NPU. Use this target on x86: several hardware-only FP16
 programs in the default full build use the AArch64 `__fp16` type.
 NPU tests are explicit executables, not part of CTest; see the

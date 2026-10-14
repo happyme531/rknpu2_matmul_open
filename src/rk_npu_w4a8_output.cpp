@@ -1,5 +1,8 @@
 #include "rk_npu_half_bits.h"
 #include "rk_npu_w4a8_cpu.h"
+#include "rk_npu_swiglu_neon.h"
+#include "rk_npu_trace.h"
+#include <stdexcept>
 #include <algorithm>
 #ifdef _OPENMP
 #include <omp.h>
@@ -157,7 +160,108 @@ void reduce_tiles(const W4A8Reduction &state, const rk_npu_i4_config &cfg,
         }
     }
 }
+template <bool First>
+void finish_swiglu(const W4A8Reduction &state, const W4A8SwiGLUPair &pair,
+                   const int16_t *src, int F, int begin, int end) {
+    const auto *gate = src + pair.gate_partial, *up = src + pair.up_partial;
+    const auto *ga = state.accumulator + pair.gate_accumulator;
+    const auto *ua = state.accumulator + pair.up_accumulator;
+    for (int r = begin; r < end; ++r) {
+        const int m = pair.m0 + r;
+        auto *out = static_cast<float *>(state.output) + size_t(m) * F + pair.n0;
+#if defined(__aarch64__)
+        // Bound register lifetimes across reconstruction and activation.
+        alignas(16) float gates[32], ups[32];
+#endif
+        for (int nb = 0; nb < 32; nb += 8) {
+            const size_t pi = (size_t(nb / 8) * pair.rows + r) * 16;
+            const size_t ai = pi / 2;
+            const auto *gc = First ? state.correction + pair.n0 + nb : ga + ai;
+            const auto *uc = First ? state.correction + F + pair.n0 + nb : ua + ai;
+#if defined(__aarch64__)
+            const auto as = vdupq_n_f32(state.a_scale[m]);
+            const auto gh = vld1q_s16(gate + pi), gl = vld1q_s16(gate + pi + 8);
+            const auto uh = vld1q_s16(up + pi), ul = vld1q_s16(up + pi + 8);
+            const auto g0 = vaddw_s16(vmlal_n_s16(vld1q_s32(gc), vget_low_s16(gh), 16), vget_low_s16(gl));
+            const auto g1 = vaddw_s16(vmlal_n_s16(vld1q_s32(gc + 4), vget_high_s16(gh), 16), vget_high_s16(gl));
+            const auto u0 = vaddw_s16(vmlal_n_s16(vld1q_s32(uc), vget_low_s16(uh), 16), vget_low_s16(ul));
+            const auto u1 = vaddw_s16(vmlal_n_s16(vld1q_s32(uc + 4), vget_high_s16(uh), 16), vget_high_s16(ul));
+            const auto gscale = state.w_scale + pair.n0 + nb;
+            const auto uscale = gscale + F;
+            const auto gf0 = vmulq_f32(vmulq_f32(vcvtq_f32_s32(g0), as), vld1q_f32(gscale));
+            const auto gf1 = vmulq_f32(vmulq_f32(vcvtq_f32_s32(g1), as), vld1q_f32(gscale + 4));
+            const auto uf0 = vmulq_f32(vmulq_f32(vcvtq_f32_s32(u0), as), vld1q_f32(uscale));
+            const auto uf1 = vmulq_f32(vmulq_f32(vcvtq_f32_s32(u1), as), vld1q_f32(uscale + 4));
+            vst1q_f32(gates + nb, gf0);
+            vst1q_f32(gates + nb + 4, gf1);
+            vst1q_f32(ups + nb, uf0);
+            vst1q_f32(ups + nb + 4, uf1);
+#else
+            for (int j = 0; j < 8; ++j) {
+                const int32_t g = int32_t(int64_t(gc[j]) + 16 * int64_t(gate[pi + j]) + gate[pi + 8 + j]);
+                const int32_t u = int32_t(int64_t(uc[j]) + 16 * int64_t(up[pi + j]) + up[pi + 8 + j]);
+                const float gf = (float(g) * state.a_scale[m]) * state.w_scale[pair.n0 + nb + j];
+                const float uf = (float(u) * state.a_scale[m]) * state.w_scale[F + pair.n0 + nb + j];
+                out[nb + j] = swiglu::scalar(gf, uf);
+            }
+#endif
+        }
+#if defined(__aarch64__)
+        for (int nb = 0; nb < 32; nb += 8)
+            swiglu::apply8(vld1q_f32(gates + nb), vld1q_f32(ups + nb),
+                          vld1q_f32(gates + nb + 4), vld1q_f32(ups + nb + 4), out + nb);
+#endif
+    }
+}
+
+template <bool First>
+void reduce_swiglu(const W4A8Reduction &state, const rk_npu_i4_config &cfg, const int16_t *src) {
+    const auto &pairs = *state.swiglu_pairs;
+    int64_t jobs = 0;
+    for (const auto &pair : pairs) jobs += pair.rows;
+    // Each work unit is one row/N32 pair, including partial final M panels.
+#pragma omp parallel num_threads(cfg.cpu_threads) if (cfg.cpu_threads > 1)
+    {
+        int id = 0, workers = 1;
+#ifdef _OPENMP
+        id = omp_get_thread_num();
+        workers = omp_get_num_threads();
+#endif
+        const int64_t begin = jobs * id / workers, end = jobs * (id + 1) / workers;
+        int64_t offset = 0;
+        for (const auto &pair : pairs) {
+            const int first = int(std::clamp(begin - offset, int64_t(0), int64_t(pair.rows)));
+            const int last = int(std::clamp(end - offset, int64_t(0), int64_t(pair.rows)));
+            if (first < last) finish_swiglu<First>(state, pair, src, cfg.N / 2, first, last);
+            offset += pair.rows;
+        }
+    }
+}
 } // namespace
+
+std::vector<W4A8SwiGLUPair> w4a8_swiglu_pairs(int N, const std::vector<I4Tile> &tiles) {
+    if (N <= 0 || N % 64) throw std::invalid_argument("SwiGLU requires N%64=0");
+    const int F = N / 2;
+    std::vector<W4A8SwiGLUPair> pairs;
+    for (const auto &g : tiles) {
+        for (int n = g.n0; n < std::min(F, g.n0 + g.logical_n); n += 32) {
+            const I4Tile *up = nullptr;
+            for (const auto &u : tiles)
+                if (u.m0 == g.m0 && u.m == g.m && u.n0 <= n + F && n + F + 32 <= u.n0 + u.logical_n) {
+                    up = &u;
+                    break;
+                }
+            if (!up) throw std::invalid_argument("SwiGLU gate/up tile mismatch");
+            const int rows = g.m / 2;
+            const uint64_t go = uint64_t((n - g.n0) / 8) * rows * 16;
+            const uint64_t uo = uint64_t((n + F - up->n0) / 8) * rows * 16;
+            pairs.push_back({g.output_offset / 2 + go, up->output_offset / 2 + uo,
+                             g.output_offset / 4 + go / 2, up->output_offset / 4 + uo / 2,
+                             g.m0 / 2, rows, n});
+        }
+    }
+    return pairs;
+}
 
 int w4a8_reduce_tiles(const W4A8Reduction &state, const rk_npu_i4_config &cfg,
                       const std::vector<I4Tile> &tiles, int wave, int waves, const int16_t *src) {
@@ -168,7 +272,13 @@ int w4a8_reduce_tiles(const W4A8Reduction &state, const rk_npu_i4_config &cfg,
         if (t.m0 % 2 || t.m <= 0 || t.m % 2)
             return RK_NPU_ERR_PARAM;
     if (wave + 1 == waves) {
-        if (state.half) {
+        if (state.swiglu_pairs) {
+            if (state.half || cfg.N % 64) return RK_NPU_ERR_PARAM;
+            RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.swiglu_epilogue", "M", cfg.M / 2,
+                "F", cfg.N / 2, "cpu_threads", cfg.cpu_threads);
+            if (wave == 0) reduce_swiglu<true>(state, cfg, src);
+            else reduce_swiglu<false>(state, cfg, src);
+        } else if (state.half) {
             if (wave == 0)
                 reduce_tiles<true, true, true>(state, cfg, tiles, src);
             else

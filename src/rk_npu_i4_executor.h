@@ -30,6 +30,9 @@ private:
     bool stop_=false, pending_=false, done_=true;
     int wave_=0, result_=RK_NPU_OK;
     double submit_us_=0;
+#if RK_NPU_ENABLE_TRACE
+    uint64_t trace_run_id_=0, trace_wave_id_=0;
+#endif
 };
 }
 #endif

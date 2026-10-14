@@ -1,4 +1,5 @@
 #include "rk_npu_w4a8_tune.h"
+#include "../src/rk_npu_w4a8_tune_internal.h"
 #include "../src/rk_npu_autotune_common.h"
 #include "../src/rk_npu_half_bits.h"
 #include <algorithm>
@@ -15,8 +16,11 @@ using W=std::unique_ptr<rk_npu_w4a8_weights,decltype(&rk_npu_w4a8_weights_free)>
 using P=std::unique_ptr<rk_npu_w4a8_workspace,decltype(&rk_npu_w4a8_workspace_free)>;
 static void verify(rk_npu_iommu_domain* domain,const rk_npu_w4a8_strategy& s,
                    const std::vector<int8_t>& b,const std::vector<float>& scale) {
+    const auto caller_affinity=rknpu2_matmul_open::tune::process_cpu_mask();
+    CHECK(rknpu2_matmul_open::tune::set_thread_cpu_mask(s.cpu_core_mask));
     const auto& c=s.config;W w(rk_npu_w4a8_weights_create_tuned(domain,&s,b.data(),scale.data()),rk_npu_w4a8_weights_free);
-    P p(rk_npu_w4a8_workspace_create(domain,&c),rk_npu_w4a8_workspace_free);CHECK(w&&p&&c.pipeline==1);
+    P p(rk_npu_w4a8_workspace_create(domain,&c),rk_npu_w4a8_workspace_free);
+    CHECK(w&&p&&c.pipeline>=0 && c.pipeline<=2);
     std::vector<float> a(size_t(c.M)*c.K),out(size_t(c.M)*c.N);
     std::vector<uint16_t> ah(a.size()),oh(out.size());
     for(size_t i=0;i<a.size();++i) {a[i]=float(int(i%23)-11)*.0625f;ah[i]=rknpu2_matmul_open::bits::float_to_half(a[i]);}
@@ -33,6 +37,9 @@ static void verify(rk_npu_iommu_domain* domain,const rk_npu_w4a8_strategy& s,
             CHECK(out[ix]==ref && oh[ix]==rknpu2_matmul_open::bits::float_to_half(ref));
         }
     }
+    // OpenMP may bind the primary thread while executing. Restore the caller
+    // context before testing an identical-affinity cache replay.
+    CHECK(rknpu2_matmul_open::tune::set_thread_cpu_mask(caller_affinity));
 }
 static void one(rk_npu_ctx* ctx,rk_npu_iommu_domain* domain,int M,int K,int N,bool half,double multiplier,
                 int required,const std::string& file) {
@@ -40,17 +47,28 @@ static void one(rk_npu_ctx* ctx,rk_npu_iommu_domain* domain,int M,int K,int N,bo
     for(auto& x:b) x=int(rng()%16)-8;
     rk_npu_w4a8_autotune_config c;rk_npu_w4a8_autotune_config_init(&c,M,N,K);
     c.activation_type=half?RK_NPU_W4A8_F16:RK_NPU_W4A8_F32;c.warmup=0;c.loops=1;c.repeats=1;
-    c.allowed_cpu_core_mask=M>=8?0xf0:0x10;c.k_tile_multiplier=multiplier;c.required_k_tile=required;
+    c.allowed_cpu_core_mask=(M==1||M>=8)?0xf0:0x10;c.k_tile_multiplier=multiplier;c.required_k_tile=required;
     rk_npu_w4a8_strategy fast{},stable{};int hit=-1;const auto before=rknpu2_matmul_open::tune::process_cpu_mask();
     CHECK(!rk_npu_w4a8_autotune_cached(ctx,&c,b.data(),scale.data(),file.c_str(),1,&fast,&stable,&hit)&&hit==0);
     CHECK(before==rknpu2_matmul_open::tune::process_cpu_mask());verify(domain,fast,b,scale);verify(domain,stable,b,scale);
     const auto total=fast.total_us;
-    CHECK(!rk_npu_w4a8_autotune_cached(ctx,&c,b.data(),scale.data(),file.c_str(),0,&fast,&stable,&hit)&&hit==1);
-    CHECK(fast.total_us==total && fast.config.pipeline==1);
+    const int replay=rk_npu_w4a8_autotune_cached(ctx,&c,b.data(),scale.data(),file.c_str(),0,&fast,&stable,&hit);
+    if(replay || hit!=1) {
+        using namespace rknpu2_matmul_open::w4_tune;
+        Profile profile_info;const int profile_rc=profile(c,b.data(),scale.data(),profile_info);
+        const auto r=resources(c);
+        std::fprintf(stderr,"cache replay failure M=%d rc=%d hit=%d profile=%d valid=%d affinity=0x%llx selected=0x%llx threads=%d max=%d pipeline=%d revision=%u file=%s\n",
+            M,replay,hit,profile_rc,profile_rc?0:valid_strategy(extend(fast),c,profile_info,r),
+            (unsigned long long)r.cpu,(unsigned long long)fast.cpu_core_mask,fast.config.cpu_threads,r.threads,
+            fast.config.pipeline,fast.tuning_revision,file.c_str());
+    }
+    CHECK(!replay&&hit==1);
+    CHECK(fast.total_us==total && fast.config.pipeline>=0 && fast.config.pipeline<=2);
+    CHECK(fast.cpu_core_mask==c.allowed_cpu_core_mask);
     if(multiplier==1) CHECK(!fast.weights.bound_relaxed);
     auto changed=b;changed[0]=changed[0]==7?6:changed[0]+1;
     W bad(rk_npu_w4a8_weights_create_tuned(domain,&fast,changed.data(),scale.data()),rk_npu_w4a8_weights_free);CHECK(!bad);
-    std::printf("PASS W4 tune/cache M=%d K=%d N=%d dtype=%s kt=%d relaxed=%d\n",M,K,N,half?"f16":"f32",fast.config.k_tile,fast.weights.bound_relaxed);
+    std::printf("PASS W4 tune/cache M=%d K=%d N=%d dtype=%s kt=%d threads=%d pipeline=%d relaxed=%d\n",M,K,N,half?"f16":"f32",fast.config.k_tile,fast.config.cpu_threads,fast.config.pipeline,fast.weights.bound_relaxed);
 }
 static void family(rk_npu_ctx* ctx,const std::string& directory) {
     const int ms[]={1,4,32};double freq[]={1,2,1};const int K=513,N=193;
@@ -63,15 +81,21 @@ static void family(rk_npu_ctx* ctx,const std::string& directory) {
     c.m_count=3;CHECK(!run() && hits>0 && misses>0);
     CHECK(!run() && hits>0 && misses==0);
     freq[0]=100;CHECK(!run() && hits>0 && misses==0);
-    for(int i=0;i<3;++i) CHECK(fs[i].config.k_tile==f.weights.config.k_tile && ss[i].config.k_tile==s.weights.config.k_tile && fs[i].config.pipeline==1);
+    for(int i=0;i<3;++i) CHECK(fs[i].config.k_tile==f.weights.config.k_tile && ss[i].config.k_tile==s.weights.config.k_tile && fs[i].config.pipeline>=0 && fs[i].config.pipeline<=2);
     std::puts("PASS W4 family shared K, partial cache reuse, changed frequencies without retuning");
 }
 int main(int argc,char**) {
     char directory[]="/tmp/rk_w4_tune_XXXXXX";if(!::mkdtemp(directory)) return 1;
     try {
+        const auto affinity=rknpu2_matmul_open::tune::process_cpu_mask();
+        const int threads=std::min(4,__builtin_popcountll(affinity));
+        rknpu2_matmul_open::tune::pin_openmp_team(affinity,threads);
+        CHECK(rknpu2_matmul_open::tune::set_thread_cpu_mask(affinity));
         std::unique_ptr<rk_npu_ctx,decltype(&rk_npu_close)> ctx(rk_npu_open(nullptr),rk_npu_close);CHECK(ctx);
         std::unique_ptr<rk_npu_iommu_domain,decltype(&rk_npu_iommu_domain_free)> domain(rk_npu_iommu_domain_create(ctx.get(),0),rk_npu_iommu_domain_free);CHECK(domain);
         one(ctx.get(),domain.get(),3,257,193,false,1,0,std::string(directory)+"/small");
+        one(ctx.get(),domain.get(),1,8193,193,false,1,480,std::string(directory)+"/m1-long");
+        one(ctx.get(),domain.get(),1,1057,193,true,1,480,std::string(directory)+"/m1-half");
         if(argc==1) {
             one(ctx.get(),domain.get(),65,1057,257,true,1,0,std::string(directory)+"/tail");
             one(ctx.get(),domain.get(),4,4096,193,false,2.1,2048,std::string(directory)+"/relaxed");

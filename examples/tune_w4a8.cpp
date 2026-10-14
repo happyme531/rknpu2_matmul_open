@@ -47,7 +47,7 @@ int main(int argc,char** argv) {
                 std::puts("tune_w4a8 --shape M K N [--f16] [--weights raw_i4_codes.bin --scales raw_f32.bin]\n"
                           "  [--multiplier 1|1.5|2.1|0(env)] [--k-tile K] [--cpu-mask 0xf0] [--npu-mask 7]\n"
                           "  [--native-only] [--cache PATH] [--refresh|--no-cache] [--warmup 2] [--loops 8] [--repeats 3] [--verbose]\n"
-                          "Without files, generate synthetic weights/scales. Search native/panel8, ubatch<=256; CPU reduction, pipeline=1.");
+                          "Without files, generate synthetic weights/scales. Search native/panel8, ubatch<=256; CPU reduction. Small batches search CPU teams and serial/pipeline/chain; RK_NPU_W4A8_CHAIN_MAX_M sets the chain ceiling (default8, 0 disables).");
                 return 0;
             } else throw std::runtime_error("unknown option: "+arg);
         }

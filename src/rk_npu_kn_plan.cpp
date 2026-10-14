@@ -1,3 +1,4 @@
+#include "rk_npu_trace.h"
 #include "rk_npu_kn_plan.h"
 #include "rk_npu_cpu_kernels.h"
 #include "rk_npu_dcomp.h"
@@ -495,13 +496,17 @@ int I8KnPlan::pack_wave_f32_static(
 }
 
 int I8KnPlan::run_wave(int wave_index, const I8KnWeights& weights) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "w8.wave_submit", "wave", wave_index,
+        "M", config_.M, "K", config_.K, "N", config_.N, "npu_mask", config_.npu_core_mask);
     if (!ctx_ || wave_index < 0 || wave_index >= (int)waves_.size() ||
         !wave_packed_[(size_t)wave_index] ||
         !weights.compatible_wave(*this, wave_index))
         return RK_NPU_ERR_PARAM;
     const int slot = output_slot_for_wave(wave_index);
-    int rc = input_slot_[input_slot_for_wave(wave_index)].end_cpu_access();
-    if (rc == RK_NPU_OK) rc = output_slot_[slot].end_cpu_access();
+    int rc;
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "w8.submit_buffer_sync", "wave", wave_index);
+      rc = input_slot_[input_slot_for_wave(wave_index)].end_cpu_access();
+      if (rc == RK_NPU_OK) rc = output_slot_[slot].end_cpu_access(); }
     if (rc != RK_NPU_OK) return rc;
     Wave& wave = waves_[(size_t)wave_index];
     if (weights.compressed())
@@ -524,9 +529,13 @@ int I8KnPlan::input_slot_for_wave(int wave) const {
 
 int I8KnPlan::run_chain(const I8KnWeights& weights, const float* a_scale,
                         const float* w_scale, bool dequant) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "w8.chain_submit", "M", config_.M,
+        "K", config_.K, "N", config_.N, "waves", waves_.size(),
+        "npu_mask", config_.npu_core_mask, "npu_dequant", dequant);
     if (!chain_ || !weights.compatible(*this) || weights.compressed())
         return RK_NPU_ERR_PARAM;
     for (auto packed : wave_packed_) if (!packed) return RK_NPU_ERR_PARAM;
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "w8.chain_buffer_sync");
     for (auto& input : input_slot_) {
         int rc = input.end_cpu_access();
         if (rc != RK_NPU_OK) return rc;
@@ -535,26 +544,31 @@ int I8KnPlan::run_chain(const I8KnWeights& weights, const float* a_scale,
         int rc = output_slot_[slot].end_cpu_access();
         if (rc != RK_NPU_OK) return rc;
     }
+    }
     return chain_->run(weights, a_scale, w_scale, dequant);
 }
 
 int I8KnPlan::copy_dequant(void* output, bool fp16) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "w8.chain_output_copy", "fp16_output", fp16);
     return chain_ ? chain_->copy_dequant(output, fp16) : RK_NPU_ERR_PARAM;
 }
 
 int I8KnPlan::begin_wave_output_cpu_read(int wave) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "w8.output_sync_read", "wave", wave);
     if (!ctx_ || wave < 0 || wave >= (int)waves_.size())
         return RK_NPU_ERR_PARAM;
     return output_slot_[output_slot_for_wave(wave)].begin_cpu_read();
 }
 
 int I8KnPlan::begin_wave_output_cpu_readwrite(int wave) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "w8.output_sync_readwrite", "wave", wave);
     if (!ctx_ || wave < 0 || wave >= (int)waves_.size())
         return RK_NPU_ERR_PARAM;
     return output_slot_[output_slot_for_wave(wave)].begin_cpu_readwrite();
 }
 
 int I8KnPlan::end_wave_output_cpu_access(int wave) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "w8.output_sync_end", "wave", wave);
     if (!ctx_ || wave < 0 || wave >= (int)waves_.size())
         return RK_NPU_ERR_PARAM;
     return output_slot_[output_slot_for_wave(wave)].end_cpu_access();

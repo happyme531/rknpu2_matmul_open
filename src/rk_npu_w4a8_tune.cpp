@@ -46,8 +46,9 @@ int tune(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config& c,const int8_t* B,co
     data.capture();if(!data.verify_reference(B,scales)) return RK_NPU_ERR_PARAM;
     reference.reset();
     bool found=false;
-    if(c.verbose) std::fprintf(stderr,"w4 autotune: %zu candidates, npu=0x%x cpu=0x%llx safe=%d limit=%d multiplier=%g pipeline=1\n",
-        choices.size(),r.npu,(unsigned long long)r.cpu,p.safe,p.limit,p.multiplier);
+    if(c.verbose) std::fprintf(stderr,"w4 autotune: %zu candidates, npu=0x%x cpu=0x%llx safe=%d limit=%d multiplier=%g policy=%s\n",
+        choices.size(),r.npu,(unsigned long long)r.cpu,p.safe,p.limit,p.multiplier,
+        c.M<=std::max(small_cpu_batch_limit,r.chain_max_m)?"small-batch teams/serial/pipeline/chain":"fixed team/pipeline=1");
     for(const auto& candidate:choices) {
         const auto& cfg=candidate.config;const auto& execution=candidate.execution;
         auto* w=weight(cfg.k_tile);if(!w) return RK_NPU_ERR_NOMEM;
@@ -71,8 +72,9 @@ int tune(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config& c,const int8_t* B,co
         s.weights=p.info(cfg.k_tile);s.weight_fingerprint=p.fingerprint;s.tuning_revision=revision;
         s.input_us=score.input_us;s.npu_us=score.npu_us;s.sync_us=score.sync_us;s.output_us=score.output_us;
         s.total_us=score.total_us;s.jitter_pct=score.jitter_pct;s.robust_us=score.robust_us;
-        if(c.verbose) std::fprintf(stderr,"w4 autotune: layout=%d M/K/N=%d/%d/%d total=%.2f robust=%.2f us relaxed=%d\n",
-            int(execution.input_layout),cfg.m_tile,cfg.k_tile,cfg.n_tile,s.total_us,s.robust_us,s.weights.bound_relaxed);
+        if(c.verbose) std::fprintf(stderr,"w4 autotune: layout=%d M/K/N=%d/%d/%d threads=%d pipeline=%d total=%.2f robust=%.2f us relaxed=%d\n",
+            int(execution.input_layout),cfg.m_tile,cfg.k_tile,cfg.n_tile,cfg.cpu_threads,cfg.pipeline,
+            s.total_us,s.robust_us,s.weights.bound_relaxed);
         if(!found||s.total_us<fast.base.total_us) fast=strategy;
         if(!found||s.robust_us<stable.base.robust_us) stable=strategy;
         found=true;

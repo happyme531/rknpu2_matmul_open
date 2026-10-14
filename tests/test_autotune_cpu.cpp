@@ -78,7 +78,7 @@ static void w4_policy_cache(rk_npu_ctx& ctx,const std::string& path) {
     CHECK(!rknpu2_matmul_open::w4_tune::on_worker(r,[&]{return rknpu2_matmul_open::tune::process_cpu_mask()==r.cpu?0:RK_NPU_ERR_PARAM;}));
     CHECK(rknpu2_matmul_open::tune::process_cpu_mask()==before);
     const auto choices=rknpu2_matmul_open::w4_tune::candidates(c,p,r);CHECK(!choices.empty());
-    for(const auto& cfg:choices) CHECK(cfg.config.pipeline==1 && p.certified(cfg.config.k_tile));
+    for(const auto& cfg:choices) CHECK(cfg.config.pipeline>=0 && cfg.config.pipeline<=2 && p.certified(cfg.config.k_tile));
     rk_npu_w4a8_strategy s{};s.config=choices.front().config;s.activation_type=c.activation_type;s.cpu_core_mask=r.cpu;
     s.weights=p.info(s.config.k_tile);s.weight_fingerprint=p.fingerprint;s.tuning_revision=rknpu2_matmul_open::w4_tune::revision;
     s.total_us=1.25;s.robust_us=2;
@@ -92,7 +92,7 @@ static void w4_policy_cache(rk_npu_ctx& ctx,const std::string& path) {
     b[0]=1;CHECK(rk_npu_w4a8_autotune_cache_load(&ctx,&c,b.data(),&scale,path.c_str(),&f,&stable)==RK_NPU_ERR_CACHE_MISS);b[0]=0;
     scale=.2f;CHECK(rk_npu_w4a8_autotune_cache_load(&ctx,&c,b.data(),&scale,path.c_str(),&f,&stable)==RK_NPU_ERR_CACHE_MISS);scale=.1f;
     c.k_tile_multiplier=1.5;CHECK(rk_npu_w4a8_autotune_cache_load(&ctx,&c,b.data(),&scale,path.c_str(),&f,&stable)==RK_NPU_ERR_CACHE_MISS);c=original;
-    s.config.pipeline=0;CHECK(rk_npu_w4a8_autotune_cache_save(&ctx,&c,b.data(),&scale,path.c_str(),&s,&s)==RK_NPU_ERR_PARAM);s.config.pipeline=1;
+    s.config.pipeline=3;CHECK(rk_npu_w4a8_autotune_cache_save(&ctx,&c,b.data(),&scale,path.c_str(),&s,&s)==RK_NPU_ERR_PARAM);s.config.pipeline=1;
     s.weights.safe_k_tile=2048;
     CHECK(!rknpu2_matmul_open::w4_tune::save(path,rknpu2_matmul_open::w4_tune::key(&ctx,c,p,r),rknpu2_matmul_open::w4_tune::extend(s),rknpu2_matmul_open::w4_tune::extend(s)));
     CHECK(rk_npu_w4a8_autotune_cache_load(&ctx,&c,b.data(),&scale,path.c_str(),&f,&stable)==RK_NPU_ERR_CACHE_MISS);

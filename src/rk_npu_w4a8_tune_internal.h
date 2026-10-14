@@ -10,7 +10,9 @@
 #include <type_traits>
 
 namespace rknpu2_matmul_open::w4_tune {
-constexpr uint32_t revision=3; // layout-aware candidates, strategy and cache encoding
+constexpr uint32_t revision=5; // small-batch teams and all-K chain; same measured affinity
+constexpr int small_cpu_batch_limit=8;
+int chain_max_m(); // default8, 0 disables chain candidates, -1 invalid environment
 using Strategy = rk_npu_w4a8_strategy_ex;
 inline Strategy extend(const rk_npu_w4a8_strategy& s) {
     return {s,{sizeof(rk_npu_w4a8_options),RK_NPU_W4A8_INPUT_NATIVE,RK_NPU_W4A8_REDUCE_CPU}};
@@ -30,7 +32,9 @@ struct Profile {
     bool permits(int k) const {return k>=32 && k<=limit && k%32==0 && (certified(k)||multiplier>1);}
     rk_npu_w4a8_weight_info info(int k) const {return {{K,N,k},safe,multiplier,!certified(k)};}
 };
-struct Resources {uint32_t npu=0;uint64_t cpu=0,allowed_cpu=0;int threads=0;};
+// threads is the maximum team size within the measured CPU affinity.
+// Small batches may select one thread within that same affinity mask.
+struct Resources {uint32_t npu=0;uint64_t cpu=0,allowed_cpu=0;int threads=0;int chain_max_m=8;};
 using Weight=std::unique_ptr<rk_npu_w4a8_weights,decltype(&rk_npu_w4a8_weights_free)>;
 using Workspace=std::unique_ptr<rk_npu_w4a8_workspace,decltype(&rk_npu_w4a8_workspace_free)>;
 bool valid(const rk_npu_w4a8_autotune_config&);

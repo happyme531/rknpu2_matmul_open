@@ -1913,6 +1913,24 @@ void f16_pack_b_native_n16_k32(int K, int N, int align_in, int align_out,
     }
 }
 
+void f16_pack_b_native_n16_k32_update(int rows, int N, int native_k, int first,
+                                      const uint16_t* src, uint16_t* dst) {
+    const int kb_count = native_k / 32;
+    for (int row = 0; row < rows;) {
+        const int pos = first + row, lane = pos % 32;
+        const int count = std::min(rows - row, 32 - lane);
+        for (int nb = 0; nb < N / 16; ++nb) {
+            auto* out = dst + ((size_t)nb * kb_count + pos / 32) * 512 + lane;
+            const auto* in = src + (size_t)row * N + nb * 16;
+            if (count == 32)
+                transpose16bit_32x16(out, in, N);
+            else
+                transpose16bit_tile(out, in, count, 16, N, 32);
+        }
+        row += count;
+    }
+}
+
 void f16_pack_b_native_n16_k32_batch(int B, int K, int N,
                                      int align_in, int align_out,
                                      const uint16_t* src, uint16_t* dst) {

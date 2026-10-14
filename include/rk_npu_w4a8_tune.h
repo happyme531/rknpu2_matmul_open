@@ -23,9 +23,10 @@ typedef struct rk_npu_w4a8_autotune_config {
 } rk_npu_w4a8_autotune_config;
 
 typedef struct rk_npu_w4a8_strategy {
-    rk_npu_w4a8_config config; /* selected K/N/logical-M tiles, pipeline always 1 */
+    rk_npu_w4a8_config config; /* selected tiles/team/serial/pipeline/chain */
     rk_npu_w4a8_activation_type activation_type;
-    uint64_t cpu_core_mask; /* measured affinity; caller applies this when running */
+    uint64_t cpu_core_mask; /* measured affinity; caller applies this when running.
+                             Small batches may use one thread within the same mask. */
     rk_npu_w4a8_weight_info weights;
     uint64_t weight_fingerprint; /* B codes and FP32 scales, not a security hash */
     uint32_t tuning_revision;
@@ -63,7 +64,13 @@ void rk_npu_w4a8_family_config_init(rk_npu_w4a8_family_config*, int N, int K,
 
 /* Actual B[K,N]/scale[N] are required for bounds and cache identity. A is a
  * deterministic synthetic calibration tensor. Search Ktile/Ntile/Mtile with
- * pipeline enabled and fixed resources. Time complete production calls;
+ * fixed NPU cores and CPU affinity. M<=max(8,CHAIN_MAX_M) searches one/max
+ * CPU threads and serial/pipelined execution. RK_NPU_W4A8_CHAIN_MAX_M is an
+ * integer0..64 (default8, 0 disables chain candidates); M<=that ceiling and
+ * multiple K waves also try one all-K PC chain. Each shape selects by latency.
+ * The ceiling is captured for each tuning operation and included in cache
+ * identity; changing it requires retuning. No environment reads during run.
+ * Time complete production calls;
  * exclude weight/workspace creation. Every timed output is checked against
  * a K<=480 reference. A submit failure stops tuning immediately.
  * A multiplier>1 is experimental: sample agreement is NOT an INT16 proof;
@@ -104,8 +111,9 @@ int rk_npu_w4a8_autotune_family_cached(rk_npu_ctx*, const rk_npu_w4a8_family_con
     int* cache_hits, int* cache_misses);
 
 /* Search native plus panel8 and logical ubatches up to 256, within the
- * workspace geometry/CBUF budget. Resources are fixed, pipeline=1 and CPU
- * reduction only. Small ragged batches retain native candidates; supported
+ * workspace geometry/CBUF budget. NPU cores/CPU affinity are fixed, CPU
+ * reduction only. M1 searches team/pipeline as above; M>1 keeps the original
+ * team/pipeline policy. Small ragged batches retain native candidates; supported
  * larger tails are measured against the same full-output reference.
  * Cache identity includes this search space; old/native-only cache entries
  * cannot stand in for an extended search. Remaining contracts match above. */

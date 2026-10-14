@@ -13,6 +13,12 @@
 extern "C" {
 #endif
 
+typedef enum rk_npu_w4a8_pipeline {
+    RK_NPU_W4A8_SERIAL = 0,
+    RK_NPU_W4A8_PIPELINED = 1,
+    RK_NPU_W4A8_CHAIN = 2
+} rk_npu_w4a8_pipeline;
+
 typedef struct rk_npu_w4a8_config {
     int M, N, K;            /* logical token rows; K <= INT32_MAX/1024 */
     int m_tile;             /* logical tokens, legacy 1..64; _ex panel8 allows more; physical rows doubled */
@@ -20,7 +26,8 @@ typedef struct rk_npu_w4a8_config {
     int n_tile;             /* multiple of 64, 64..4096 */
     uint32_t npu_core_mask; /* 1/2/4/3/7, same N64 alignment as W4A4 */
     uint32_t timeout_ms;
-    int pipeline;    /* 0: serial; 1: overlapped pack/submit/reduce */
+    int pipeline;    /* SERIAL / PIPELINED / CHAIN; CHAIN packs all K, submits once,
+                       then CPU-reduces all native partials; any supported M */
     int cpu_threads; /* 1..4; caller/OpenMP runtime controls CPU affinity */
 } rk_npu_w4a8_config;
 
@@ -136,6 +143,20 @@ int rk_npu_w4a8_run_f32(rk_npu_w4a8_workspace *workspace, const rk_npu_w4a8_weig
                         const float *A, float *C, rk_npu_w4a8_timings *timings);
 int rk_npu_w4a8_run_f16(rk_npu_w4a8_workspace *workspace, const rk_npu_w4a8_weights *weights,
                         const uint16_t *A, uint16_t *C, rk_npu_w4a8_timings *timings);
+
+/* Fused FP32 gate/up projection and SwiGLU, using the same workspace and weights.
+ * cfg.N=2*F, with weight columns [gate(F), up(F)]; A is [M,K], middle is
+ * compact [M,F], non-aliasing. middle=(gate/(1+exp(-gate)))*up. Requires N%64=0
+ * and effective CPU reduction; unsupported geometry/backend returns PARAM
+ * before submit. Serial, pipelined, chain and native/panel8 inputs are supported.
+ * The final CPU consumer writes middle directly from native integer partials;
+ * no complete FP32 gate/up tensor is stored. reduce_us includes activation.
+ * AArch64 uses a FP64 polynomial exponential rounded to FP32; floating
+ * results can differ slightly from scalar expf.
+ * The blocking, domain, non-reentrancy and failure contracts above also apply. */
+int rk_npu_w4a8_run_swiglu_f32(rk_npu_w4a8_workspace *workspace,
+    const rk_npu_w4a8_weights *weights, const float *A, float *middle,
+    rk_npu_w4a8_timings *timings);
 
 #ifdef __cplusplus
 }

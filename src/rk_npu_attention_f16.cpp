@@ -1,3 +1,4 @@
+#include "rk_npu_trace.h"
 #include "rk_npu_attention_f16_internal.h"
 #include "rk_npu_matmul_f16.h"
 #include <cmath>
@@ -201,6 +202,8 @@ void Graph::bind(Cache& c){
     bound=&c;bound_identity=c.identity;bound_generation=c.generation;bound_tail_generation=c.tail_generation;
 }
 void Graph::update_mask(int start,const rk_npu_attention_f16_boolean_mask* b,int length){
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.mask_update", "query_start", start,
+        "kv_length", length, "mask_mode", int(cfg.mask_mode));
     if(cfg.mask_mode==RK_NPU_ATTENTION_F16_NO_MASK)return;
     const bool causal=cfg.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL;
     if(causal && mask_start==start)return;
@@ -265,6 +268,7 @@ void Graph::update_mask(int start,const rk_npu_attention_f16_boolean_mask* b,int
     mask_start=length;saved_mask=*b;
 }
 void Graph::pack_q(const uint16_t* query){
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.query_pack", "query_rows", rows);
 #ifdef ATTENTION_NEON
     const auto scale=vdupq_n_f16(float16_t(shape.scale));
 #endif
@@ -284,6 +288,9 @@ void Graph::pack_q(const uint16_t* query){
     q.range(0,size_t(cfg.kv_heads)*m*shape.key_dim*2);
 }
 double Graph::submit(int stage){
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.graph_submit", "stage", stage,
+        "query_rows", rows, "physical_M", m, "compute_length", span, "tasks", tasks,
+        "npu_mask", core_mask(cfg));
     rknpu_submit s{};s.flags=RKNPU_JOB_PC|RKNPU_JOB_PINGPONG;s.timeout=cfg.timeout_ms?cfg.timeout_ms:2000;
     s.task_number=tasks;s.task_obj_addr=descriptors.mem.obj_addr;s.iommu_domain_id=domain->id;s.core_mask=core_mask(cfg);s.fence_fd=-1;
     // Match the existing board-validated driver ABI: dual uses slots 0/1,
@@ -299,16 +306,18 @@ double Graph::submit(int stage){
     return s.hw_elapse_time/1000.;
 }
 void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* mask_data,int length){
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.stable_softmax", "query_rows", rows,
+        "kv_length", length, "compute_length", span);
     // Raw QK and PV use the same native block-8 tensor. Long sequences scan
-    // 32 adjacent rows together to amortize cache-line fetches and page walks.
+    // Up to 128 adjacent rows together keep native score reads contiguous.
     // Small tensors keep row scans; normalized scratch uses four-row groups
     // and is retained by the workspace.
     // When tile*max(abs(V)) <= 32752, exp(score-max) gives finite FP16 PV
     // partials with a factor-of-two margin. PV already computes [E@V,E@1]
     // and finish() divides in FP32; omit CPU normalization in that case.
     // Larger V keeps normalized probabilities and the previous range bound.
-    // The range-reduced degree-6 FP32 polynomial avoids scalar exp calls on
-    // the common causal/no-mask path; x<=-80 contributes less than 2e-35.
+    // Short tensors use degree-6 FP32 exp; long tensors split a degree-5
+    // polynomial into independent terms. x<=-80 contributes less than 2e-35.
 #ifdef ATTENTION_NEON
     auto exp4=[](float32x4_t x){
         x=vmaxq_f32(x,vdupq_n_f32(-80.f));
@@ -324,6 +333,21 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
         p=vfmaq_f32(vdupq_n_f32(1.f),p,r);
         const auto power=vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(nf),vdupq_n_s32(127)),23));
         return vmulq_f32(p,power);
+    };
+    // Adapted from ggml's ARM exp approximation (LICENSES/ggml-MIT.txt).
+    // score-max is nonpositive; clamping to -80 keeps the exponent normal.
+    auto long_exp4=[](float32x4_t x){
+        x=vmaxq_f32(x,vdupq_n_f32(-80.f));
+        const auto z=vfmaq_f32(vdupq_n_f32(0x1.8p23f),x,vdupq_n_f32(0x1.715476p+0f));
+        const auto n=vsubq_f32(z,vdupq_n_f32(0x1.8p23f));
+        const auto b=vfmsq_f32(vfmsq_f32(x,n,vdupq_n_f32(0x1.62e4p-1f)),n,vdupq_n_f32(0x1.7f7d1cp-20f));
+        const auto e=vshlq_n_u32(vreinterpretq_u32_f32(z),23);
+        const auto k=vreinterpretq_f32_u32(vaddq_u32(e,vreinterpretq_u32_f32(vdupq_n_f32(1.f))));
+        const auto u=vmulq_f32(b,b);
+        const auto j=vfmaq_f32(vmulq_f32(vdupq_n_f32(0x1.ffffecp-1f),b),
+            vfmaq_f32(vfmaq_f32(vdupq_n_f32(0x1.fffdb6p-2f),vdupq_n_f32(0x1.555e66p-3f),b),
+                      vfmaq_f32(vdupq_n_f32(0x1.573e2ep-5f),vdupq_n_f32(0x1.0e4020p-7f),b),u),u);
+        return vfmaq_f32(k,j,k);
     };
 #endif
     std::atomic<bool> finite{true};
@@ -394,8 +418,16 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
     if(!finite.load())throw Error{RK_NPU_ERR_PARAM};
         return;
     }
-    constexpr int max_row_block=32,scratch_rows=4;
-    const int row_block=m>=32?max_row_block:scratch_rows;
+    // Compile separate scan sizes so small query batches retain their original
+    // row scheduling and worker stack footprint.
+    auto scan_rows=[&](auto block_tag,int start,const rk_npu_attention_f16_boolean_mask* mask_data,
+        int length,std::atomic<bool>& finite
+#ifdef ATTENTION_NEON
+        ,auto exp4
+#endif
+        ){
+    constexpr int max_row_block=decltype(block_tag)::value,scratch_rows=4;
+    const int row_block=m>=32?std::min(m,max_row_block):scratch_rows;
     const int row_blocks=ceil_div(m,row_block);
     const int threads=size_t(cfg.query_heads)*rows*length>=4096?4:1;
 #pragma omp parallel for num_threads(threads) schedule(static)
@@ -410,7 +442,7 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
         // above one. A common 1/2 gain also cancels in finish(), keeping the
         // normalized fallback's numerator safely away from FP16 overflow.
         const float probability_gain=widen(bound->value_absmax[cache_head])>32752.f?.5f:1.f;
-        const int process_rows=delayed?(span>=2048?row_block:1):scratch_rows;
+        const int process_rows=delayed?(max_row_block>32 || span>=2048?row_block:1):scratch_rows;
         auto* scratch=delayed?nullptr:softmax_scratch.data()+size_t(omp_get_thread_num())*scratch_rows*span;
         for(int first=base;first<limit;first+=process_rows){
         const int count=std::min(process_rows,limit-first);
@@ -514,9 +546,18 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
             else process(std::false_type{},std::false_type{});
         }
     }
+    };
+    auto scan=[&](auto tag){scan_rows(tag,start,mask_data,length,finite
+#ifdef ATTENTION_NEON
+        ,long_exp4
+#endif
+        );};
+    if(m>32)scan(std::integral_constant<int,128>{});
+    else scan(std::integral_constant<int,32>{});
     if(!finite.load())throw Error{RK_NPU_ERR_PARAM};
 }
 void Graph::finish(float* output){
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.output_finish", "query_rows", rows);
     const size_t stride=size_t(shape.value_dim+32)*m,count=sum.size();
     for(int hi=0;hi<cfg.kv_heads;++hi){
         for(int block=0;block<blocks;++block){
@@ -545,6 +586,8 @@ void Graph::finish(float* output){
     }
 }
 void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t){
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.geometry", "query_rows", rows,
+        "query_start", start, "kv_length", cache.length, "kv_tile", cfg.kv_tile);
     compatible(*this,cache);if(poisoned)throw Error{RK_NPU_ERR_SUBMIT};
     const int prefix=prefix_length(cfg,cache,rows,start);
     const bool causal_prefill=full_causal_prefill && rows>1 && cfg.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL;
@@ -557,35 +600,55 @@ void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_ti
         span=std::min(align_up(span,cfg.kv_tile),align_up(cache.length,32));
     rk_npu_attention_f16_sizes sizes{};check(query_engine(cfg,shape,cache.capacity,rows,span,sizes));
     auto graph_cfg=cfg;
-    // A final decode query sees every valid KV. Cache padding has zero V and
-    // zero denominator, so its unmasked exp values contribute exactly zero.
+    // A final decode query sees every valid KV. Stable softmax zeroes padding
+    // probabilities; fixed-shift caches retain zero V/denominator padding.
     // An earlier query into a preloaded cache still needs the causal mask.
     if(rows==1 && cfg.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL && prefix==cache.length)
         graph_cfg.mask_mode=RK_NPU_ATTENTION_F16_NO_MASK;
     auto a=Clock::now();cache.stage_tail(span);auto b=Clock::now();
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.graph_prepare", "compute_length", span);
     if(!graph || graph->rows!=rows || graph->span!=span || graph->cfg.mask_mode!=graph_cfg.mask_mode){
         try{auto next=std::make_unique<Graph>(lease.domain,graph_cfg,rows,span,cache,shape,graph.get());graph.swap(next);}
         catch(...){poisoned=true;graph.reset();throw;}
     }else graph->bind(cache);
+    }
     t.tail_stage_us=elapsed(a,b);t.prepare_us=elapsed(b,Clock::now());t.compute_length=span;t.tasks=graph->tasks;
 }
 rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,int rows,int start,float* output,
     const rk_npu_attention_f16_boolean_mask* mask){
+    RK_NPU_TRACE_EVENT("rknpu", "attention.run", "query_rows", rows, "query_start", start,
+        "query_heads", cfg.query_heads, "kv_heads", cfg.kv_heads,
+        "head_dim", cfg.head_dim, "kv_length", cache.length,
+        "kv_tile", cfg.kv_tile, "npu_mask", core_mask(cfg), "mask_mode", int(cfg.mask_mode),
+        "stable_softmax", cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX);
     if(!query || !output)throw Error{RK_NPU_ERR_PARAM};
     validate_mask(cfg,mask,rows,cache.length);auto begin=Clock::now();rk_npu_attention_f16_timings t{};
     geometry(cache,rows,start,t);auto prepared=Clock::now();
     const bool stable=cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;
     if(!stable)graph->update_mask(start,mask,cache.length);auto masked=Clock::now();
     graph->pack_q(query);auto packed=Clock::now();
-    try{t.hardware_us=graph->submit();
+    try{
+        if(stable) {
+            RK_NPU_TRACE_EVENT("rknpu.detail", "attention.qk_submit");
+            t.hardware_us=graph->submit();
+        } else {
+            RK_NPU_TRACE_EVENT("rknpu.detail", "attention.fused_submit");
+            t.hardware_us=graph->submit();
+        }
         if(stable){
-            graph->score.range(0,size_t(cfg.kv_heads)*graph->m*graph->span*2,RK_NPU_SYNC_FROM_DEVICE);
+            { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.score_sync_from_device");
+              graph->score.range(0,size_t(cfg.kv_heads)*graph->m*graph->span*2,RK_NPU_SYNC_FROM_DEVICE); }
             graph->stable_softmax(start,mask,cache.length);
-            graph->score.range(0,size_t(cfg.kv_heads)*graph->m*graph->span*2);
-            t.hardware_us+=graph->submit(1);
+            { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.score_sync_to_device");
+              graph->score.range(0,size_t(cfg.kv_heads)*graph->m*graph->span*2); }
+            { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.pv_submit");
+              t.hardware_us+=graph->submit(1); }
         }
     }catch(...){poisoned=true;throw;}
-    auto computed=Clock::now();graph->partial.range(0,size_t(cfg.kv_heads)*graph->blocks*(shape.value_dim+32)*graph->m*2,RK_NPU_SYNC_FROM_DEVICE);auto synced=Clock::now();
+    auto computed=Clock::now();
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.output_sync");
+      graph->partial.range(0,size_t(cfg.kv_heads)*graph->blocks*(shape.value_dim+32)*graph->m*2,RK_NPU_SYNC_FROM_DEVICE); }
+    auto synced=Clock::now();
     graph->finish(output);auto done=Clock::now();t.mask_update_us=elapsed(prepared,masked);t.query_pack_us=elapsed(masked,packed);
     t.submit_us=elapsed(packed,computed);t.output_sync_us=elapsed(computed,synced);t.finish_us=elapsed(synced,done);t.total_us=elapsed(begin,done);return t;
 }
@@ -647,6 +710,9 @@ int rk_npu_attention_f16_cache_load(rk_npu_ctx* ctx,rk_npu_attention_f16_cache* 
 }
 int rk_npu_attention_f16_cache_append(rk_npu_ctx* ctx,rk_npu_attention_f16_cache* c,const uint16_t* k,const uint16_t* v,int count){
     if(!c)return RK_NPU_ERR_PARAM;return api([&]{context(ctx,c->lease.domain);Lock lock(c->busy);c->append(k,v,count);});
+}
+int rk_npu_attention_f16_cache_truncate(rk_npu_attention_f16_cache* c,int length){
+    if(!c)return RK_NPU_ERR_PARAM;return api([&]{Lock lock(c->busy);c->truncate(length);});
 }
 int rk_npu_attention_f16_prepare(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config* c,rk_npu_attention_f16_workspace** out){
     if(!out)return RK_NPU_ERR_PARAM;*out=nullptr;if(!d || !c || validate(*c))return RK_NPU_ERR_PARAM;

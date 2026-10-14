@@ -49,7 +49,7 @@ static void forced(rk_npu_iommu_domain *domain, int M, int K, int kt) {
     const auto r = resources(c);
     int count = 0;
     for (const auto &x : candidates(c, p, r, true)) {
-        if (x.execution.input_layout != RK_NPU_W4A8_INPUT_PANEL8)
+        if (M > small_cpu_batch_limit && x.execution.input_layout != RK_NPU_W4A8_INPUT_PANEL8)
             continue;
         Strategy s{};
         s.base.config = x.config;
@@ -64,6 +64,12 @@ static void forced(rk_npu_iommu_domain *domain, int M, int K, int kt) {
                  rk_npu_w4a8_weights_free);
         Workspace ws(rk_npu_w4a8_workspace_create_tuned_ex(domain, &s), rk_npu_w4a8_workspace_free);
         CHECK(w && ws);
+        if(s.base.config.pipeline==RK_NPU_W4A8_CHAIN) {
+            CHECK(!setenv("RK_NPU_W4A8_CHAIN_MAX_M","0",1));
+            CHECK(!rk_npu_w4a8_workspace_create_tuned_ex(domain,&s));
+            CHECK(!rk_npu_w4a8_weights_create_tuned_ex(domain,&s,b.data(),scales.data()));
+            CHECK(!setenv("RK_NPU_W4A8_CHAIN_MAX_M","8",1));
+        }
         for (auto dtype : {RK_NPU_W4A8_F32, RK_NPU_W4A8_F16}) {
             c.activation_type = dtype;
             Data data(c);
@@ -71,18 +77,32 @@ static void forced(rk_npu_iommu_domain *domain, int M, int K, int kt) {
             rknpu2_matmul_open::tune::Sample t;
             CHECK(!data.run(ws.get(), w.get(), t));
             CHECK(data.same());
+            if (M <= small_cpu_batch_limit) {
+                // Reuse with zero and changed inputs in both execution modes.
+                std::fill(data.a.begin(),data.a.end(),0.f);
+                std::fill(data.ah.begin(),data.ah.end(),uint16_t(0));
+                oracle(data,b,scales);
+                CHECK(!data.run(ws.get(),w.get(),t) && data.same());
+                for (size_t i=0;i<data.a.size();++i) {
+                    data.a[i]=float(int(i%29)-14)*.125f;
+                    if (dtype==RK_NPU_W4A8_F16)
+                        data.ah[i]=rknpu2_matmul_open::bits::float_to_half(data.a[i]);
+                }
+                oracle(data,b,scales);
+                CHECK(!data.run(ws.get(),w.get(),t) && data.same());
+            }
         }
         c.activation_type = RK_NPU_W4A8_F32;
         ++count;
     }
     CHECK(count > 0);
-    std::printf("PASS all %d panel8 candidates M=%d K=%d kt=%d full INT64 oracle f32/f16\n", count,
-                M, K, kt);
+    std::printf("PASS all %d %s candidates M=%d K=%d kt=%d full INT64 oracle f32/f16\n", count,
+                M<=small_cpu_batch_limit?"small-batch CPU/chain":"panel8",M,K,kt);
     std::fflush(stdout);
 }
-static void single(rk_npu_ctx *ctx, rk_npu_iommu_domain *domain, const std::string &file) {
+static void single(rk_npu_ctx *ctx, rk_npu_iommu_domain *domain, const std::string &file, int M=128) {
     rk_npu_w4a8_autotune_config c;
-    rk_npu_w4a8_autotune_config_init(&c, 128, 193, 513);
+    rk_npu_w4a8_autotune_config_init(&c, M, 193, 513);
     c.k_tile_multiplier = 1;
     c.required_k_tile = 256;
     c.allowed_cpu_core_mask = 0xf0;
@@ -104,6 +124,15 @@ static void single(rk_npu_ctx *ctx, rk_npu_iommu_domain *domain, const std::stri
           hit == 1);
     CHECK(fast.execution.input_layout == original.execution.input_layout &&
           fast.base.total_us == original.base.total_us);
+    if (M<=small_cpu_batch_limit) {
+        // Force a legal chain cache entry, independent of which candidate
+        // wins a noisy one-loop tune, to cover cache replay and both factories.
+        fast.base.config.cpu_threads=stable.base.config.cpu_threads=1;
+        fast.base.config.pipeline=stable.base.config.pipeline=RK_NPU_W4A8_CHAIN;
+        CHECK(!rk_npu_w4a8_autotune_cache_save_ex(ctx,&c,b.data(),scales.data(),file.c_str(),&fast,&stable));
+        CHECK(!rk_npu_w4a8_autotune_cached_ex(ctx,&c,b.data(),scales.data(),file.c_str(),0,&fast,&stable,&hit) && hit==1);
+        CHECK(fast.base.config.cpu_threads==1 && fast.base.config.pipeline==RK_NPU_W4A8_CHAIN && fast.base.cpu_core_mask==0xf0);
+    }
     for (const auto &s : {fast, stable}) {
         Weight w(rk_npu_w4a8_weights_create_tuned_ex(domain, &s, b.data(), scales.data()),
                  rk_npu_w4a8_weights_free);
@@ -116,6 +145,11 @@ static void single(rk_npu_ctx *ctx, rk_npu_iommu_domain *domain, const std::stri
         auto bad = s;
         bad.execution.reduce_backend = RK_NPU_W4A8_REDUCE_NPU;
         CHECK(!rk_npu_w4a8_workspace_create_tuned_ex(domain, &bad));
+        if (M<=small_cpu_batch_limit) {
+            bad=s;bad.base.config.cpu_threads=2;
+            CHECK(!rk_npu_w4a8_workspace_create_tuned_ex(domain,&bad));
+            CHECK(!rk_npu_w4a8_weights_create_tuned_ex(domain,&bad,b.data(),scales.data()));
+        }
         b[0] = 2;
         CHECK(!rk_npu_w4a8_weights_create_tuned_ex(domain, &s, b.data(), scales.data()));
         b[0] = 1;
@@ -181,6 +215,13 @@ int main(int argc, char **) {
             rk_npu_iommu_domain_create(ctx.get(), 0), rk_npu_iommu_domain_free);
         CHECK(domain);
         forced(domain.get(), 32, 33, 32);
+        forced(domain.get(), 1, 1057, 480);
+        forced(domain.get(), 1, 8193, 480);
+        for(int M:{2,4,8}) {
+            forced(domain.get(),M,1057,480);
+            single(ctx.get(),domain.get(),std::string(dir)+"/small-chain-"+std::to_string(M),M);
+        }
+        single(ctx.get(),domain.get(),std::string(dir)+"/m1-serial",1);
         if (argc == 1) {
             forced(domain.get(), 65, 993, 992);
             forced(domain.get(), 127, 2049, 2048);

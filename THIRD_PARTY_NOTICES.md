@@ -19,6 +19,21 @@ permission for adapted portions has not been confirmed. This notice records
 their origin; it does not assert permission to relicense those portions under
 AGPL or resolve their licensing status.
 
+## ggml
+
+The NEON exponential implementation used by
+`src/rk_npu_cpu_kernels.cpp` includes adaptations from ggml.
+The upstream revision, copyright notice and MIT license are preserved in
+[LICENSES/ggml-MIT.txt](LICENSES/ggml-MIT.txt).
+
+## Perfetto
+
+Optional tracing uses the Perfetto v58.2 C++ SDK. The bootstrap tool downloads
+the SDK and preserves its upstream LICENSE alongside the source files.
+Trace-enabled installations include that license as `Perfetto-LICENSE`.
+
+Source: <https://github.com/google/perfetto>
+
 ## Reference material
 
 The [README references](README.md#references) identify additional technical

@@ -1,3 +1,4 @@
+#include "rk_npu_trace.h"
 #include "rk_npu_i4_plan.h"
 #include "rk_npu_i4_cpu.h"
 #include "rk_npu_i4_regs.h"
@@ -202,11 +203,18 @@ int I4Plan::bind(const I4Weights& weights) {
 }
 
 int I4Plan::pack(int w, rk_npu_i4_input_producer producer, void* user, rk_npu_i4_timings& times) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "i4.wave_pack", "wave", w, "M", cfg_.M,
+        "K", cfg_.K, "k_tile", cfg_.k_tile, "input_layout", int(layout_));
     if (w<0 || w>=wave_count() || !producer) return RK_NPU_ERR_PARAM;
     const auto& wave=waves_[w]; auto& buffer=input_[w%slots_];
-    auto start=Clock::now(); int rc=buffer.begin_cpu_write(); times.sync_us+=elapsed(start);
+    auto start=Clock::now(); int rc;
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "i4.input_sync_begin", "wave", w);
+      rc=buffer.begin_cpu_write(); }
+    times.sync_us+=elapsed(start);
     if (rc) return rc;
     start=Clock::now();
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "i4.input_pack", "wave", w,
+        "k_offset", wave.k0, "k_count", wave.k, "cpu_threads", cfg_.cpu_threads);
     for (int m0=0;m0<cfg_.M;) {
         const int rows=i4_m_rows(cfg_.M-m0,cfg_.m_tile,layout_);
         rk_npu_i4_input_tile tile{m0,rows,wave.k0,wave.k,wave.padded_k,
@@ -217,22 +225,30 @@ int I4Plan::pack(int w, rk_npu_i4_input_producer producer, void* user, rk_npu_i4
         m0+=rows;
     }
     times.pack_us+=elapsed(start);
-    start=Clock::now(); const int end=buffer.end_cpu_access(); times.sync_us+=elapsed(start);
+    }
+    start=Clock::now(); int end;
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "i4.input_sync_end", "wave", w);
+      end=buffer.end_cpu_access(); }
+    times.sync_us+=elapsed(start);
     return rc ? rc : end;
 }
 
 int I4Plan::submit(int wave) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "i4.wave_submit", "wave", wave,
+        "M", cfg_.M, "K", cfg_.K, "N", cfg_.N, "npu_mask", cfg_.npu_core_mask);
     if (wave<0 || wave>=wave_count() || bound_weight_dma_==UINT64_MAX) return RK_NPU_ERR_PARAM;
     return do_submit_multicore(domain_->ctx->fd,waves_[wave].tasks.obj_addr,int(tiles_.size()),
                                cfg_.npu_core_mask,starts_,counts_,domain_->id,cfg_.timeout_ms);
 }
 int I4Plan::begin_partial(int w, const int16_t** partial) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "i4.output_sync_begin", "wave", w);
     if (retained_ || w<0 || w>=wave_count() || !partial) return RK_NPU_ERR_PARAM;
     auto& buffer=output_[w%slots_]; const int rc=buffer.begin_cpu_read();
     if (!rc) *partial=static_cast<const int16_t*>(buffer.mem.vaddr);
     return rc;
 }
 int I4Plan::end_partial(int w) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "i4.output_sync_end", "wave", w);
     if (retained_ || w<0 || w>=wave_count()) return RK_NPU_ERR_PARAM;
     return output_[w%slots_].end_cpu_access();
 }
@@ -260,7 +276,9 @@ int I4Plan::consume(int w, I4PartialConsumer consumer, void* user, rk_npu_i4_tim
     auto start=Clock::now(); int rc=begin_partial(w,&src); times.sync_us+=elapsed(start);
     if (rc) return rc;
     start=Clock::now();
-    try { rc=consumer(user,*this,w,src); } catch (...) { rc=RK_NPU_ERR_PARAM; }
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "i4.wave_reduce", "wave", w,
+        "cpu_threads", cfg_.cpu_threads);
+      try { rc=consumer(user,*this,w,src); } catch (...) { rc=RK_NPU_ERR_PARAM; } }
     times.reduce_us+=elapsed(start);
     start=Clock::now(); const int end=end_partial(w); times.sync_us+=elapsed(start);
     return rc ? rc : end;

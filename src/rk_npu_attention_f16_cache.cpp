@@ -1,5 +1,6 @@
 #include "rk_npu_attention_f16_internal.h"
 #include "rk_npu_cpu_kernels.h"
+#include "rk_npu_trace.h"
 #include <cmath>
 #include <cstdlib>
 #include <charconv>
@@ -57,6 +58,8 @@ static uint16_t value_bound(const uint16_t* source,size_t count,uint16_t previou
     return previous;
 }
 void Cache::reserve(int requested){
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.cache_reserve", "requested", requested,
+        "capacity", capacity, "kv_length", length);
     if(requested<0)throw Error{RK_NPU_ERR_PARAM};
     if(requested>cfg.max_capacity)throw Error{RK_NPU_ERR_NOMEM};
     if(requested<=capacity)return;
@@ -118,6 +121,8 @@ void Cache::load(const uint16_t* k,const uint16_t* v,int count){
 }
 
 void Cache::append(const uint16_t* k,const uint16_t* v,int count,double* reserve_time){
+    RK_NPU_TRACE_EVENT("rknpu", "attention.cache_append", "rows", count,
+        "kv_length_before", length, "kv_heads", cfg.kv_heads, "head_dim", cfg.head_dim);
     if(poisoned)throw Error{RK_NPU_ERR_SUBMIT};
     if(count<0 || (count && (!k || !v)))throw Error{RK_NPU_ERR_PARAM};
     if(count>cfg.max_capacity-length)throw Error{RK_NPU_ERR_NOMEM};
@@ -130,9 +135,40 @@ void Cache::append(const uint16_t* k,const uint16_t* v,int count,double* reserve
     // or align32 span. A multi-token append uses one policy for the whole call.
     const int dirty_sync_groups=dirty_sync.for_length(last);
     try {
+        { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.cache_pack", "rows", count);
         for(int hi=0;hi<h();++hi)
             value_absmax[hi]=value_bound(v+size_t(hi)*count*shape.value_dim,size_t(count)*shape.value_dim,value_absmax[hi]);
-        for(int i=0;i<count;++i)write(first+i,k,v,count,i);
+        // Single-token decode has no measured packing benefit. Keep its
+        // original scatter; block transposes target multi-token prefill.
+        if(count==1)write(first,k,v,1,0);
+        else {
+            // K^T's native B layout contains contiguous K32 channel pieces.
+            // V uses N16/K32 transposes, including partial stripe updates.
+            // Only new rows are written; old tokens and padding survive.
+            for(int hi=0;hi<h();++hi){
+                for(int i=0;i<count;++i)for(int kb=0;kb<d/32;++kb){
+                    const int pos=first+i;
+                    std::memcpy(key.data()+size_t(hi)*capacity*d+
+                        ((size_t(pos/16)*(d/32)+kb)*16+pos%16)*32,
+                        k+(size_t(hi)*count+i)*d+kb*32,64);
+                }
+                for(int b=first/tile;b<ceil_div(last,tile);++b){
+                    const int lo=std::max(first,b*tile)-b*tile;
+                    const int end=std::min(last,(b+1)*tile)-b*tile;
+                    auto* dst=value.data()+voffset(hi,b);
+                    cpu::f16_pack_b_native_n16_k32_update(end-lo,shape.value_dim,tile,lo,
+                        v+(size_t(hi)*count+b*tile+lo-first)*shape.value_dim,dst);
+                    for(int pos=lo;pos<end;){
+                        const int valid=std::min(end-pos,32-pos%32);
+                        std::fill_n(dst+((size_t(shape.value_dim/16)*(tile/32)+pos/32)*512)+pos%32,
+                            valid,half(1));
+                        pos+=valid;
+                    }
+                }
+            }
+        }
+        }
+        { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.cache_sync", "rows", count);
         for(int hi=0;hi<h();++hi){
             const int kfirst=first/16*16,kend=align_up(last,16);
             key.range((size_t(hi)*capacity+kfirst)*d*2,size_t(kend-kfirst)*d*2);
@@ -148,11 +184,25 @@ void Cache::append(const uint16_t* k,const uint16_t* v,int count,double* reserve
                 }
             }
         }
+        }
     }catch(...){poisoned=true;throw;}
     length=last;++epoch;dirty_first=first;dirty_count=count;
 }
 
+void Cache::truncate(int count){
+    if(poisoned)throw Error{RK_NPU_ERR_SUBMIT};
+    if(cfg.flags!=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX || count<0 || count>length)
+        throw Error{RK_NPU_ERR_PARAM};
+    if(count==length)return;
+    length=count;++epoch;dirty_first=count;dirty_count=0;tail_epoch=~uint64_t(0);
+    // Native K/V and their denominator channel stay intact. Stable softmax
+    // writes zero probability beyond length; the historical V bound remains
+    // a valid conservative bound for every retained/replaced prefix.
+}
+
 void Cache::stage_tail(int span){
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.tail_stage", "compute_length", span,
+        "kv_tile", cfg.kv_tile, "kv_length", length);
     const int size=span%cfg.kv_tile,block=span/cfg.kv_tile,tile=cfg.kv_tile;
     if(!size)return;
     if(poisoned)throw Error{RK_NPU_ERR_SUBMIT};

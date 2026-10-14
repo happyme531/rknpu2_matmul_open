@@ -10,6 +10,27 @@
 #include <sstream>
 
 namespace rknpu2_matmul_open::w4_tune {
+namespace {
+bool valid_cpu_policy(const rk_npu_w4a8_config& c,int maximum_threads,int chain_limit) {
+    if(maximum_threads<1 || maximum_threads>4 || chain_limit<0) return false;
+    const bool small=c.M<=std::max(small_cpu_batch_limit,chain_limit);
+    if(c.cpu_threads!=maximum_threads && !(small && c.cpu_threads==1))return false;
+    if(c.pipeline==RK_NPU_W4A8_CHAIN)
+        return c.M<=chain_limit && c.K>c.k_tile;
+    return c.pipeline==RK_NPU_W4A8_PIPELINED || (small && c.pipeline==RK_NPU_W4A8_SERIAL);
+}
+}
+int chain_max_m() {
+    const char* text=std::getenv("RK_NPU_W4A8_CHAIN_MAX_M");
+    if(!text)return 8;
+    if(!*text)return -1;
+    int value=0;
+    for(const char* p=text;*p;++p) {
+        if(*p<'0' || *p>'9')return -1;
+        value=value*10+(*p-'0');if(value>64)return -1;
+    }
+    return value;
+}
 bool valid(const rk_npu_w4a8_autotune_config& c) {
     return c.M>0 && c.M<=INT_MAX/2 && c.K>0 && c.K<=INT32_MAX/1024 && c.N>0 && c.N<=INT_MAX-63
         && (c.activation_type==RK_NPU_W4A8_F32||c.activation_type==RK_NPU_W4A8_F16)
@@ -41,6 +62,7 @@ int profile(const rk_npu_w4a8_autotune_config& c,const int8_t* B,const float* sc
 }
 Resources resources(const rk_npu_w4a8_autotune_config& c) {
     Resources r;const auto affinity=rknpu2_matmul_open::tune::process_cpu_mask();
+    r.chain_max_m=chain_max_m();if(r.chain_max_m<0)return r;
     r.allowed_cpu=(c.allowed_cpu_core_mask?c.allowed_cpu_core_mask:affinity)&affinity;
     const auto cpus=rknpu2_matmul_open::tune::preferred_cpus(r.allowed_cpu);
     r.threads=std::min(4,int(cpus.size()));r.cpu=rknpu2_matmul_open::tune::first_cpu_mask(cpus,r.threads);
@@ -63,8 +85,8 @@ std::vector<Candidate> candidates(const rk_npu_w4a8_autotune_config& c,const Pro
     std::set<int> ns,ms;
     for(int n:{512,1024,2048,4096}) ns.insert(std::min(n,max_shard));
     for(int m:{16,32,64}) ms.insert(std::min(m,c.M));
-    auto add=[&](int k,int m,int n,rk_npu_w4a8_input_layout layout) {
-        Candidate candidate{{c.M,c.N,c.K,m,k,n,r.npu,c.timeout_ms,1,r.threads},
+    auto add=[&](int k,int m,int n,rk_npu_w4a8_input_layout layout,int threads,int pipeline) {
+        Candidate candidate{{c.M,c.N,c.K,m,k,n,r.npu,c.timeout_ms,pipeline,threads},
             {sizeof(rk_npu_w4a8_options),layout,RK_NPU_W4A8_REDUCE_CPU}};
         rk_npu_w4a8_memory_info_ex memory{};
         if(!rk_npu_w4a8_memory_query_ex(&candidate.config,&candidate.execution,&memory))
@@ -72,19 +94,36 @@ std::vector<Candidate> candidates(const rk_npu_w4a8_autotune_config& c,const Pro
     };
     const auto ks=k_candidates(c,p);
     // Keep all legacy candidates. An extended search can always select native.
-    for(int k:ks) for(int m:ms) for(int n:ns) add(k,m,n,RK_NPU_W4A8_INPUT_NATIVE);
+    for(int k:ks) for(int m:ms) for(int n:ns)
+        add(k,m,n,RK_NPU_W4A8_INPUT_NATIVE,r.threads,1);
+    auto extra=[&](const std::set<int>& tiles,rk_npu_w4a8_input_layout layout) {
+      if(c.M<=std::max(small_cpu_batch_limit,r.chain_max_m)) {
+        // Legacy choices stay first on ties. Teams and execution modes vary
+        // within the same affinity; each shape is timed independently.
+        const std::set<int> threads{1,r.threads};
+        for(int k:ks) for(int m:tiles) for(int n:ns)
+            for(int cpu:threads) for(int pipeline:{0,1,2})
+                if((cpu!=r.threads || pipeline!=1) &&
+                   (pipeline!=2 || (c.M<=r.chain_max_m && c.K>k)))
+                    add(k,m,n,layout,cpu,pipeline);
+      }
+    };
+    extra(ms,RK_NPU_W4A8_INPUT_NATIVE);
     // On small ragged batches, panel8 adds a native tail task and repeats B
     // traffic (e.g. M17 -> 16+1); native can process these in one task.
     if(panel8 && c.M>=32 && (c.M>64 || c.M%4==0)) {
         ms.clear();
         for(int m:{16,32,64,128,256}) ms.insert(std::min(m,c.M/4*4));
-        for(int k:ks) for(int m:ms) for(int n:ns) add(k,m,n,RK_NPU_W4A8_INPUT_PANEL8);
+        for(int k:ks) for(int m:ms) for(int n:ns)
+            add(k,m,n,RK_NPU_W4A8_INPUT_PANEL8,r.threads,1);
+        extra(ms,RK_NPU_W4A8_INPUT_PANEL8);
     }
     return out;
 }
 bool valid_execution(const Strategy& s,bool panel8) {
     const auto& o=s.execution;
-    if(o.struct_size!=sizeof(o) || o.reduce_backend!=RK_NPU_W4A8_REDUCE_CPU ||
+    if(!valid_cpu_policy(s.base.config,__builtin_popcountll(s.base.cpu_core_mask),chain_max_m()) ||
+       o.struct_size!=sizeof(o) || o.reduce_backend!=RK_NPU_W4A8_REDUCE_CPU ||
        (o.input_layout!=RK_NPU_W4A8_INPUT_NATIVE &&
         (!panel8 || o.input_layout!=RK_NPU_W4A8_INPUT_PANEL8))) return false;
     rk_npu_w4a8_memory_info_ex info{};
@@ -96,8 +135,8 @@ bool valid_strategy(const Strategy& strategy,const rk_npu_w4a8_autotune_config& 
     if(!valid_execution(strategy,panel8)) return false;
     const auto& a=s.config;const auto& w=s.weights;
     if(s.tuning_revision!=revision||s.activation_type!=c.activation_type||s.weight_fingerprint!=p.fingerprint
-       ||a.M!=c.M||a.N!=c.N||a.K!=c.K||a.npu_core_mask!=r.npu||a.cpu_threads!=r.threads
-       ||s.cpu_core_mask!=r.cpu||a.timeout_ms!=c.timeout_ms||a.pipeline!=1||!p.permits(a.k_tile)
+       ||a.M!=c.M||a.N!=c.N||a.K!=c.K||a.npu_core_mask!=r.npu||!valid_cpu_policy(a,r.threads,r.chain_max_m)
+       ||s.cpu_core_mask!=r.cpu||a.timeout_ms!=c.timeout_ms||!p.permits(a.k_tile)
        ||(c.required_k_tile && a.k_tile!=c.required_k_tile)
        ||w.config.K!=c.K||w.config.N!=c.N||w.config.k_tile!=a.k_tile||w.safe_k_tile!=p.safe
        ||w.multiplier!=p.multiplier||w.bound_relaxed!=!p.certified(a.k_tile)) return false;
@@ -110,7 +149,8 @@ std::string key(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config& c,const Profi
     out<<revision<<' '<<(panel8?3:1)<<' '<<ctx->driver_version<<' '<<c.M<<' '<<c.N<<' '<<c.K<<' '<<int(c.activation_type)
        <<' '<<(c.allowed_npu_core_mask?c.allowed_npu_core_mask:7)<<' '<<r.allowed_cpu<<' '<<r.npu<<' '<<r.cpu
        <<' '<<c.warmup<<' '<<c.loops<<' '<<c.repeats<<' '<<c.timeout_ms<<' '<<c.required_k_tile
-       <<' '<<p.fingerprint<<' '<<p.safe<<' '<<p.safe_tiles<<' '<<p.limit<<' '<<rknpu2_matmul_open::tune::double_bits(p.multiplier);
+       <<' '<<p.fingerprint<<' '<<p.safe<<' '<<p.safe_tiles<<' '<<p.limit<<' '<<rknpu2_matmul_open::tune::double_bits(p.multiplier)
+       <<' '<<r.chain_max_m;
     return out.str();
 }
 } // namespace rknpu2_matmul_open::w4_tune
@@ -133,7 +173,8 @@ rk_npu_w4a8_weights* create_tuned(rk_npu_iommu_domain* domain,
         c.activation_type=s->activation_type;c.required_k_tile=s->config.k_tile;
         c.k_tile_multiplier=s->weights.multiplier;c.timeout_ms=s->config.timeout_ms;
         rknpu2_matmul_open::w4_tune::Profile p;if(rknpu2_matmul_open::w4_tune::profile(c,B,scale,p)) return nullptr;
-        rknpu2_matmul_open::w4_tune::Resources r{s->config.npu_core_mask,s->cpu_core_mask,s->cpu_core_mask,s->config.cpu_threads};
+        rknpu2_matmul_open::w4_tune::Resources r{s->config.npu_core_mask,s->cpu_core_mask,s->cpu_core_mask,
+                                                __builtin_popcountll(s->cpu_core_mask),rknpu2_matmul_open::w4_tune::chain_max_m()};
         if(!rknpu2_matmul_open::w4_tune::valid_strategy(strategy,c,p,r,panel8)) return nullptr;
         return rknpu2_matmul_open::detail::create_w4a8_weights(domain,p.info(c.required_k_tile),B,scale);
     } catch(...) {return nullptr;}
@@ -149,7 +190,7 @@ extern "C" rk_npu_w4a8_weights* rk_npu_w4a8_weights_create_tuned_ex(rk_npu_iommu
 }
 extern "C" rk_npu_w4a8_workspace* rk_npu_w4a8_workspace_create_tuned_ex(rk_npu_iommu_domain* domain,
     const rk_npu_w4a8_strategy_ex* s) {
-    if(!s || s->base.tuning_revision!=rknpu2_matmul_open::w4_tune::revision || s->base.config.pipeline!=1 ||
+    if(!s || s->base.tuning_revision!=rknpu2_matmul_open::w4_tune::revision ||
        !rknpu2_matmul_open::w4_tune::valid_execution(*s,true) || s->base.config.K!=s->base.weights.config.K ||
        s->base.config.N!=s->base.weights.config.N || s->base.config.k_tile!=s->base.weights.config.k_tile)
         return nullptr;

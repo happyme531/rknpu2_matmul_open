@@ -445,8 +445,36 @@ int f16_m_tile(int align_in) {
                        cbuf_bank_size / input_row_bytes);
 }
 
+bool check_f16_b_updates() {
+    std::mt19937 rng(8127);
+    int cases = 0;
+    for (int width : {256, 512, 1024, 4096}) for (int n : {128, 512})
+    for (int first : {0, 1, 7, 15, 16, 31, 32, width - 33, width - 1})
+    for (int rows : {1, 2, 7, 8, 15, 16, 31, 32, 33, 64, 128}) {
+        if (first + rows > width) continue;
+        std::vector<uint16_t> source((size_t)rows * n), out((size_t)n * width + 32);
+        for (auto& x : source) x = (uint16_t)rng(); // Preserve all FP16 bit patterns.
+        for (auto& x : out) x = (uint16_t)rng();
+        auto expected = out;
+        for (int r = 0; r < rows; ++r) for (int c = 0; c < n; ++c) {
+            const int pos = first + r;
+            expected[16 + (((size_t)(c / 16) * (width / 32) + pos / 32) * 16 + c % 16) * 32 + pos % 32] =
+                source[(size_t)r * n + c];
+        }
+        rknpu2_matmul_open::cpu::f16_pack_b_native_n16_k32_update(
+            rows, n, width, first, source.data(), out.data() + 16);
+        if (!same_vec(out, expected, "f16 native B partial update / old rows / guards")) {
+            std::fprintf(stderr, "update shape width=%d N=%d first=%d rows=%d\n", width, n, first, rows);
+            return false;
+        }
+        ++cases;
+    }
+    std::printf("f16 native B updates: %d partial-stripe/old-row/padding/guard cases PASS\n", cases);
+    return true;
+}
+
 bool run_correctness() {
-    bool ok = true;
+    bool ok = check_f16_b_updates();
     const int shapes[][3] = {
         {1, 16, 4}, {3, 31, 31}, {16, 257, 97}, {128, 1024, 513},
         {1, 17, 4099}, {33, 33, 4099}

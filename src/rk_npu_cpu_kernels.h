@@ -253,6 +253,12 @@ void f16_pack_a_native_k8_m8_batch(int B, int M, int K, int align_in,
                                    const uint16_t* src, uint16_t* dst);
 void f16_pack_b_native_n16_k32(int K, int N, int align_in, int align_out,
                                const uint16_t* src, uint16_t* dst);
+/* Update compact src[rows,N] at rows [first,first+rows) of a native B.
+ * Requires native_k 32-aligned, N 16-aligned, 0<=first<=first+rows<=native_k.
+ * Preserve every other element,
+ * including padding and earlier KV rows. No OpenMP team or full-buffer zero. */
+void f16_pack_b_native_n16_k32_update(int rows, int N, int native_k, int first,
+                                      const uint16_t* src, uint16_t* dst);
 void f16_pack_b_native_n16_k32_batch(int B, int K, int N,
                                      int align_in, int align_out,
                                      const uint16_t* src, uint16_t* dst);

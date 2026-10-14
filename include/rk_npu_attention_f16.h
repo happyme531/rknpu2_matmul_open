@@ -85,6 +85,11 @@ int rk_npu_attention_f16_cache_load(rk_npu_ctx* ctx,
 /* K/V are compact [kv_heads,count,128]; NULL is accepted only for count=0. */
 int rk_npu_attention_f16_cache_append(rk_npu_ctx* ctx,
     rk_npu_attention_f16_cache* cache, const uint16_t* k, const uint16_t* v, int count);
+/* Retain a prefix, 0<=length<=current length, without copying/clearing native
+ * K/V or changing capacity. Requires STABLE_SOFTMAX; its probability mask
+ * excludes stale rows after the retained prefix. Tail staging is invalidated.
+ * A poisoned cache still requires cache_load before reuse. */
+int rk_npu_attention_f16_cache_truncate(rk_npu_attention_f16_cache* cache, int length);
 int rk_npu_attention_f16_prepare(rk_npu_iommu_domain* domain,
     const rk_npu_attention_f16_config* cfg, rk_npu_attention_f16_workspace** out);
 void rk_npu_attention_f16_workspace_free(rk_npu_attention_f16_workspace* workspace);

@@ -1,5 +1,6 @@
 #include "rk_npu_w4a8_npu_reduce.h"
 #include "rk_npu_half_bits.h"
+#include "rk_npu_trace.h"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -268,21 +269,26 @@ void W4A8NpuReduce::output(const W4A8Reduction &d) {
     }
 }
 int W4A8NpuReduce::run(const W4A8Reduction &data, rk_npu_w4a8_timings &t) {
+    RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.npu_reduce", "npu_mask", cfg_.npu_core_mask);
     auto start = Clock::now();
-    int rc =
-        do_submit_multicore(domain_->ctx->fd, tasks_.obj_addr, int(parts_.size()),
-                            cfg_.npu_core_mask, starts_, counts_, domain_->id, cfg_.timeout_ms);
+    int rc;
+    { RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.reduction_submit");
+      rc = do_submit_multicore(domain_->ctx->fd, tasks_.obj_addr, int(parts_.size()),
+                            cfg_.npu_core_mask, starts_, counts_, domain_->id, cfg_.timeout_ms); }
     t.reduce_us += elapsed(start); // blocking Conv submit, not CPU work
     if (!rc) {
         start = Clock::now();
-        rc = reduced_.begin_cpu_read();
+        { RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.reduction_output_sync_begin");
+          rc = reduced_.begin_cpu_read(); }
         t.sync_us += elapsed(start);
         if (!rc) {
             start = Clock::now();
-            output(data);
+            { RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.reduction_dequant");
+              output(data); }
             t.dequant_us += elapsed(start);
             start = Clock::now();
-            rc = reduced_.end_cpu_access();
+            { RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.reduction_output_sync_end");
+              rc = reduced_.end_cpu_access(); }
             t.sync_us += elapsed(start);
         }
     }

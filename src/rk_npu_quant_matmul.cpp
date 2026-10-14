@@ -1,4 +1,5 @@
 #include "rk_npu_quant_matmul.h"
+#include "rk_npu_trace.h"
 #include "rk_npu_autotune_common.h"
 #include "rk_npu_autotune_cache.h"
 
@@ -585,7 +586,11 @@ public:
         return RK_NPU_OK;
     }
 
-    int submit(const rknpu2_matmul_open::detail::I8KnWeights* weights, int wave) {
+    int submit(const rknpu2_matmul_open::detail::I8KnWeights* weights, int wave
+#if RK_NPU_ENABLE_TRACE
+               , uint64_t run_id
+#endif
+               ) {
         if (!weights) return RK_NPU_ERR_PARAM;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -593,6 +598,12 @@ public:
                 return RK_NPU_ERR_BUSY;
             weights_ = weights;
             wave_ = wave;
+#if RK_NPU_ENABLE_TRACE
+            trace_run_id_=run_id;
+            trace_wave_id_=rk_npu_trace::next_id();
+#endif
+            RK_NPU_TRACE_EVENT("rknpu.detail", "w8.submit_dispatch", "wave", wave,
+                "run_id", trace_run_id_, perfetto::Flow::ProcessScoped(trace_wave_id_));
             done_ = false;
             pending_ = true;
         }
@@ -628,17 +639,26 @@ private:
         for (;;) {
             const rknpu2_matmul_open::detail::I8KnWeights* weights = nullptr;
             int wave = -1;
+#if RK_NPU_ENABLE_TRACE
+            uint64_t run_id=0, wave_id=0;
+#endif
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait(lock, [&] { return stopping_ || pending_; });
                 if (stopping_ && !pending_) break;
                 weights = weights_;
                 wave = wave_;
+#if RK_NPU_ENABLE_TRACE
+                run_id=trace_run_id_; wave_id=trace_wave_id_;
+#endif
                 pending_ = false;
                 executing_ = true;
             }
             const auto t0 = Clock::now();
-            const int rc = plan_->run_wave(wave, *weights);
+            int rc;
+            { RK_NPU_TRACE_EVENT("rknpu.detail", "w8.submit_worker", "wave", wave,
+                "run_id", run_id, perfetto::TerminatingFlow::ProcessScoped(wave_id));
+              rc = plan_->run_wave(wave, *weights); }
             const double elapsed = us_since(t0);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -664,6 +684,9 @@ private:
     bool done_ = true;
     int rc_ = RK_NPU_OK;
     double elapsed_us_ = 0;
+#if RK_NPU_ENABLE_TRACE
+    uint64_t trace_run_id_=0, trace_wave_id_=0;
+#endif
 };
 
 class SingleRunner {
@@ -689,12 +712,26 @@ public:
     }
 
     int run(const RunJob& job, RunMetrics* metrics) {
+#if RK_NPU_ENABLE_TRACE
+        const auto &cfg=plan_->config();
+        const uint64_t run_id=rk_npu_trace::next_id();
+#endif
+        RK_NPU_TRACE_EVENT("rknpu", "w8.run", "M", cfg.M, "K", cfg.K, "N", cfg.N,
+            "k_tile", cfg.k_tile, "n_tile", cfg.n_tile, "npu_mask", cfg.npu_core_mask,
+            "cpu_mask", cpu_mask_, "cpu_threads", cpu_threads_, "a_layout", int(cfg.a_layout),
+            "c_layout", int(cfg.c_layout), "npu_reduce", cfg.npu_reduce,
+            "npu_dequant", cfg.npu_dequant, "op_kind", int(kind_), "run_id", run_id,
+            "waves", plan_->wave_count(), "pipeline", cfg.npu_reduce ? "chain" : "ping_pong",
+            perfetto::Flow::ProcessScoped(run_id));
         const auto total0 = Clock::now();
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (stopping_) return RK_NPU_ERR_PARAM;
             if (pending_ || executing_) return RK_NPU_ERR_BUSY;
             job_ = job;
+#if RK_NPU_ENABLE_TRACE
+            trace_run_id_=run_id;
+#endif
             pending_ = true;
             done_ = false;
         }
@@ -729,16 +766,25 @@ private:
         cv_.notify_all();
         for (;;) {
             RunJob job;
+#if RK_NPU_ENABLE_TRACE
+            uint64_t run_id=0;
+#endif
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait(lock, [&] { return stopping_ || pending_; });
                 if (stopping_ && !pending_) break;
                 job = job_;
+#if RK_NPU_ENABLE_TRACE
+                run_id=trace_run_id_;
+#endif
                 pending_ = false;
                 executing_ = true;
             }
             RunMetrics metrics{};
-            const int rc = execute(job, metrics);
+            int rc;
+            { RK_NPU_TRACE_EVENT("rknpu.detail", "w8.execute_worker", "run_id", run_id,
+                perfetto::TerminatingFlow::ProcessScoped(run_id));
+              rc = execute(job, metrics); }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 metrics_ = metrics;
@@ -769,6 +815,8 @@ private:
         const int waves = plan_->wave_count();
         if (waves <= 0) return RK_NPU_ERR_PARAM;
         auto pack = [&](int wave) {
+            RK_NPU_TRACE_EVENT("rknpu.detail", "w8.wave_pack", "wave", wave,
+                "run_id", trace_run_id_, "includes_activation_scan", wave==0);
             const auto input0 = Clock::now();
             int one_rc = RK_NPU_ERR_PARAM;
             if (traits.quant == QuantKind::None)
@@ -791,9 +839,14 @@ private:
             return one_rc;
         };
         auto submit = [&](int wave) {
-            return npu_.submit(job.weights, wave);
+            return npu_.submit(job.weights, wave
+#if RK_NPU_ENABLE_TRACE
+                , trace_run_id_
+#endif
+                );
         };
         auto wait = [&]() {
+            RK_NPU_TRACE_EVENT("rknpu.detail", "w8.submit_wait", "run_id", trace_run_id_);
             double one_us = 0;
             const int one_rc = npu_.wait(&one_us);
             metrics.npu_us += one_us;
@@ -801,6 +854,8 @@ private:
         };
         auto write_output = [&](int partial_count,
                                 const int32_t* const* partials) {
+            RK_NPU_TRACE_EVENT("rknpu.detail", "w8.output_reduce_dequant", "partials", partial_count,
+                "run_id", trace_run_id_);
             if (traits.quant == QuantKind::None) {
                 rknpu2_matmul_open::cpu::i8_reduce_c_native_i32_to_rowmajor(
                     plan_->config().M, plan_->config().N, partial_count,
@@ -825,6 +880,7 @@ private:
         if (plan_->config().npu_reduce) {
             if (job.weights->compressed()) return RK_NPU_ERR_PARAM;
             if (traits.quant == QuantKind::Dynamic) {
+                RK_NPU_TRACE_EVENT("rknpu.detail", "w8.chain_pack", "run_id", trace_run_id_);
                 const auto input0 = Clock::now();
                 rc = traits.input == HostDType::F16
                     ? plan_->pack_chain_dynamic(job.A_f16)
@@ -909,9 +965,12 @@ private:
                 }
             }
             const auto reduce0 = Clock::now();
+            RK_NPU_TRACE_BEGIN("rknpu.detail", "w8.partial_accumulate", "wave", pending_partial,
+                "run_id", trace_run_id_);
             rknpu2_matmul_open::cpu::i8_accumulate_c_native_i32(
                 plan_->config().M, plan_->config().N,
                 plan_->partial_i32(pending_partial), accum, plan_->c_panel_width());
+            RK_NPU_TRACE_END("rknpu.detail");
             metrics.output_us += us_since(reduce0);
             sync0 = Clock::now();
             const int end_rc = plan_->end_wave_output_cpu_access(
@@ -933,9 +992,12 @@ private:
         }
         if (rc == RK_NPU_OK && pending_partial >= 0) {
             const auto reduce0 = Clock::now();
+            RK_NPU_TRACE_BEGIN("rknpu.detail", "w8.partial_accumulate", "wave", pending_partial,
+                "run_id", trace_run_id_);
             rknpu2_matmul_open::cpu::i8_accumulate_c_native_i32(
                 plan_->config().M, plan_->config().N,
                 plan_->partial_i32(pending_partial), accum, plan_->c_panel_width());
+            RK_NPU_TRACE_END("rknpu.detail");
             metrics.output_us += us_since(reduce0);
             sync0 = Clock::now();
             rc = plan_->end_wave_output_cpu_access(pending_partial);
@@ -974,6 +1036,9 @@ private:
     RunJob job_{};
     RunMetrics metrics_{};
     int rc_ = RK_NPU_OK;
+#if RK_NPU_ENABLE_TRACE
+    uint64_t trace_run_id_=0;
+#endif
 };
 
 struct WorkspaceState {

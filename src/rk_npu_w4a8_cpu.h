@@ -11,6 +11,13 @@ struct W4A8Input {
     int threads = 1; // private producer owns parallelism; public callback stays serial
     I4InputLayout layout = I4InputLayout::Native;
 };
+// Paired native N32 blocks, prepared once for a workspace's fixed geometry.
+struct W4A8SwiGLUPair {
+    uint64_t gate_partial, up_partial; // offsets in INT16 elements
+    uint64_t gate_accumulator, up_accumulator; // offsets in INT32 elements
+    int m0, rows, n0;
+};
+std::vector<W4A8SwiGLUPair> w4a8_swiglu_pairs(int N, const std::vector<I4Tile>&);
 struct W4A8Reduction {
     int32_t *accumulator; // tile / N8 / logical M / 8, including N64 padding
     const int32_t *correction;
@@ -18,6 +25,7 @@ struct W4A8Reduction {
     const float *w_scale;
     void *output;
     bool half;
+    const std::vector<W4A8SwiGLUPair> *swiglu_pairs = nullptr;
 };
 int w4a8_scales(const void *A, bool half, int M, int K, int threads, float *scales, float *inverse);
 int w4a8_pack(void *user, const rk_npu_i4_input_tile *tile);

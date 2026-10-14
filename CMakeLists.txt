@@ -12,6 +12,29 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 find_package(OpenMP REQUIRED)
 include(CheckCXXCompilerFlag)
 
+option(RK_NPU_ENABLE_TRACE "Enable in-process Perfetto diagnostic traces" OFF)
+set(RK_NPU_PERFETTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/perfetto-v58.2"
+    CACHE PATH "Pinned Perfetto v58.2 amalgamated SDK directory")
+if(RK_NPU_ENABLE_TRACE)
+  if(NOT EXISTS "${RK_NPU_PERFETTO_ROOT}/perfetto.h" OR NOT EXISTS "${RK_NPU_PERFETTO_ROOT}/perfetto.cc")
+    message(FATAL_ERROR "Run python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/bootstrap_perfetto.py first")
+  endif()
+  find_package(Threads REQUIRED)
+  add_library(rk_npu_perfetto_sdk STATIC "${RK_NPU_PERFETTO_ROOT}/perfetto.cc")
+  set_target_properties(rk_npu_perfetto_sdk PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(rk_npu_perfetto_sdk PUBLIC "${RK_NPU_PERFETTO_ROOT}")
+  target_link_libraries(rk_npu_perfetto_sdk PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+  # Both driver variants and their callers use this single category/session
+  # owner, even when static and shared driver libraries enter one executable.
+  add_library(rk_npu_trace SHARED src/rk_npu_trace.cpp)
+  target_include_directories(rk_npu_trace PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${RK_NPU_PERFETTO_ROOT}>
+    $<INSTALL_INTERFACE:include>)
+  target_compile_definitions(rk_npu_trace PUBLIC RK_NPU_ENABLE_TRACE=1)
+  target_link_libraries(rk_npu_trace PRIVATE rk_npu_perfetto_sdk)
+endif()
+
 set(RK_NPU_AARCH64_FP16_FLAGS "")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
   check_cxx_compiler_flag("-march=armv8.2-a+fp16" RK_NPU_HAS_ARMV82_FP16_FLAG)
@@ -46,6 +69,7 @@ set(RK_NPU_SRCS
   src/rk_npu_w4a4_linear.cpp   # fused FP32/FP16 W4A4 Linear C ABI
   src/rk_npu_w4a8_quant.cpp    # full-token A8 scale + fused MSD/native packing
   src/rk_npu_w4a8_output.cpp   # partial MSD reconstruction + floating output
+  src/rk_npu_w4a8_chain.cpp    # one per-core PC chain over all K waves
   src/rk_npu_w4a8_npu_reduce.cpp # optional retained-partial INT32 Conv consumer
   src/rk_npu_w4a8.cpp          # shared scaled W4 weights + f32/f16 entry points
   src/rk_npu_w4a8_tune_policy.cpp # weight-aware candidate and cache identity policy
@@ -59,9 +83,13 @@ set(RK_NPU_SRCS
   src/rk_npu_mla_f16.cpp      # Ling tiny gated MLA: expanded / absorbed latent cache
   src/rk_npu_mm.cpp           # additive raw MM/BMM descriptor and FP16 executor
   src/rk_npu_add_rmsnorm_f16.cpp)
+if(NOT RK_NPU_ENABLE_TRACE)
+  list(APPEND RK_NPU_SRCS src/rk_npu_trace.cpp)
+endif()
 
 set(RK_NPU_PUBLIC_HEADERS
   include/rk_npu_common.h
+  include/rk_npu_trace.h
   include/rk_npu_matmul.h
   include/rk_npu_moe_w8.h
   include/rk_npu_matmul_i4.h
@@ -91,6 +119,13 @@ target_include_directories(rk_npu_matmul_static PUBLIC ${CMAKE_CURRENT_SOURCE_DI
 set_target_properties(rk_npu_matmul_static PROPERTIES OUTPUT_NAME rk_npu_matmul)
 target_compile_options(rk_npu_matmul_static PRIVATE ${RK_NPU_AARCH64_FP16_FLAGS})
 target_link_libraries(rk_npu_matmul_static PUBLIC OpenMP::OpenMP_CXX)
+if(RK_NPU_ENABLE_TRACE)
+  target_link_libraries(rk_npu_matmul PUBLIC rk_npu_trace)
+  target_link_libraries(rk_npu_matmul_static PUBLIC rk_npu_trace)
+else()
+  target_compile_definitions(rk_npu_matmul PUBLIC RK_NPU_ENABLE_TRACE=0)
+  target_compile_definitions(rk_npu_matmul_static PUBLIC RK_NPU_ENABLE_TRACE=0)
+endif()
 
 # ---- demo executables ----
 add_executable(demo examples/demo.cpp)
@@ -233,6 +268,10 @@ add_executable(test_w4a8_reduction tests/test_w4a8_reduction.cpp)
 target_link_libraries(test_w4a8_reduction PRIVATE rk_npu_matmul)
 add_executable(test_w4a8 tests/test_w4a8.cpp)
 target_link_libraries(test_w4a8 PRIVATE rk_npu_matmul)
+add_executable(test_w4a8_swiglu tests/test_w4a8_swiglu.cpp)
+target_link_libraries(test_w4a8_swiglu PRIVATE rk_npu_matmul)
+add_executable(test_w4a8_chain tests/test_w4a8_chain.cpp)
+target_link_libraries(test_w4a8_chain PRIVATE rk_npu_matmul)
 add_executable(test_i4_bounds tests/test_i4_bounds.cpp)
 target_link_libraries(test_i4_bounds PRIVATE rk_npu_matmul)
 add_executable(test_w4a8_multiplier tests/test_w4a8_multiplier.cpp)
@@ -246,6 +285,7 @@ target_include_directories(test_w4a8_header_c PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 if(BUILD_TESTING)
   add_test(NAME w4a8_cpu COMMAND test_w4a8_cpu)
   add_test(NAME w4a8_reduction COMMAND test_w4a8_reduction)
+  add_test(NAME w4a8_swiglu_cpu COMMAND test_w4a8_swiglu --cpu)
   add_test(NAME i4_bounds COMMAND test_i4_bounds)
   add_test(NAME autotune_cpu COMMAND test_autotune_cpu)
 endif()
@@ -286,6 +326,12 @@ include(GNUInstallDirs)
 install(TARGETS rk_npu_matmul
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(RK_NPU_ENABLE_TRACE)
+  install(TARGETS rk_npu_trace LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  install(FILES "${RK_NPU_PERFETTO_ROOT}/perfetto.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(FILES "${RK_NPU_PERFETTO_ROOT}/LICENSE"
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/rk_npu_matmul RENAME Perfetto-LICENSE)
+endif()
 
 add_executable(test_w4a8_low_cpu tests/test_w4a8_low_cpu.cpp)
 target_link_libraries(test_w4a8_low_cpu PRIVATE rk_npu_matmul ${CMAKE_DL_LIBS})
@@ -306,7 +352,7 @@ target_link_libraries(test_w4a8_tune_layout PRIVATE rk_npu_matmul)
 # programs use __fp16 and therefore cannot be built by an x86 compiler.
 add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_cpu_kernels test_i4_cpu test_w4a4_linear_cpu test_w4a8_cpu
-  test_w4a8_reduction test_i4_bounds test_autotune_cpu test_panel_layout
+  test_w4a8_reduction test_w4a8_swiglu test_i4_bounds test_autotune_cpu test_panel_layout
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
   test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c
   test_w4a4_linear_header_c test_moe_w8_header_c test_mm test_mm_header_c test_mm_tf32
