@@ -89,6 +89,7 @@ void Cache::reserve(int requested){
     }
     nk.sync(RK_NPU_SYNC_TO_DEVICE);nv.sync(RK_NPU_SYNC_TO_DEVICE);
     key.swap(nk);value.swap(nv);capacity=next;blocks=nb;++generation;
+    if(lut_exp){value_total.resize(size_t(h())*shape.value_dim);value_prefix.resize(size_t(capacity/32+1)*h()*shape.value_dim);}
     tail_epoch=~uint64_t(0);
 }
 
@@ -108,6 +109,7 @@ void Cache::load(const uint16_t* k,const uint16_t* v,int count){
     if(count<0 || count>cfg.max_capacity || (count && (!k || !v)))throw Error{RK_NPU_ERR_PARAM};
     reserve(count);
     poisoned=true;length=0;key.zero();value.zero();ones(value,h(),blocks,n(),cfg.kv_tile,shape.value_dim,count);
+    if(lut_exp){std::fill(value_total.begin(),value_total.end(),0);add_value_sum(v,count,0);}
     for(int hi=0;hi<h();++hi)
         value_absmax[hi]=value_bound(v?v+size_t(hi)*count*shape.value_dim:nullptr,size_t(count)*shape.value_dim);
     const int d=shape.key_dim,tile=cfg.kv_tile;
@@ -172,6 +174,7 @@ void Cache::append(const uint16_t* k,const uint16_t* v,int count,double* reserve
                 }
             }
         }
+        if(lut_exp)add_value_sum(v,count,first);
         }
         { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.cache_sync", "rows", count);
         for(int hi=0;hi<h();++hi){
@@ -199,10 +202,52 @@ void Cache::truncate(int count){
     if(cfg.flags!=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX || count<0 || count>length)
         throw Error{RK_NPU_ERR_PARAM};
     if(count==length)return;
+    if(lut_exp){
+        const int first=count/32*32,tile=cfg.kv_tile;
+        for(int hi=0;hi<h();++hi){
+            auto* total=value_total.data()+size_t(hi)*shape.value_dim;
+            std::copy_n(value_prefix.data()+(size_t(count/32)*h()+hi)*shape.value_dim,shape.value_dim,total);
+            for(int pos=first;pos<count;++pos)for(int c=0;c<shape.value_dim;++c){
+                const int inner=pos%tile;
+                total[c]+=widen(value.data()[voffset(hi,pos/tile)+((size_t(c/16)*(tile/32)+inner/32)*16+c%16)*32+inner%32]);
+            }
+            // LUT masking leaves a positive carrier on every physical key.
+            // Clear discarded V/denominator rows so correction uses live KV.
+            for(int b=count/tile;b<ceil_div(length,tile);++b){
+                const int lo=std::max(count,b*tile)-b*tile,end=std::min(length,(b+1)*tile)-b*tile;
+                auto* dst=value.data()+voffset(hi,b);
+                for(int c=0;c<=shape.value_dim;++c)for(int pos=lo;pos<end;){
+                    const int n=std::min(end-pos,32-pos%32);
+                    std::fill_n(dst+((size_t(c/16)*(tile/32)+pos/32)*16+c%16)*32+pos%32,n,uint16_t(0));pos+=n;
+                }
+                value.range(voffset(hi,b)*2,size_t(n())*tile*2);
+            }
+        }
+    }
     length=count;++epoch;dirty_first=count;dirty_count=0;tail_epoch=~uint64_t(0);
-    // Native K/V and their denominator channel stay intact. Stable softmax
-    // writes zero probability beyond length; the historical V bound remains
-    // a valid conservative bound for every retained/replaced prefix.
+    // CPU softmax masks retained native rows beyond length. The historical V
+    // bound remains conservative for every retained/replaced prefix.
+}
+
+void Cache::add_value_sum(const uint16_t* v,int count,int first){
+    const int d=shape.value_dim;
+    for(int hi=0;hi<h();++hi){
+        auto* total=value_total.data()+size_t(hi)*d;
+        for(int pos=0;pos<count;++pos){
+            const auto* src=v+(size_t(hi)*count+pos)*d;
+            int c=0;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            for(;c+8<=d;c+=8){
+                const auto x=vreinterpretq_f16_u16(vld1q_u16(src+c));
+                vst1q_f32(total+c,vaddq_f32(vld1q_f32(total+c),vcvt_f32_f16(vget_low_f16(x))));
+                vst1q_f32(total+c+4,vaddq_f32(vld1q_f32(total+c+4),vcvt_f32_f16(vget_high_f16(x))));
+            }
+#endif
+            for(;c<d;++c)total[c]+=widen(src[c]);
+            if((first+pos+1)%32==0)
+                std::copy_n(total,d,value_prefix.data()+(size_t((first+pos+1)/32)*h()+hi)*d);
+        }
+    }
 }
 
 void Cache::stage_tail(int span){

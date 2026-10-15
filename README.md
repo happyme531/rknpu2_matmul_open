@@ -150,9 +150,12 @@ round slightly differently from scalar `expf`; see the public header.
 ## Attention and KV cache
 
 GQA and MLA offer an explicit fixed-shift experimental softmax path and a
-stable path using CPU FP32 row-max/exp with NPU QK/PV products. Long-sequence
-softmax uses NEON polynomial evaluation. Set the corresponding config flag;
-see [Attention](docs/ATTENTION.md) and [MLA](docs/MLA.md) for numerical scope.
+stable row-max path. Stable mode defaults to NPU LUT exponential and PINGPONG
+execution between QK and PV. CPU FP32 code applies the row maximum and mask,
+then corrects the LUT bias and normalizes the output. PV magnitude and task
+limits select the CPU softmax fallback. Set `RK_NPU_ATTN_LUT_EXP=0` before cache
+creation to restore CPU softmax. See [Attention](docs/ATTENTION.md),
+[MLA](docs/MLA.md) and [environment settings](ENV.md) for numerical scope.
 
 `rk_npu_attention_f16_cache_truncate(cache, length)` removes the active KV
 suffix while retaining the prefix and allocated capacity. It requires stable

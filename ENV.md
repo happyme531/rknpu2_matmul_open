@@ -14,11 +14,25 @@
 | `RK_NPU_MOE_TRACE` | 关 | 每次 MoE `ioctl` submit 前后 | 往 stderr 打阶段日志 |
 | `RK_NPU_MOE_W4_MIXED` | 开 | 仅 `rk_npu_moe_w4_workspace_create` | 混合 W4/W8 MoE 是否把 INT4 和 INT8 GEMM 拼进同一条 PC chain |
 | `RK_NPU_MM_SPLIT_K` | 开 | 新 `rk_npu_mm_plan_create`，options.split_k=-1 时 | 允许 FP16/BF16/TF32 MM/BMM 自动 split-K；`0` 关闭，`1` 开启，其它值报错；不影响旧接口 |
+| `RK_NPU_ATTN_LUT_EXP` | 开 | stable Attention cache 创建 | 使用 NPU LUT exponential；`0` 恢复 CPU softmax |
+| `RK_NPU_ATTN_LUT_SUBMIT` | `pingpong` | Attention graph 创建 | LUT 提交方式：`pingpong`、`pc`、`split` |
 | `XDG_CACHE_HOME`、`HOME` | 见下文 | cache path 参数为 NULL 时 | autotune 结果目录 |
 
 改环境变量不会改已经建好的 workspace 或 weight。W8A8 模式在 `plan_config()` 里读一次并写进 plan；W4A8 倍数写进 `rk_npu_w4a8_weight_info`；`RK_NPU_MOE_W4_MIXED` 写进 workspace 的 `mixed_chain`。`RK_NPU_MOE_TRACE` 是每次 submit 现读的。
 
 `setenv` 和正在进行的 `getenv` 没有同步。进程起来之前设好，或者至少在查询、调优、创建 handle 之前设好，创建期间不要再改。
+
+## Attention：`RK_NPU_ATTN_LUT_EXP` 和 `RK_NPU_ATTN_LUT_SUBMIT`
+
+stable Attention 默认在 NPU 上执行 LUT exponential，以 PINGPONG 将 exponential
+与 PV 串联。`RK_NPU_ATTN_LUT_EXP` 未设置或精确为 `1` 时开启，其余值关闭。
+在进程启动前设置 `RK_NPU_ATTN_LUT_EXP=0` 恢复 CPU softmax 及原有 KV 更新、
+截断行为。开关在 cache 创建时固定；fixed-shift 模式不读取此开关的执行选择。
+
+`RK_NPU_ATTN_LUT_SUBMIT=pc` 使用普通 PC 提交；`split` 单独装载 LUT，再以
+PINGPONG 提交 exponential/PV。同链 PINGPONG 是默认方式。若 FP16 PV partial
+的幅值界或4095-task上限不允许 LUT，沿用 CPU softmax。两条路径的 FP16
+舍入不同，完整模型的质量结果见 [Attention](docs/ATTENTION.md#stable-lut-exponential)。
 
 ## 新 MM/BMM：`RK_NPU_MM_SPLIT_K`
 

@@ -6,10 +6,11 @@ retains domain references, and accepts one selected NPU core (mask 1, 2 or 4),
 two cores (mask 3), or three cores (mask 7).
 Existing matmul APIs and default execution choices are unchanged.
 
-This is an explicit performance backend using the fixed-shift exp approximation.
-Set `RK_NPU_ATTENTION_F16_FIXED_SHIFT_EXPERIMENTAL` in `config.flags`; there is no
-automatic selection or hidden fallback. Numerical range handling and model quality
-validation remain deferred. No RKNN runtime, compiler, model or `.tasks` file is
+Set `config.flags` to `RK_NPU_ATTENTION_F16_FIXED_SHIFT_EXPERIMENTAL` for the
+fixed-shift approximation, or `RK_NPU_ATTENTION_F16_STABLE_SOFTMAX` for stable
+row-max Attention. Stable mode defaults to NPU LUT exponential with a CPU
+softmax fallback for PV magnitude and task limits. Fixed-shift numerical range
+handling remains the caller's responsibility. No RKNN runtime, compiler, model or `.tasks` file is
 needed at build or run time. The DPU-RDMA mask registers are generated from dimensions,
 using tested native Softmax layout rules.
 
@@ -22,7 +23,8 @@ using tested native Softmax layout rules.
   `1/sqrt(head_dim)`. Default geometry remains Hq/Hkv=32/8, D128.
 - Large head dimensions or query/KV ratios are handled by internal query-row
   splitting. `run` accepts logical rows and restores compact output order;
-  `query` reports peak segment buffers and total output bytes/tasks.
+  `query` reports peak segment buffers, total output bytes and QK/PV tasks;
+  LUT execution adds DPU tasks at run time.
 - KV capacity is aligned to 32, grows up to an explicit limit of at most 32768.
   Each internal graph must fit within 4095 NPU tasks; `query` rejects configurations
   that cannot fit even after query-row splitting.
@@ -268,9 +270,30 @@ PV 仍使用配置中的 `kv_tile`，不改变默认值 512。`query()` 包含�
 增长/rebind 和每个选定物理核的 INT8 交错。详细证据及 decode 测量见
 长上下文修复记录。
 
+## Stable LUT exponential
+
 `RK_NPU_ATTENTION_F16_STABLE_SOFTMAX` 与 MLA 共用稳定路径：原始 QK 写回后，CPU
-排除无效 keys、以 FP32 减行最大值并计算 exp，再提交 PV。大 score 在 V 幅值
-允许时利用 PV 的 denominator 延后归一化，短 score/大 V 保留归一化概率；
-stable 无需 native mask tensor，`mask_bytes=0`，boolean 的逻辑 ABI 保留。
-公开 GQA 的 causal 前缀规则不变。具体 bound、舍入和计时范围见
-稳定路径性能记录。
+排除无效 keys、以 FP32 减行最大值，NPU LUT 执行 exponential 并通过 PINGPONG
+连接 PV；CPU 以 FP32 去掉正偏置并归一化。stable 无需 native mask tensor，
+`mask_bytes=0`，boolean 的逻辑 ABI 和 GQA causal 前缀规则保留。
+
+启动进程前设置 `RK_NPU_ATTN_LUT_EXP=0` 恢复 CPU exponential 以及原有 KV
+更新和截断行为。大 score 在 V 幅值允许时通过 PV denominator 延后归一化，
+短 score/大 V 保留 CPU 归一化概率。若 `max(abs(V))*kv_tile*1.001>32752`，
+或加入 exponential 后总任务数超过4095，自动使用 CPU softmax。
+
+LUT 分别覆盖 `[-16,-8]` 和 `[-8,0]`。CPU 维护 V 的 FP32 前缀和以修正 LUT
+正偏置；每32个 KV token、每个 V channel 保存4 bytes，另有当前累加和。
+workspace 增加一个与 score 等大的 FP16 exponential 缓冲区。截断保留原有
+分配和前缀，并清除被丢弃的 V/denominator 行。
+
+Qwen3-4B-W4A8-Mixed-LMHeadW8，ubatch128、CPU4-7/4 threads、NPU mask7、
+CPU/NPU/DDR 2.4/1/2.112 GHz、Clang22/O2 的完整模型 ABBA 对照中，prefill512
+吞吐增加1.68%，decode128基本持平，整次累计进程 CPU 时间减少3.83%。
+WikiText-2 raw test 前32个独立512-token窗口、每窗重置 KV，评分 target257–511，
+共8160个目标；CPU/LUT PPL 分别为14.885053/14.972756，变化+0.5892%。
+该质量结果对应此 checkpoint 和语料前缀，不代表其他模型或下游任务。
+
+默认路径通过8种通用 GQA 几何、query 行数1/3/31/32/64/128、三种 mask、
+KV grow/truncate/替换后缀/reset 回归。NPU LUT 改变 FP16 中间舍入，
+Attention 相对 FP32 reference 的最大 relative L2 约0.0564%。

@@ -1,5 +1,5 @@
 /* Experimental causal GQA Attention: compact FP16 Q/K/V -> compact FP32 O.
- * Flags explicitly select fixed-shift exp or stable CPU softmax.
+ * Flags explicitly select fixed-shift exp or stable row-max Attention.
  * No RKNN runtime/compiler/model files are required. */
 #ifndef RK_NPU_ATTENTION_F16_H
 #define RK_NPU_ATTENTION_F16_H
@@ -9,7 +9,8 @@ extern "C" {
 #endif
 
 #define RK_NPU_ATTENTION_F16_FIXED_SHIFT_EXPERIMENTAL 1u
-/* NPU QK/PV with stable FP32 CPU softmax between two submits. */
+/* NPU QK/PV with stable row-max centering and native LUT exponential.
+ * CPU exponential is used when the FP16 PV bound or task limit requires it. */
 #define RK_NPU_ATTENTION_F16_STABLE_SOFTMAX 2u
 typedef enum {
     RK_NPU_ATTENTION_F16_CAUSAL = 0,
@@ -54,8 +55,8 @@ typedef struct {
 } rk_npu_attention_f16_cache_info;
 typedef struct {
     double reserve_us, kv_update_us, prepare_us, tail_stage_us, mask_update_us;
-    /* Stable mode submit_us includes both submits and CPU softmax/score sync;
-     * hardware_us sums only the two driver-reported NPU intervals. */
+    /* Stable mode submit_us includes NPU submits and CPU score processing/sync;
+     * hardware_us sums only the driver-reported NPU intervals. */
     double query_pack_us, submit_us, hardware_us, output_sync_us, finish_us, total_us;
     int compute_length, tasks;
 } rk_npu_attention_f16_timings;
@@ -66,7 +67,8 @@ typedef struct rk_npu_attention_f16_workspace rk_npu_attention_f16_workspace;
 void rk_npu_attention_f16_config_init(rk_npu_attention_f16_config* cfg);
 /* Pure CPU sizing/validation. kv_length is the causal prefix to compute, not
  * allocated cache capacity. Buffer sizes describe the largest internal segment;
- * output_bytes covers [query_heads,query_rows,head_dim], tasks sums all segments. */
+ * output_bytes covers [query_heads,query_rows,head_dim], tasks sums the QK/PV
+ * tasks in all segments. Native LUT execution adds DPU tasks at run time. */
 int rk_npu_attention_f16_query(const rk_npu_attention_f16_config* cfg,
     int capacity, int query_rows, int kv_length, rk_npu_attention_f16_sizes* sizes);
 
@@ -88,9 +90,9 @@ int rk_npu_attention_f16_cache_load(rk_npu_ctx* ctx,
 /* K/V are compact [kv_heads,count,head_dim]; NULL is accepted only for count=0. */
 int rk_npu_attention_f16_cache_append(rk_npu_ctx* ctx,
     rk_npu_attention_f16_cache* cache, const uint16_t* k, const uint16_t* v, int count);
-/* Retain a prefix, 0<=length<=current length, without copying/clearing native
- * K/V or changing capacity. Requires STABLE_SOFTMAX; its probability mask
- * excludes stale rows after the retained prefix. Tail staging is invalidated.
+/* Retain a prefix, 0<=length<=current length, without copying retained K/V or
+ * changing capacity. Requires STABLE_SOFTMAX. Native LUT masking clears discarded
+ * V/denominator rows; CPU masking excludes them. Tail staging is invalidated.
  * A poisoned cache still requires cache_load before reuse. */
 int rk_npu_attention_f16_cache_truncate(rk_npu_attention_f16_cache* cache, int length);
 int rk_npu_attention_f16_prepare(rk_npu_iommu_domain* domain,

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <tuple>
@@ -116,6 +117,8 @@ struct Cache {
     Shape shape;
     // Read once at construction; zero preserves the verified full-range path.
     DirtySyncPolicy dirty_sync=experimental_dirty_sync_policy();
+    bool lut_exp=[](){const char* p=std::getenv("RK_NPU_ATTN_LUT_EXP");return !p || !std::strcmp(p,"1");}();
+    std::vector<float> value_total,value_prefix;
     uint64_t identity=next_identity();
     std::atomic<bool> busy{false};
     Buffer key,value,tail;
@@ -127,7 +130,10 @@ struct Cache {
     // Magnitude bits are ordered for finite FP16. Track V on updates so a
     // stable run can bound each FP16 PV partial without rescanning the cache.
     uint16_t value_absmax[32]{};
-    explicit Cache(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,Shape s={}):lease(d),cfg(c),shape(s){reserve(c.initial_capacity);}
+    explicit Cache(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,Shape s={}):lease(d),cfg(c),shape(s){
+        lut_exp=lut_exp && c.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;
+        reserve(c.initial_capacity);
+    }
     int h()const{return shape.shared_kv?1:cfg.kv_heads;}
     int n()const{return shape.value_dim+32;}
     size_t voffset(int hi,int block)const{return size_t(hi*blocks+block)*n()*cfg.kv_tile;}
@@ -137,16 +143,30 @@ struct Cache {
     void truncate(int count);
     void stage_tail(int span);
     void write(int position,const uint16_t* k,const uint16_t* v,int source_stride,int source_position);
+    void add_value_sum(const uint16_t* v,int count,int first);
+    const float* value_sum(int hi,int span)const{
+        return span>=length?value_total.data()+size_t(hi)*shape.value_dim:
+            value_prefix.data()+(size_t(span/32)*h()+hi)*shape.value_dim;
+    }
+    bool use_lut()const{
+        if(!lut_exp || cfg.flags!=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX)return false;
+        for(int hi=0;hi<h();++hi)if(widen(value_absmax[hi])>32752.f/(cfg.kv_tile*1.001f))return false;
+        return true;
+    }
 };
 struct Binding {size_t word;int kind,head,block;};
 struct Graph {
     rk_npu_iommu_domain* domain;
     rk_npu_attention_f16_config cfg;
     Shape shape;
-    int rows,m,span,blocks,full,tail_length,tasks=0;
+    int rows,m,span,blocks,full,tail_length,tasks=0,matmul_tasks=0;
     uint32_t task_start[3]{},task_count[3]{}; // Logical selected-core order.
-    uint32_t stage_start[2][3]{},stage_count[2][3]{};
-    Buffer q,score,mask,partial,regs,descriptors;
+    uint32_t stage_start[3][3]{},stage_count[3][3]{};
+    Buffer q,score,mask,partial,regs,descriptors,exponent;
+    bool lut=false;
+    bool lut_split=false;
+    uint32_t lut_flags=RKNPU_JOB_PC;
+    std::vector<uint8_t> active;
     std::vector<float> sum;
     std::vector<float> softmax_scratch;
     std::vector<Binding> bindings;
@@ -155,12 +175,21 @@ struct Graph {
     uint64_t bound_identity=0;
     int mask_start=-1;
     rk_npu_attention_f16_boolean_mask saved_mask{};
+    bool can_lut(const Cache& cache)const{
+        // Long contexts can exceed the descriptor limit after adding DPU
+        // exponent tasks. Keep the existing CPU path for those geometries.
+        const uint64_t extra=uint64_t(cfg.kv_heads)*ceil_div(m*span,4096)+
+            (lut_split?__builtin_popcount(core_mask(cfg)):0);
+        return cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX && cache.use_lut() &&
+            uint64_t(matmul_tasks)+extra<=4095;
+    }
     explicit Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,int s,Cache& cache,Shape shape,Graph* reuse=nullptr);
     void bind(Cache& cache);
     void update_mask(int start,const rk_npu_attention_f16_boolean_mask* boolean,int length);
     void pack_q(const uint16_t* query,int tensor_rows=0,int tensor_offset=0);
     double submit(int stage=0);
     void stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
+    void center_scores(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
     void finish(float* output,int tensor_rows=0,int tensor_offset=0);
 };
 struct Workspace {

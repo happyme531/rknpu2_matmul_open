@@ -152,7 +152,10 @@ run/step 包含这些成本。执行或几何重建失败后重建 workspace，c
 投影与 PV 写回为 FP16，跨 tile 归约、除 denominator 和 gate 为 FP32。
 仍需真实权重及模型质量验证；合成数据通过不代表 BF16 模型的 PPL/长上下文质量通过。
 
-`RK_NPU_MLA_F16_STABLE_SOFTMAX` 可替代 fixed-shift flag：第一次 submit 做原始
+`RK_NPU_MLA_F16_STABLE_SOFTMAX` 可替代 fixed-shift flag。共用的 stable graph 默认
+使用 NPU LUT exponential + PINGPONG，PV 幅值或任务数超限时使用 CPU softmax；
+具体规则见 [stable LUT exponential](ATTENTION.md#stable-lut-exponential)。
+`RK_NPU_ATTN_LUT_EXP=0` 恢复以下 CPU 路径：第一次 submit 做原始
 QK，CPU 在 native block-8 score 上排除 causal/boolean/padding，再以 FP32
 减行最大值和 exp，第二次 submit 做 PV。长 score 且 `max(abs(V))*kv_tile<=32752`
 的 head 使用未归一化 e，利用已有 `[V,1]` 的 PV denominator 在最后做 FP32 除法；
