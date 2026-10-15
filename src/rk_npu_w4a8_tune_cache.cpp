@@ -102,6 +102,22 @@ extern "C" int rk_npu_w4a8_autotune_cache_load_ex(rk_npu_ctx* ctx,const rk_npu_w
     const int8_t* B,const float* scales,const char* path,rk_npu_w4a8_strategy_ex* fast,rk_npu_w4a8_strategy_ex* stable) {
     return load_entry(ctx,cfg,B,scales,path,fast,stable);
 }
+extern "C" int rk_npu_w4a8_autotune_cache_load_profile_ex(rk_npu_ctx* ctx,
+    const rk_npu_w4a8_autotune_config* cfg,const rk_npu_w4a8_tuning_profile* profile,
+    const char* path,rk_npu_w4a8_strategy_ex* fast,rk_npu_w4a8_strategy_ex* stable) {
+    using namespace rknpu2_matmul_open::w4_tune;
+    if(!ctx||!cfg||!profile||!fast||!stable||(path&&!*path)||!valid(*cfg)) return RK_NPU_ERR_PARAM;
+    try {
+        const auto& p=profile->value;
+        // Explicit policy is required: a captured profile must not silently
+        // adopt a changed environment multiplier.
+        if(p.K!=cfg->K||p.N!=cfg->N||cfg->k_tile_multiplier!=p.multiplier||
+           (cfg->required_k_tile&&!p.permits(cfg->required_k_tile))) return RK_NPU_ERR_PARAM;
+        const auto r=resources(*cfg);if(!r.npu||!r.threads) return RK_NPU_ERR_PARAM;
+        const auto k=key(ctx,*cfg,p,r,true);
+        return load(path?path:cache_path(k),k,*cfg,p,r,*fast,*stable,true);
+    } catch(const std::bad_alloc&) {return RK_NPU_ERR_NOMEM;} catch(...) {return RK_NPU_ERR_PARAM;}
+}
 extern "C" int rk_npu_w4a8_autotune_cache_save_ex(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config* cfg,
     const int8_t* B,const float* scales,const char* path,const rk_npu_w4a8_strategy_ex* fast,const rk_npu_w4a8_strategy_ex* stable) {
     return save_entry(ctx,cfg,B,scales,path,fast,stable);

@@ -124,6 +124,24 @@ static void single(rk_npu_ctx *ctx, rk_npu_iommu_domain *domain, const std::stri
           hit == 1);
     CHECK(fast.execution.input_layout == original.execution.input_layout &&
           fast.base.total_us == original.base.total_us);
+    const rk_npu_i4_weight_config wc{c.K,c.N,0};
+    Weight profiled(rk_npu_w4a8_weights_create(domain,&wc,b.data(),scales.data()),rk_npu_w4a8_weights_free);
+    CHECK(profiled);
+    std::unique_ptr<rk_npu_w4a8_tuning_profile,decltype(&rk_npu_w4a8_tuning_profile_free)> p(
+        rk_npu_w4a8_tuning_profile_from_weights(profiled.get()),rk_npu_w4a8_tuning_profile_free);
+    CHECK(p);profiled.reset();
+    // The profile owns its identity: neither a live weight object nor the
+    // original codes/scales are required by the load-only call.
+    b[0]=2;scales[0]*=2;
+    CHECK(!rk_npu_w4a8_autotune_cache_load_profile_ex(ctx,&c,p.get(),file.c_str(),&fast,&stable));
+    CHECK(fast.base.total_us==original.base.total_us && fast.base.weight_fingerprint==original.base.weight_fingerprint);
+    CHECK(rk_npu_w4a8_autotune_cache_load_ex(ctx,&c,b.data(),scales.data(),file.c_str(),&fast,&stable)==RK_NPU_ERR_CACHE_MISS);
+    b[0]=1;scales[0]*=.5f;
+    auto changed=c;changed.M+=1;
+    CHECK(rk_npu_w4a8_autotune_cache_load_profile_ex(ctx,&changed,p.get(),file.c_str(),&fast,&stable)==RK_NPU_ERR_CACHE_MISS);
+    changed=c;changed.k_tile_multiplier=2;
+    CHECK(rk_npu_w4a8_autotune_cache_load_profile_ex(ctx,&changed,p.get(),file.c_str(),&fast,&stable)==RK_NPU_ERR_PARAM);
+    CHECK(!rk_npu_w4a8_autotune_cache_load_profile_ex(ctx,&c,p.get(),file.c_str(),&fast,&stable));
     if (M<=small_cpu_batch_limit) {
         // Force a legal chain cache entry, independent of which candidate
         // wins a noisy one-loop tune, to cover cache replay and both factories.

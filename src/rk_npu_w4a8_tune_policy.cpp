@@ -176,7 +176,7 @@ rk_npu_w4a8_weights* create_tuned(rk_npu_iommu_domain* domain,
         rknpu2_matmul_open::w4_tune::Resources r{s->config.npu_core_mask,s->cpu_core_mask,s->cpu_core_mask,
                                                 __builtin_popcountll(s->cpu_core_mask),rknpu2_matmul_open::w4_tune::chain_max_m()};
         if(!rknpu2_matmul_open::w4_tune::valid_strategy(strategy,c,p,r,panel8)) return nullptr;
-        return rknpu2_matmul_open::detail::create_w4a8_weights(domain,p.info(c.required_k_tile),B,scale);
+        return rknpu2_matmul_open::detail::create_w4a8_weights(domain,p.info(c.required_k_tile),B,scale,&p);
     } catch(...) {return nullptr;}
 }
 }

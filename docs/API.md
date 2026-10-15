@@ -657,3 +657,13 @@ latency autotuner also searches panel8 and still uses CPU reduction. Use
 the library does not change the process OpenMP environment.
 
 See API example, memory accounting and paired CPU/latency measurements (historical note: `w4a8_low_cpu_2026-09-22.md`).
+
+## Load-only W4 cache with resident weight profiles
+
+`rk_npu_w4a8_tuning_profile_from_weights` copies the bounds and cache identity captured when W4 weights are created. The returned immutable profile owns no device memory or raw codes/scales and may outlive the weight object. Release it with `rk_npu_w4a8_tuning_profile_free`.
+
+Use `rk_npu_w4a8_autotune_cache_load_profile_ex` with that profile and the desired M/resource configuration. Set `cfg.k_tile_multiplier` explicitly to the captured policy (normally 1). K/N, required Ktile, resource masks and cache identity must match; a missing or stale entry returns `RK_NPU_ERR_CACHE_MISS`. Invalid profile/configuration combinations return `RK_NPU_ERR_PARAM`.
+
+This call reuses the existing cache key, format and strategy validation, without rescanning weights, creating device work, tuning, or writing files. Keep strategy values independently from large workspaces so workspace eviction does not require a new search. The original raw-weight cache and factory APIs remain available.
+
+Offline W4 tuning supports `verbose=2` for a terminal progress bar or periodic file-log updates showing candidate counts, the best complete-call time and elapsed time. `verbose=1` prints each candidate. Candidate selection and measurement settings are unchanged.

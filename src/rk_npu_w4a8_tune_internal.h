@@ -69,3 +69,7 @@ int cached(rk_npu_ctx*,const rk_npu_w4a8_autotune_config&,const int8_t*,const fl
            Strategy&,Strategy&,int* hit,bool panel8=false);
 int on_worker(const Resources&,const std::function<int()>&);
 } // namespace rknpu2_matmul_open::w4_tune
+
+struct rk_npu_w4a8_tuning_profile {
+    rknpu2_matmul_open::w4_tune::Profile value;
+};

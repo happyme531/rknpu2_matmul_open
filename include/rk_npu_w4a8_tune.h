@@ -17,7 +17,7 @@ typedef struct rk_npu_w4a8_autotune_config {
     uint64_t allowed_cpu_core_mask; /* 0: current affinity; prefer up to 4 big cores */
     int warmup, loops, repeats;
     uint32_t timeout_ms;
-    int verbose;
+    int verbose; /* 0: silent, 1: candidate data, >=2: progress/best/elapsed */
     int required_k_tile; /* 0: search; otherwise a 32-aligned tile <= min(align32(K),2048) */
     double k_tile_multiplier; /* 0 (default): read environment; >=1: explicit policy */
 } rk_npu_w4a8_autotune_config;
@@ -42,6 +42,19 @@ typedef struct rk_npu_w4a8_strategy_ex {
     rk_npu_w4a8_strategy base;
     rk_npu_w4a8_options execution; /* native or panel8 input, CPU reduction */
 } rk_npu_w4a8_strategy_ex;
+
+/* Immutable bounds and cache identity captured during weight creation.
+ * The copy owns no device memory or unpacked B and outlives the weights.
+ * Loading preserves the existing cache key/validation, performs no weight
+ * scan, device work, tuning, or cache write. A miss returns ERR_CACHE_MISS. */
+typedef struct rk_npu_w4a8_tuning_profile rk_npu_w4a8_tuning_profile;
+rk_npu_w4a8_tuning_profile* rk_npu_w4a8_tuning_profile_from_weights(
+    const rk_npu_w4a8_weights*);
+void rk_npu_w4a8_tuning_profile_free(rk_npu_w4a8_tuning_profile*);
+int rk_npu_w4a8_autotune_cache_load_profile_ex(rk_npu_ctx*,
+    const rk_npu_w4a8_autotune_config*, const rk_npu_w4a8_tuning_profile*,
+    const char* cache_path, rk_npu_w4a8_strategy_ex* fastest,
+    rk_npu_w4a8_strategy_ex* stable);
 
 typedef struct rk_npu_w4a8_family_config {
     rk_npu_w4a8_autotune_config base; /* M ignored; dtype/resources/policy shared */

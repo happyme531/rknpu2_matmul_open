@@ -1,5 +1,7 @@
 #include "rk_npu_w4a8_tune_internal.h"
 #include "rk_npu_w4a8_internal.h"
+#include <chrono>
+#include <unistd.h>
 #include <algorithm>
 #include <cstdio>
 #include <thread>
@@ -31,7 +33,7 @@ int tune(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config& c,const int8_t* B,co
     auto weight=[&](int kt)->rk_npu_w4a8_weights* {
         auto it=weights.find(kt);
         if(it==weights.end()) {
-            Weight w(rknpu2_matmul_open::detail::create_w4a8_weights(domain.get(),p.info(kt),B,scales),rk_npu_w4a8_weights_free);
+            Weight w(rknpu2_matmul_open::detail::create_w4a8_weights(domain.get(),p.info(kt),B,scales,&p),rk_npu_w4a8_weights_free);
             if(!w) return nullptr;
             it=weights.emplace(kt,std::move(w)).first;
         }
@@ -49,7 +51,21 @@ int tune(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config& c,const int8_t* B,co
     if(c.verbose) std::fprintf(stderr,"w4 autotune: %zu candidates, npu=0x%x cpu=0x%llx safe=%d limit=%d multiplier=%g policy=%s\n",
         choices.size(),r.npu,(unsigned long long)r.cpu,p.safe,p.limit,p.multiplier,
         c.M<=std::max(small_cpu_batch_limit,r.chain_max_m)?"small-batch teams/serial/pipeline/chain":"fixed team/pipeline=1");
+    const auto started=std::chrono::steady_clock::now();
+    const bool terminal=isatty(STDERR_FILENO);
+    auto progress=[&](size_t done) {
+        if(c.verbose<2 || (!terminal && done%5 && done!=choices.size())) return;
+        const int fill=int(done*20/choices.size());
+        const double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+        std::fprintf(stderr,"%sW4 M=%d K=%d N=%d [%.*s%.*s] %zu/%zu (%zu%%) elapsed=%.1fs best=%.1fus%s",
+            terminal?"\r":"",c.M,c.K,c.N,fill,"####################",20-fill,"....................",
+            done,choices.size(),done*100/choices.size(),seconds,found?fast.base.total_us:0.,
+            !terminal||done==choices.size()?"\n":"");
+        std::fflush(stderr);
+    };
+    size_t done=0;
     for(const auto& candidate:choices) {
+        progress(done++);
         const auto& cfg=candidate.config;const auto& execution=candidate.execution;
         auto* w=weight(cfg.k_tile);if(!w) return RK_NPU_ERR_NOMEM;
         Workspace ws(rk_npu_w4a8_workspace_create_ex(domain.get(),&cfg,&execution),rk_npu_w4a8_workspace_free);
@@ -60,7 +76,7 @@ int tune(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config& c,const int8_t* B,co
             if(!data.same()) {correct=false;break;}
         }
         if(!correct) {
-            if(c.verbose) std::fprintf(stderr,"w4 autotune: reject layout=%d M/K/N=%d/%d/%d output mismatch\n",int(execution.input_layout),cfg.m_tile,cfg.k_tile,cfg.n_tile);
+            if(c.verbose==1) std::fprintf(stderr,"w4 autotune: reject layout=%d M/K/N=%d/%d/%d output mismatch\n",int(execution.input_layout),cfg.m_tile,cfg.k_tile,cfg.n_tile);
             continue;
         }
         rknpu2_matmul_open::tune::Score score;
@@ -72,13 +88,14 @@ int tune(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config& c,const int8_t* B,co
         s.weights=p.info(cfg.k_tile);s.weight_fingerprint=p.fingerprint;s.tuning_revision=revision;
         s.input_us=score.input_us;s.npu_us=score.npu_us;s.sync_us=score.sync_us;s.output_us=score.output_us;
         s.total_us=score.total_us;s.jitter_pct=score.jitter_pct;s.robust_us=score.robust_us;
-        if(c.verbose) std::fprintf(stderr,"w4 autotune: layout=%d M/K/N=%d/%d/%d threads=%d pipeline=%d total=%.2f robust=%.2f us relaxed=%d\n",
+        if(c.verbose==1) std::fprintf(stderr,"w4 autotune: layout=%d M/K/N=%d/%d/%d threads=%d pipeline=%d total=%.2f robust=%.2f us relaxed=%d\n",
             int(execution.input_layout),cfg.m_tile,cfg.k_tile,cfg.n_tile,cfg.cpu_threads,cfg.pipeline,
             s.total_us,s.robust_us,s.weights.bound_relaxed);
         if(!found||s.total_us<fast.base.total_us) fast=strategy;
         if(!found||s.robust_us<stable.base.robust_us) stable=strategy;
         found=true;
     }
+    progress(choices.size());
     return found?RK_NPU_OK:RK_NPU_ERR_PARAM;
 }
 int cached(rk_npu_ctx* ctx,const rk_npu_w4a8_autotune_config& c,const int8_t* B,const float* scale,

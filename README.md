@@ -16,6 +16,7 @@ Fully open source high-performance matrix multiplication library for LLM inferen
 - Optional Perfetto tracing for operator, submission and CPU-stage profiling
 - Optimized performance (at least I tried to do so)
 - Some of these kernels support auto-tuning for even better performance
+- Load-only tuning cache APIs and immutable W4 weight profiles for predictable inference setup
 
 ## Usage
 
@@ -24,6 +25,12 @@ Build on RK3588 using the commands below. See [MM/BMM](docs/MM.md),
 [typed GEMM](docs/API.md) for API examples and tensor layouts.
 The [kernel programming Wiki](https://github.com/happyme531/rknpu2_matmul_open/wiki)
 describes register configuration and kernel development.
+
+### Tuning and inference setup
+
+Run tuning explicitly during preparation and retain the resulting strategies for inference. W8 callers can use `rk_npu_matmul_autotune_cache_load`; W4 callers can copy an immutable profile from uploaded weights and use `rk_npu_w4a8_autotune_cache_load_profile_ex`. The W4 profile keeps the certified partitions and cache identity after the original CPU codes/scales are released, so a new M lookup needs no weight reload or scan. A cache miss is reported to the caller; these load-only APIs do not search or write cache files.
+
+Tune using the same CPU affinity, NPU mask and operator configuration as inference, and check cache results before quoting tuned throughput. W4 `verbose=2` displays candidate progress, the current best complete-call time and elapsed time; `verbose=1` retains individual candidate data. See [the cache API](docs/API.md#load-only-w4-cache-with-resident-weight-profiles).
 
 ## Limitations
 

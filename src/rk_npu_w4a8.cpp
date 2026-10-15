@@ -1,5 +1,6 @@
 #include "rk_npu_w4a8.h"
 #include "rk_npu_w4a8_internal.h"
+#include "rk_npu_w4a8_tune_internal.h"
 #include "rk_npu_i4_executor.h"
 #include "rk_npu_w4a8_cpu.h"
 #include "rk_npu_w4a8_chain.h"
@@ -20,6 +21,7 @@ struct rk_npu_w4a8_weights {
     std::vector<float> scales;
     std::vector<int32_t> correction;
     rk_npu_w4a8_weight_info info{};
+    rknpu2_matmul_open::w4_tune::Profile profile;
 };
 struct rk_npu_w4a8_workspace {
     rk_npu_w4a8_config config{};
@@ -163,7 +165,8 @@ extern "C" int rk_npu_w4a8_memory_query(const rk_npu_w4a8_config* cfg, rk_npu_w4
     return rc;
 }
 rk_npu_w4a8_weights* rknpu2_matmul_open::detail::create_w4a8_weights(rk_npu_iommu_domain* domain,
-    const rk_npu_w4a8_weight_info& info, const int8_t* B, const float* scales) {
+    const rk_npu_w4a8_weight_info& info, const int8_t* B, const float* scales,
+    const w4_tune::Profile* profile) {
     const auto& actual=info.config;
     if(!domain || !B || !scales || !valid_shape(actual.K,actual.N)) return nullptr;
     try {
@@ -171,6 +174,16 @@ rk_npu_w4a8_weights* rknpu2_matmul_open::detail::create_w4a8_weights(rk_npu_iomm
         if (rk_npu_i4_weights_memory_query(&actual, &bytes))
             return nullptr;
         auto w = std::make_unique<rk_npu_w4a8_weights>();
+        if(profile) w->profile=*profile;
+        else {
+            rk_npu_w4a8_autotune_config c;
+            rk_npu_w4a8_autotune_config_init(&c,1,actual.N,actual.K);
+            // Legacy explicit-Ktile factories allow a tile wider than K.
+            // Capture the full proof independently; packed.prepare below
+            // still validates the actual requested partition as before.
+            c.required_k_tile=0;c.k_tile_multiplier=info.multiplier;
+            if(w4_tune::profile(c,B,scales,w->profile)) return nullptr;
+        }
         w->info = info;
         w->scales.assign(scales, scales + actual.N);
         w->correction.assign(actual.N, 0);
@@ -201,6 +214,7 @@ extern "C" rk_npu_w4a8_weights *rk_npu_w4a8_weights_create(rk_npu_iommu_domain *
         rk_npu_i4_weight_config actual = *cfg;
         int safe = cfg->k_tile;
         double factor = 1;
+        rknpu2_matmul_open::w4_tune::Profile profile;
         if (cfg->k_tile == 0) {
             rknpu2_matmul_open::detail::I4WeightBound bound;
             if (rknpu2_matmul_open::detail::bound_i4_weights(cfg->K, cfg->N, B, 0, bound))
@@ -215,14 +229,26 @@ extern "C" rk_npu_w4a8_weights *rk_npu_w4a8_weights_create(rk_npu_iommu_domain *
             }
             const int cap = std::min(rknpu2_matmul_open::detail::I4_K_TILE_MAX, ((cfg->K + 31) / 32) * 32);
             actual.k_tile = int(std::min(double(cap), safe * factor) / 32) * 32;
+            profile.K=cfg->K;profile.N=cfg->N;profile.safe=safe;
+            profile.safe_tiles=bound.safe_tiles;profile.multiplier=factor;profile.limit=actual.k_tile;
+            rknpu2_matmul_open::tune::Hash hash;hash.mix(cfg->K);hash.mix(cfg->N);
+            hash.bytes(B,size_t(cfg->K)*cfg->N);hash.bytes(scales,size_t(cfg->N)*sizeof(float));
+            profile.fingerprint=hash.value;
         }
         return rknpu2_matmul_open::detail::create_w4a8_weights(domain,
-            {actual, safe, factor, actual.k_tile > safe}, B, scales);
+            {actual, safe, factor, actual.k_tile > safe}, B, scales,
+            cfg->k_tile==0?&profile:nullptr);
     } catch (...) {
         return nullptr;
     }
 }
 extern "C" void rk_npu_w4a8_weights_free(rk_npu_w4a8_weights *w) { delete w; }
+extern "C" rk_npu_w4a8_tuning_profile* rk_npu_w4a8_tuning_profile_from_weights(
+    const rk_npu_w4a8_weights* w) {
+    if(!w) return nullptr;
+    try { return new rk_npu_w4a8_tuning_profile{w->profile}; } catch(...) { return nullptr; }
+}
+extern "C" void rk_npu_w4a8_tuning_profile_free(rk_npu_w4a8_tuning_profile* p) { delete p; }
 extern "C" int rk_npu_w4a8_weights_query(const rk_npu_w4a8_weights *w,
                                          rk_npu_w4a8_weight_info *out) {
     if (!w || !out)
