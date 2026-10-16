@@ -15,11 +15,13 @@ inline std::vector<uint64_t> lut_exp_regs(int count, uint64_t input, uint64_t ou
         static const std::vector<uint64_t> table = []{
             std::vector<uint64_t> words;words.reserve(1028);
             constexpr int bias=16;
+            // Leave headroom for the carrier; the common gain cancels in finish().
+            constexpr double gain=255./256.;
             for(int table=0;table<2;++table){
                 words.push_back(E(T_DPU,0x4100,unsigned(2 | table) << 16));
                 for(int i=0;i<513;++i){
                     const double x=-16.+table*8.+std::min(i,510)*(8./510.);
-                    const int value=std::clamp(int(std::nearbyint(std::exp(x)*32768.))+bias,bias,32767);
+                    const int value=std::clamp(int(std::nearbyint(std::exp(x)*(32768.*gain)))+bias,bias,32767);
                     words.push_back(E(T_DPU,0x4104,unsigned(value)));
                 }
             }

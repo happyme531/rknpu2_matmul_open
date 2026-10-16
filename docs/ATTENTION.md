@@ -287,13 +287,30 @@ LUT 分别覆盖 `[-16,-8]` 和 `[-8,0]`。CPU 维护 V 的 FP32 前缀和以修
 workspace 增加一个与 score 等大的 FP16 exponential 缓冲区。截断保留原有
 分配和前缀，并清除被丢弃的 V/denominator 行。
 
+LUT 使用公共增益 `g=255/256` 和正偏置 `delta=16/32768`，近似
+`P'=g*exp(x)+delta`。增益为正偏置保留 INT16 表项的峰值空间；CPU 修正
+`P'@V-delta*sum(V)` 和 `P'@1-delta*key_count` 后相除，公共增益自动抵消。
+该配方不增加任务或提交次数。板端测得 `x=0` 在去偏置并除以增益后为1。
+
 Qwen3-4B-W4A8-Mixed-LMHeadW8，ubatch128、CPU4-7/4 threads、NPU mask7、
 CPU/NPU/DDR 2.4/1/2.112 GHz、Clang22/O2 的完整模型 ABBA 对照中，prefill512
 吞吐增加1.68%，decode128基本持平，整次累计进程 CPU 时间减少3.83%。
-WikiText-2 raw test 前32个独立512-token窗口、每窗重置 KV，评分 target257–511，
-共8160个目标；CPU/LUT PPL 分别为14.885053/14.972756，变化+0.5892%。
-该质量结果对应此 checkpoint 和语料前缀，不代表其他模型或下游任务。
+该性能结果使用 `g=1`；`g=255/256` 没有单独测量完整模型吞吐。
 
-默认路径通过8种通用 GQA 几何、query 行数1/3/31/32/64/128、三种 mask、
-KV grow/truncate/替换后缀/reset 回归。NPU LUT 改变 FP16 中间舍入，
-Attention 相对 FP32 reference 的最大 relative L2 约0.0564%。
+WikiText-2 raw test 前32个独立512-token窗口、每窗重置 KV，评分 target257–511，
+共8160个目标，三种模式使用同一可执行文件与 FP64 NLL 累加：
+
+| Exponential | PPL | 相对 CPU |
+| --- | ---: | ---: |
+| CPU FP32 | 14.885053 | — |
+| LUT `g=1` | 14.972756 | +0.5892% |
+| LUT `g=255/256` | 14.953214 | +0.4579% |
+
+两种 LUT 的相对 PPL 变化为−0.1305%，按32个配对窗口 NLL 差值计算的近似
+95%区间为[−1.45%, +1.20%]。该语料前缀不足以确认整体质量提升，不代表其他
+模型或下游任务。固定的36层真实 QKV 回放中，`g=255/256` 相对 CPU softmax 输出
+的 relative L2 均值/最大值为0.04449%/0.05114%，32层低于 `g=1`。
+
+`g=1` 的稳定路径通过8种通用 GQA 几何、query 行数1/3/31/32/64/128、三种 mask、
+KV grow/truncate/替换后缀/reset 回归。公共增益改变 LUT 量化与 FP16 中间舍入；
+上述36层回放和完整模型 PPL 覆盖 `g=255/256`。
