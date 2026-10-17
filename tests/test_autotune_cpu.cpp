@@ -32,7 +32,7 @@ static void w8_cache(rk_npu_ctx& ctx,const std::string& path) {
     CHECK(!rk_npu_matmul_autotune_cache_save(&ctx,path.c_str(),s.op_kind,&c,&s,&s));
     std::ifstream in(path);std::string magic,key;std::getline(in,magic);std::getline(in,key);
     CHECK(magic=="rk_npu_matmul_tuning_cache_v2");
-    std::ostringstream expected;expected<<"key 2 5 "<<ctx.driver_version<<" 0 1 64 64 1 "
+    std::ostringstream expected;expected<<"key 2 6 "<<ctx.driver_version<<" 0 1 64 64 1 "
         <<c.allowed_cpu_core_mask<<" 2 8 3 500 0";
     CHECK(key==expected.str());
     rk_npu_matmul_strategy f{},stable{};
