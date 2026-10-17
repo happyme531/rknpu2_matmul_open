@@ -380,7 +380,7 @@ int do_submit(int fd, uint64_t task_obj_addr, int num_tasks,
 int do_submit_multicore(int fd, uint64_t task_obj_addr, int num_tasks,
                         uint32_t core_mask, const uint32_t task_start[3],
                         const uint32_t task_count[3], uint32_t iommu_domain_id,
-                        uint32_t timeout_ms) {
+                        uint32_t timeout_ms, int64_t* hardware_ns) {
     const int core_count = __builtin_popcount(core_mask & 7u);
     if (core_mask == 0 || (core_mask & ~7u) != 0 ||
         core_mask == 5u || core_mask == 6u ||
@@ -424,6 +424,7 @@ int do_submit_multicore(int fd, uint64_t task_obj_addr, int num_tasks,
         ioctl(fd, IOCTL_ACTION, &act);
         return RK_NPU_ERR_SUBMIT;
     }
+    if (hardware_ns) *hardware_ns = s.hw_elapse_time;
     return RK_NPU_OK;
 }
 

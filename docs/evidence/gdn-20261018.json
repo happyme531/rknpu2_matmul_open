@@ -1,0 +1,249 @@
+{
+  "status": "passed",
+  "scope": "normalized recurrence or projected Conv+SiLU+L2+GDN; one layer, state import/export included",
+  "conditions": {
+    "board": "RK3588 spare1",
+    "cpu_threads": 4,
+    "cpu_khz": 2256000,
+    "npu_hz": 1000000000,
+    "cpu_affinity": "0xf0",
+    "dmc_controlled": false,
+    "compiler": "GCC",
+    "precision": "TF32",
+    "chunk": 64,
+    "order": "ABBA twice",
+    "warmups": 2,
+    "measured_per_segment": 7,
+    "sample_filtering": "none"
+  },
+  "bitwise_regressions": {
+    "normalized": 52,
+    "projected": 90,
+    "total": 142
+  },
+  "performance": [
+    {
+      "kind": "normalized",
+      "tokens": 128,
+      "samples_per_version": 28,
+      "versions": {
+        "before": {
+          "total_ms": {
+            "mean": 7.18173075,
+            "median": 6.5931745,
+            "minimum": 6.333589,
+            "maximum": 16.142412
+          },
+          "cpu_ms": {
+            "mean": 13.471214285714286,
+            "median": 12.864,
+            "minimum": 12.594,
+            "maximum": 22.192
+          }
+        },
+        "after": {
+          "total_ms": {
+            "mean": 6.90421825,
+            "median": 6.6466955,
+            "minimum": 6.487299,
+            "maximum": 7.797765999999999
+          },
+          "cpu_ms": {
+            "mean": 12.83325,
+            "median": 12.9215,
+            "minimum": 12.228,
+            "maximum": 13.261
+          },
+          "wall_ms": {
+            "mean": 6.937281071428571,
+            "median": 6.678487500000001,
+            "minimum": 6.514132,
+            "maximum": 7.833933
+          }
+        }
+      },
+      "latency_change_ratio": -0.03864145143564457,
+      "cpu_change_ratio": -0.04735759317486499
+    },
+    {
+      "kind": "normalized",
+      "tokens": 512,
+      "samples_per_version": 28,
+      "versions": {
+        "before": {
+          "total_ms": {
+            "mean": 22.90866110714286,
+            "median": 22.9737345,
+            "minimum": 22.196291000000002,
+            "maximum": 23.061089
+          },
+          "cpu_ms": {
+            "mean": 44.65882142857143,
+            "median": 44.607,
+            "minimum": 44.064,
+            "maximum": 45.392
+          }
+        },
+        "after": {
+          "total_ms": {
+            "mean": 23.3907895,
+            "median": 23.390090999999998,
+            "minimum": 23.261758,
+            "maximum": 23.498300999999998
+          },
+          "cpu_ms": {
+            "mean": 45.88878571428572,
+            "median": 45.897000000000006,
+            "minimum": 45.4,
+            "maximum": 46.604
+          },
+          "wall_ms": {
+            "mean": 23.422414892857145,
+            "median": 23.4207175,
+            "minimum": 23.293841,
+            "maximum": 23.526593000000002
+          }
+        }
+      },
+      "latency_change_ratio": 0.02104568183196065,
+      "cpu_change_ratio": 0.02754135121280643
+    },
+    {
+      "kind": "projected",
+      "tokens": 128,
+      "samples_per_version": 84,
+      "versions": {
+        "before": {
+          "total_ms": {
+            "mean": 8.025219761904761,
+            "median": 7.933101,
+            "minimum": 7.826642,
+            "maximum": 15.85891
+          },
+          "cpu_ms": {
+            "mean": 18.24104761904762,
+            "median": 18.1265,
+            "minimum": 17.821,
+            "maximum": 26.438
+          }
+        },
+        "after": {
+          "total_ms": {
+            "mean": 7.996615404761904,
+            "median": 7.729516,
+            "minimum": 7.548973,
+            "maximum": 12.924138999999998
+          },
+          "cpu_ms": {
+            "mean": 17.907988095238096,
+            "median": 17.813000000000002,
+            "minimum": 17.124,
+            "maximum": 22.49
+          },
+          "wall_ms": {
+            "mean": 8.028598214285715,
+            "median": 7.7630585,
+            "minimum": 7.577265000000001,
+            "maximum": 12.960889
+          }
+        }
+      },
+      "latency_change_ratio": -0.0035643082671256154,
+      "cpu_change_ratio": -0.018258793615654967
+    },
+    {
+      "kind": "projected",
+      "tokens": 512,
+      "samples_per_version": 84,
+      "versions": {
+        "before": {
+          "total_ms": {
+            "mean": 26.20683838095238,
+            "median": 25.8074425,
+            "minimum": 25.399398,
+            "maximum": 27.657791
+          },
+          "cpu_ms": {
+            "mean": 62.182071428571426,
+            "median": 62.072,
+            "minimum": 60.759,
+            "maximum": 63.924
+          }
+        },
+        "after": {
+          "total_ms": {
+            "mean": 27.147026035714287,
+            "median": 27.161224,
+            "minimum": 26.739033,
+            "maximum": 27.59129
+          },
+          "cpu_ms": {
+            "mean": 61.41625,
+            "median": 61.4055,
+            "minimum": 60.334,
+            "maximum": 62.98
+          },
+          "wall_ms": {
+            "mean": 27.17957488095238,
+            "median": 27.1952035,
+            "minimum": 26.777825,
+            "maximum": 27.62629
+          }
+        }
+      },
+      "latency_change_ratio": 0.0358756611955624,
+      "cpu_change_ratio": -0.012315791529253328
+    }
+  ],
+  "clocks": [
+    {
+      "run": "quality-final",
+      "restored": true
+    },
+    {
+      "run": "paired-final",
+      "restored": true
+    },
+    {
+      "run": "final-checks",
+      "restored": true
+    }
+  ],
+  "device_validation": {
+    "shared_and_static": true,
+    "c_header": true,
+    "independent_fp64_oracle": true,
+    "max_tokens": 2048,
+    "head_mappings": [
+      "grouped",
+      "interleaved"
+    ],
+    "cpu_threads": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "core_masks": [
+      1,
+      2,
+      4,
+      3,
+      7
+    ],
+    "replay_and_inplace": true,
+    "busy": true,
+    "retained_iommu_domain": true,
+    "existing_mm_board_tests": true
+  },
+  "normalized_max_relative_l2": {
+    "tf32": {
+      "output": 0.001463294122804949,
+      "state": 0.0007987704750258546
+    },
+    "compensated_tf32": {
+      "output": 6.599293280415896e-07,
+      "state": 3.8524022565253094e-07
+    }
+  }
+}

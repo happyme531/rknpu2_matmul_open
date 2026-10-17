@@ -10,6 +10,7 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 
 find_package(OpenMP REQUIRED)
+find_package(Threads REQUIRED)
 include(CheckCXXCompilerFlag)
 
 option(RK_NPU_ENABLE_TRACE "Enable in-process Perfetto diagnostic traces" OFF)
@@ -78,6 +79,9 @@ set(RK_NPU_SRCS
   src/rk_npu_w4a8_tune.cpp        # W4 complete-call tuning
   src/rk_npu_w4a8_tune_family.cpp # shared K selection across M values
   src/rk_npu_matmul_f16.cpp    # fp16 x fp16 -> fp16 matmul + fused MUL/ADD
+  src/rk_npu_gdn.cpp          # scalar GDN C API, workspace and CPU workers
+  src/rk_npu_gdn_device.cpp   # native TF32 GEMM / FP32 DPU task chains
+  src/rk_npu_gdn_prefill.cpp  # chunked GDN and fused CPU Conv/SiLU/L2 producer
   src/rk_npu_attention_f16.cpp # experimental causal/no-mask/boolean GQA workspace
   src/rk_npu_attention_f16_cache.cpp # persistent native KV and tail staging
   src/rk_npu_mla_f16.cpp      # Ling tiny gated MLA: expanded / absorbed latent cache
@@ -98,6 +102,7 @@ set(RK_NPU_PUBLIC_HEADERS
   include/rk_npu_w4a8_tune.h
   include/rk_npu_quant_matmul.h
   include/rk_npu_matmul_f16.h
+  include/rk_npu_gdn.h
   include/rk_npu_attention_f16.h
   include/rk_npu_mla_f16.h
   include/rk_npu_mm.h
@@ -111,14 +116,18 @@ target_include_directories(rk_npu_matmul PUBLIC
 set_target_properties(rk_npu_matmul PROPERTIES
   PUBLIC_HEADER "${RK_NPU_PUBLIC_HEADERS}")
 target_compile_options(rk_npu_matmul PRIVATE ${RK_NPU_AARCH64_FP16_FLAGS})
-target_link_libraries(rk_npu_matmul PUBLIC OpenMP::OpenMP_CXX)
+target_link_libraries(rk_npu_matmul PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
 
 # also a static lib for easy embedding
 add_library(rk_npu_matmul_static STATIC ${RK_NPU_SRCS})
 target_include_directories(rk_npu_matmul_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(rk_npu_matmul_static PROPERTIES OUTPUT_NAME rk_npu_matmul)
 target_compile_options(rk_npu_matmul_static PRIVATE ${RK_NPU_AARCH64_FP16_FLAGS})
-target_link_libraries(rk_npu_matmul_static PUBLIC OpenMP::OpenMP_CXX)
+target_link_libraries(rk_npu_matmul_static PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
+set_property(SOURCE src/rk_npu_gdn_prefill.cpp APPEND PROPERTY COMPILE_OPTIONS -O3 -ffp-contract=off)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+  set_property(SOURCE src/rk_npu_gdn_prefill.cpp APPEND PROPERTY COMPILE_OPTIONS -mtune=cortex-a76)
+endif()
 if(RK_NPU_ENABLE_TRACE)
   target_link_libraries(rk_npu_matmul PUBLIC rk_npu_trace)
   target_link_libraries(rk_npu_matmul_static PUBLIC rk_npu_trace)
@@ -183,6 +192,18 @@ add_executable(test_batch_f16 tests/test_batch_f16.cpp)
 target_link_libraries(test_batch_f16 PRIVATE rk_npu_matmul)
 
 add_executable(test_attention_f16 tests/test_attention_f16.cpp)
+add_executable(test_gdn tests/test_gdn.cpp)
+target_link_libraries(test_gdn PRIVATE rk_npu_matmul)
+target_compile_options(test_gdn PRIVATE -ffp-contract=off)
+add_executable(test_gdn_static tests/test_gdn.cpp)
+target_link_libraries(test_gdn_static PRIVATE rk_npu_matmul_static)
+target_compile_options(test_gdn_static PRIVATE -ffp-contract=off)
+add_library(test_gdn_header_c OBJECT tests/test_gdn_header.c)
+target_include_directories(test_gdn_header_c PRIVATE include)
+if(BUILD_TESTING)
+  add_test(NAME gdn_cpu COMMAND test_gdn)
+  add_test(NAME gdn_static_cpu COMMAND test_gdn_static)
+endif()
 target_compile_options(test_attention_f16 PRIVATE ${RK_NPU_AARCH64_FP16_FLAGS})
 target_link_libraries(test_attention_f16 PRIVATE rk_npu_matmul)
 add_library(test_attention_f16_header_c OBJECT tests/test_attention_f16_header.c)
@@ -356,4 +377,5 @@ add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
   test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c
   test_w4a4_linear_header_c test_moe_w8_header_c test_mm test_mm_header_c test_mm_tf32
-  test_attention_f16 test_attention_f16_header_c test_mla_f16 test_mla_f16_header_c)
+  test_attention_f16 test_attention_f16_header_c test_mla_f16 test_mla_f16_header_c
+  test_gdn test_gdn_static test_gdn_header_c)

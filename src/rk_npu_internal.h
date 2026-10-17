@@ -249,7 +249,7 @@ int do_submit(int fd, uint64_t task_obj_addr, int num_tasks,
 int do_submit_multicore(int fd, uint64_t task_obj_addr, int num_tasks,
                         uint32_t core_mask, const uint32_t task_start[3],
                         const uint32_t task_count[3], uint32_t iommu_domain_id,
-                        uint32_t timeout_ms = 500);
+                        uint32_t timeout_ms = 500, int64_t* hardware_ns = nullptr);
 
 /* Private N-tiled INT8 plan surface.  N tiling is an execution-strategy detail,
  * not a register-tuning ABI, so production/autotune code uses these helpers

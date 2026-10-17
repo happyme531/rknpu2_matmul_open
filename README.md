@@ -12,6 +12,7 @@ Fully open source high-performance matrix multiplication library for LLM inferen
 - w8a8/w4a8 quantized MoE kernel
 - Very fast fused fp16 GQA (MHA, MQA) kernel
 - Fast fused fp16 MLA/gated MLA kernel, supporting both expanded and absorbed mode
+- Scalar-gated DeltaNet prefill with TF32 products, FP32 state and fused CPU Conv/SiLU/QK normalization
 - Native FP16 KV cache load, append, reserve and stable-softmax truncation
 - Optional Perfetto tracing for operator, submission and CPU-stage profiling
 - Optimized performance (at least I tried to do so)
@@ -21,7 +22,7 @@ Fully open source high-performance matrix multiplication library for LLM inferen
 ## Usage
 
 Build on RK3588 using the commands below. See [MM/BMM](docs/MM.md),
-[Attention](docs/ATTENTION.md), [MLA](docs/MLA.md) and
+[Attention](docs/ATTENTION.md), [MLA](docs/MLA.md), [GDN](docs/GDN.md) and
 [typed GEMM](docs/API.md) for API examples and tensor layouts.
 The [kernel programming Wiki](https://github.com/happyme531/rknpu2_matmul_open/wiki)
 describes register configuration and kernel development.
@@ -116,6 +117,7 @@ Runtime settings are described in [ENV.md](ENV.md) and the operator guides.
 | Raw FP16 GEMM/BMM | [rk_npu_matmul_f16.h](include/rk_npu_matmul_f16.h) | Optional fused MUL/ADD and explicit split-K |
 | Experimental FP16 Attention | [rk_npu_attention_f16.h](include/rk_npu_attention_f16.h) | GQA/MHA/MQA, causal/no-mask/boolean masks, fixed-shift or stable softmax, growing and truncatable native KV; [guide](docs/ATTENTION.md) |
 | Experimental FP16 Gated MLA | [rk_npu_mla_f16.h](include/rk_npu_mla_f16.h) | Ling tiny H16/QK192/V128, expanded or absorbed latent512 KV; [guide](docs/MLA.md) |
+| Scalar GDN prefill | [rk_npu_gdn.h](include/rk_npu_gdn.h) | C7 Hk16/Hv32, d128; ordinary/compensated TF32, canonical FP32 state, fused CPU Conv/SiLU/L2 producer; [guide](docs/GDN.md) |
 | Unified raw MM/BMM (new) | [rk_npu_mm.h](include/rk_npu_mm.h) | FP16/BF16/TF32, transpose/strides, dynamic or typed packed B, multicore and default-enabled automatic split-K; [guide](docs/MM.md) |
 | Legacy INT8 BMM | [rk_npu_matmul.h](include/rk_npu_matmul.h) | Distinct weights per batch item |
 | Add + RMSNorm | [rk_npu_add_rmsnorm_f16.h](include/rk_npu_add_rmsnorm_f16.h) | Fixed shapes: M=1/128, D=4096, eps=1e-5 |
@@ -235,7 +237,7 @@ cmake --build build-host --target rknpu2_matmul_open_cpu_tests -j4
 OMP_NUM_THREADS=4 ctest --test-dir build-host --output-on-failure
 ```
 
-This target builds all 16 registered CPU tests and the public C header checks.
+This target builds all 18 registered CPU tests and the public C header checks.
 It does not require an NPU. Use this target on x86: several hardware-only FP16
 programs in the default full build use the AArch64 `__fp16` type.
 NPU tests are explicit executables, not part of CTest; see the

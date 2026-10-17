@@ -22,7 +22,7 @@ AGPL or resolve their licensing status.
 ## ggml
 
 The NEON exponential implementation used by
-`src/rk_npu_cpu_kernels.cpp` includes adaptations from ggml.
+`src/rk_npu_cpu_kernels.cpp` and `src/rk_npu_gdn_cpu.h` includes adaptations from ggml.
 The upstream revision, copyright notice and MIT license are preserved in
 [LICENSES/ggml-MIT.txt](LICENSES/ggml-MIT.txt).
 

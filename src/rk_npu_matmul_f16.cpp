@@ -1253,6 +1253,12 @@ int export_f16_batch_tasks(const rk_npu_matmul_f16_batch_plan* plan,
     return RK_NPU_OK;
 }
 
+void float_native_regs(std::vector<uint64_t>& regs, int m, int n, int k,
+    uint64_t a, uint64_t b, uint64_t output, FloatPrecision precision) {
+    make_f16_regs(regs, m, m, n, k, a, b, output,
+        RK_NPU_FUSE_NONE, 0, 1, true, true, precision);
+}
+
 int float_batch_query(int batch_count, const rk_npu_matmul_f16_config* cfg,
     FloatPrecision precision, rk_npu_matmul_sizes* out) {
     if (batch_count <= 0 || !cfg || cfg->op != RK_NPU_FUSE_NONE || !out)
