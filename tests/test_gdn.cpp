@@ -140,6 +140,16 @@ void fused(rk_npu_iommu_domain* domain,int precision) {
     };
     CHECK(run(x.state.data(),state.data(),history.data(),final_history.data())==0);
     close(out,expected.output,precision?1e-4:4e-3); close(state,expected.state,precision?1e-4:4e-3);
+    const size_t stride=CW+4096+64;
+    std::vector<float> padded(T*stride,NAN),strided_out(out.size()),strided_state(SS),strided_history(history.size());
+    for(int t=0;t<T;++t) std::copy_n(projected.data()+t*CW,CW,padded.data()+t*stride);
+    CHECK(rk_npu_gdn_run_projected_strided(w.get(),padded.data(),stride,weights.data(),history.data(),
+        x.g.data(),x.beta.data(),x.state.data(),strided_out.data(),strided_state.data(),strided_history.data(),nullptr)==0);
+    CHECK(std::memcmp(strided_out.data(),out.data(),out.size()*sizeof(float))==0);
+    CHECK(std::memcmp(strided_state.data(),state.data(),state.size()*sizeof(float))==0);
+    CHECK(std::memcmp(strided_history.data(),final_history.data(),final_history.size()*sizeof(float))==0);
+    CHECK(rk_npu_gdn_run_projected_strided(w.get(),padded.data(),CW-1,weights.data(),history.data(),
+        x.g.data(),x.beta.data(),x.state.data(),strided_out.data(),strided_state.data(),strided_history.data(),nullptr)==RK_NPU_ERR_PARAM);
     for(int channel=0;channel<CW;++channel) for(int j=0;j<3;++j)
         CHECK(final_history[channel*3+j]==projected[(T-3+j)*CW+channel]);
     auto inplace=x.state,old_history=history;

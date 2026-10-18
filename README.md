@@ -12,7 +12,7 @@ Fully open source high-performance matrix multiplication library for LLM inferen
 - w8a8/w4a8 quantized MoE kernel
 - Very fast fused fp16 GQA (MHA, MQA) kernel
 - Fast fused fp16 MLA/gated MLA kernel, supporting both expanded and absorbed mode
-- Scalar-gated DeltaNet prefill with TF32 products, FP32 state and fused CPU Conv/SiLU/QK normalization
+- Scalar-gated DeltaNet prefill with TF32 products, FP32 state, strided projected inputs and fused CPU Conv/SiLU/QK normalization
 - Native FP16 KV cache load, append, reserve and stable-softmax truncation
 - Optional Perfetto tracing for operator, submission and CPU-stage profiling
 - Optimized performance (at least I tried to do so)

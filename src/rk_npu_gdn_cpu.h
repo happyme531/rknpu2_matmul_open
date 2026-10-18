@@ -61,7 +61,7 @@ inline void conv_silu(const Projected& p,int t,int channel,int count,float* out)
             auto value = vdupq_n_f32(0.f);
             for (int k = 0; k < 4; ++k) {
                 const auto input = t + k < 3 ? old.val[t + k]
-                    : vld1q_f32(p.input + size_t(t + k - 3) * CW + c);
+                    : vld1q_f32(p.input + size_t(t + k - 3) * p.stride + c);
                 value = vfmaq_f32(value, input, weight.val[k]);
             }
             vst1q_f32(out + c - channel, silu4(value));
@@ -104,7 +104,7 @@ void produce_native(Workers& workers,int T,const Projected& p,float* a,float* al
     workers.run([&](int w) {
         for(int c=w;c<CW;c+=workers.count()) {
             for(int j=0;j<3-keep;++j) p.final_history[c*3+j]=p.history[c*3+j+keep];
-            for(int j=0;j<keep;++j) p.final_history[c*3+3-keep+j]=p.input[size_t(T-keep+j)*CW+c];
+            for(int j=0;j<keep;++j) p.final_history[c*3+3-keep+j]=p.input[size_t(T-keep+j)*p.stride+c];
         }
     });
 }

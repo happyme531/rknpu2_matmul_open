@@ -108,6 +108,14 @@ The caller owns weights, state and history. History and state are exported
 only after the recurrence succeeds. They can be passed to an existing CPU
 decode implementation without retaining the NPU workspace.
 
+For QKV stored at the start of a wider merged projection row,
+`rk_npu_gdn_run_projected_strided` accepts the token stride in FP32 elements.
+The stride must be at least 8192; only the QKV prefix of each row is read.
+This allows a runtime to retain token-major QKV/Z/a/b projection output
+without copying QKV into a second tensor. Gates, output, state and history
+keep the contiguous layouts above. The original projected-input entry point
+uses stride 8192.
+
 ## Precision and internal state
 
 Ordinary `RK_NPU_GDN_TF32` uses one TF32 product per logical GEMM. FP32 input

@@ -87,6 +87,15 @@ int rk_npu_gdn_run_projected(rk_npu_gdn_workspace* workspace,
     const float* g, const float* beta, const float* initial_state,
     float* output, float* final_state, float* final_history,
     rk_npu_gdn_timings* timings);
+/* Same operation with projected token rows separated by projected_stride
+ * FP32 elements. The stride must be >=8192. Only the first 8192 elements
+ * of each row are read; gates, output and state remain contiguous. */
+int rk_npu_gdn_run_projected_strided(rk_npu_gdn_workspace* workspace,
+    const float* projected, uint64_t projected_stride,
+    const float* conv_weights, const float* history,
+    const float* g, const float* beta, const float* initial_state,
+    float* output, float* final_state, float* final_history,
+    rk_npu_gdn_timings* timings);
 #ifdef __cplusplus
 }
 #endif

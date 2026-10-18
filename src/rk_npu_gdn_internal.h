@@ -85,6 +85,7 @@ struct Inputs {
 struct Projected {
     const float *input,*weights,*history;
     float *values,*final_history;
+    size_t stride;
 };
 struct Times {
     double total=0,gram_pack=0,gram=0,coefficients=0,predict=0,solve=0,update=0,handoff=0,driver=0;

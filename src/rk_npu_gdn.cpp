@@ -154,8 +154,16 @@ int rk_npu_gdn_run(rk_npu_gdn_workspace* w,const float* q,const float* k,const f
 int rk_npu_gdn_run_projected(rk_npu_gdn_workspace* w,const float* projected,const float* weights,const float* history,
     const float* g,const float* beta,const float* state,float* output,float* final_state,float* final_history,
     rk_npu_gdn_timings* timings) {
+    return rk_npu_gdn_run_projected_strided(w,projected,(2*HK+HV)*D,weights,history,
+        g,beta,state,output,final_state,final_history,timings);
+}
+int rk_npu_gdn_run_projected_strided(rk_npu_gdn_workspace* w,const float* projected,uint64_t stride,
+    const float* weights,const float* history,const float* g,const float* beta,const float* state,
+    float* output,float* final_state,float* final_history,rk_npu_gdn_timings* timings) {
     if(!w || !projected || !weights || !history || !final_history) return RK_NPU_ERR_PARAM;
-    const Projected producer{projected,weights,history,w->values.data(),w->history.data()};
+    if(stride<(2*HK+HV)*D || stride>(SIZE_MAX/sizeof(float)-(2*HK+HV)*D)/w->cfg.tokens)
+        return RK_NPU_ERR_PARAM;
+    const Projected producer{projected,weights,history,w->values.data(),w->history.data(),size_t(stride)};
     return execute(w,{nullptr,nullptr,w->values.data(),g,beta,state},&producer,output,final_state,final_history,timings);
 }
 }
