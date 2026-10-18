@@ -14,6 +14,7 @@
 | `RK_NPU_MOE_TRACE` | 关 | 每次 MoE `ioctl` submit 前后 | 往 stderr 打阶段日志 |
 | `RK_NPU_MOE_W4_MIXED` | 开 | 仅 `rk_npu_moe_w4_workspace_create` | 混合 W4/W8 MoE 是否把 INT4 和 INT8 GEMM 拼进同一条 PC chain |
 | `RK_NPU_MM_SPLIT_K` | 开 | 新 `rk_npu_mm_plan_create`，options.split_k=-1 时 | 允许 FP16/BF16/TF32 MM/BMM 自动 split-K；`0` 关闭，`1` 开启，其它值报错；不影响旧接口 |
+| `RK_NPU_MM_K_TILING` | 开 | `rk_npu_mm_autotune_config_init` | FP16 调优允许 K 分块和 NPU FP16 Add 归约；`off`/`0` 关闭 |
 | `RK_NPU_ATTN_LUT_EXP` | 开 | stable Attention cache 创建 | 使用 NPU LUT exponential；`0` 恢复 CPU softmax |
 | `RK_NPU_ATTN_LUT_SUBMIT` | `pingpong` | Attention graph 创建 | LUT 提交方式：`pingpong`、`pc`、`split` |
 | `XDG_CACHE_HOME`、`HOME` | 见下文 | cache path 参数为 NULL 时 | autotune 结果目录 |
@@ -43,6 +44,18 @@ TF32 partial/输出均为 FP32，其 K 分块按 16 对齐；FP16/BF16 按 32 �
 只在创建 plan 时读取并固化，运行时不重新读取；options.split_k 的显式 0/1/2/3
 覆盖环境变量。现有 FP16、INT8、INT4 和量化接口均不读取此变量。
 完整语义、预打包 B 兼容条件和例子见 [MM.md](docs/MM.md)。
+
+## 浮点 MM 调优：`RK_NPU_MM_K_TILING`
+
+未设置、空串、`fp16`、`on` 或 `1` 时允许 FP16 K 分块；`off` 或 `0` 关闭。
+其它值使初始化后的配置在验证时返回 `RK_NPU_ERR_PARAM`。只在初始化配置时读取，
+调用方也可显式设置 `allow_k_tiling`；BF16 忽略该字段并保持完整 K。
+
+启用表示把 K 分块方案加入搜索，最终仍可选择完整 K。分块 GEMM 输出 FP16 partial，
+随后用独立 NPU FP16 Add 树归约，每层都舍入。需要比较精度时，在准备及推理前设置
+`RK_NPU_MM_K_TILING=off`，并为关闭后的配置单独调优；两种策略使用不同 cache key。
+已有 workspace 和常驻权重不随环境改变。该开关与原始 MM 的 `RK_NPU_MM_SPLIT_K`
+独立，自动调优接口不使用原始 MM 的 CPU split-K 归约。
 
 ## W8A8：`RK_NPU_I8_NPU_REDUCE` 和 `RK_NPU_W8A8_NPU_DEQUANT`
 

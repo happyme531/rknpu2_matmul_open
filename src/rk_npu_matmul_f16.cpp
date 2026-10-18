@@ -49,7 +49,7 @@ namespace {
 using FloatPrecision = rknpu2_matmul_open::detail::FloatPrecision;
 int element_bytes(FloatPrecision p) { return p == FloatPrecision::TF32 ? 4 : 2; }
 int k_atom(FloatPrecision p) { return 64 / element_bytes(p); }
-int query_common(const rk_npu_matmul_f16_config*, FloatPrecision, rk_npu_matmul_sizes*);
+int query_common(const rk_npu_matmul_f16_config*, FloatPrecision, rk_npu_matmul_sizes*, int task_m_tile = 0);
 
 /* fp16-specific CBUF budget / pipeline constants (from gemm.py) */
 constexpr int FP16_BYTES               = 2;
@@ -123,6 +123,18 @@ bool a_native(const rk_npu_matmul_f16_config& cfg) {
 bool d_native(const rk_npu_matmul_f16_config& cfg) {
     return cfg.d_layout == RK_NPU_F16_D_LAYOUT_NATIVE_N8_M8;
 }
+int a_panel(const rk_npu_matmul_f16_config& c) {
+    return c.a_layout == RK_NPU_F16_A_LAYOUT_PANEL8 ? 8 : c.a_layout == RK_NPU_F16_A_LAYOUT_PANEL16 ? 16 : 0;
+}
+int d_panel(const rk_npu_matmul_f16_config& c) {
+    return c.d_layout == RK_NPU_F16_D_LAYOUT_PANEL8 ? 8 : c.d_layout == RK_NPU_F16_D_LAYOUT_PANEL16 ? 16 : 0;
+}
+int task_rows(const Layout& l, const rk_npu_matmul_f16_config& c, FloatPrecision p, int cap) {
+    int rows = m_tile_for(l, a_native(c), p);
+    if (cap > 0) rows = std::min(rows, cap);
+    const int panel = std::max(a_panel(c), d_panel(c));
+    return panel ? rows / panel * panel : rows;
+}
 
 /* number of EW operand fp16 elements one task (tile_m rows) occupies (see pack_operand) */
 inline int operand_block_elems(int align_out, int tile_m) {
@@ -135,12 +147,18 @@ bool valid_config(const rk_npu_matmul_f16_config* cfg) {
          cfg->op != RK_NPU_FUSE_MUL &&
          cfg->op != RK_NPU_FUSE_ADD) ||
         (cfg->a_layout != RK_NPU_F16_A_LAYOUT_NORMAL &&
-         cfg->a_layout != RK_NPU_F16_A_LAYOUT_NATIVE_K8_M8) ||
+         cfg->a_layout != RK_NPU_F16_A_LAYOUT_NATIVE_K8_M8 && !a_panel(*cfg)) ||
         (cfg->d_layout != RK_NPU_F16_D_LAYOUT_NORMAL_PADDED &&
-         cfg->d_layout != RK_NPU_F16_D_LAYOUT_NATIVE_N8_M8) ||
+         cfg->d_layout != RK_NPU_F16_D_LAYOUT_NATIVE_N8_M8 && !d_panel(*cfg)) ||
         (cfg->op != RK_NPU_FUSE_NONE &&
-         (a_native(*cfg) || d_native(*cfg))))
+         (a_native(*cfg) || d_native(*cfg) || a_panel(*cfg) || d_panel(*cfg))))
         return false;
+    const int aw = a_panel(*cfg), dw = d_panel(*cfg), panel = std::max(aw, dw);
+    if (panel && cfg->M % panel) return false;
+    if (aw && !(d_native(*cfg) || dw == aw)) return false;
+    if (!aw && dw && !(cfg->a_layout == RK_NPU_F16_A_LAYOUT_NORMAL && dw == 8)) return false;
+    if ((aw == 8 && cfg->K > 1024) || (aw == 16 && cfg->K > 2048)) return false;
+    if (dw && int64_t(align_up(cfg->N, 32) / 8 - 1) * dw > 8191) return false;
     if (cfg->n_tile < 0 || (cfg->n_tile > 0 &&
         ((cfg->n_tile % MIN_CHANNEL_TILE) != 0 ||
          cfg->n_tile > align_up(cfg->N, MIN_CHANNEL_TILE) ||
@@ -203,10 +221,10 @@ uint32_t effective_core_mask(uint32_t requested, int num_tasks) {
  * registers and the whole DPU-RDMA operand-read block (see the dual-surface note
  * up top).
  */
-void make_f16_regs(std::vector<uint64_t>& v, int m, int full_M, int N, int K,
+void make_f16_regs(std::vector<uint64_t>& v, int m, int full_M, int full_N, int N, int K,
                    uint64_t in_dma, uint64_t wt_dma, uint64_t out_dma,
                    rk_npu_fuse_op op, uint64_t operand_dma,
-                   int plan_data_banks, bool native_a, bool native_d,
+                   int plan_data_banks, bool native_a, bool native_d, int aw, int dw,
                    rknpu2_matmul_open::detail::FloatPrecision precision) {
     Layout L = gemm_layout(N, K, op != RK_NPU_FUSE_NONE, precision);
     const int align_in = L.align_in, align_out = L.align_out, eff_k = L.eff_k;
@@ -228,6 +246,8 @@ void make_f16_regs(std::vector<uint64_t>& v, int m, int full_M, int N, int K,
     int feature_grains = fused
         ? std::max(RK_MIN_WIDE_FEATURE_GRAINS, even_rows_per_two_banks)
         : (native_a ? 2 : m + 1);
+    if (aw) feature_grains = std::max(1, std::min(m / aw + 1,
+        (ceil_div(2 * CBUF_BANK_SIZE, aw * input_row_bytes) + 1) & ~1));
     /* Keep the plan's first/full-tile partition on residual M tiles too. */
     int data_banks = native_a
         ? std::min(std::max(ceil_div(m * input_row_bytes, CBUF_BANK_SIZE), 1),
@@ -245,36 +265,35 @@ void make_f16_regs(std::vector<uint64_t>& v, int m, int full_M, int N, int K,
     const bool native_a_split_m = native_a && m < full_M;
     const uint32_t cna_conv1 = (proc_precision << 4) | (proc_precision << 7) |
         ((!native_a || native_a_split_m) ? (1u << 29) : 0u);
-    const uint32_t data_size0 = native_a
+    const uint32_t data_size0 = aw ? (uint32_t(aw) << 16) | uint32_t(m / aw) : native_a
         ? ((uint32_t)m << 16) | 1u
         : (1u << 16) | (uint32_t)m;
-    const uint32_t data_size2 = native_a ? (uint32_t)m : 1u;
-    const uint32_t cbuf1 = native_a
+    const uint32_t data_size2 = aw ? uint32_t(aw) : native_a ? (uint32_t)m : 1u;
+    const uint32_t cbuf1 = aw ? uint32_t(ceil_div(aw * align_in, ka)) : native_a
         ? (uint32_t)ceil_div(m * align_in, ka)
         : (uint32_t)ceil_div(align_in, ka);
-    const uint32_t dma_con1 = native_a
+    const uint32_t dma_con1 = aw ? uint32_t(aw * input_row_bytes / 16) : native_a
         ? (native_a_split_m ? (uint32_t)full_M : 0x200u)
         : (uint32_t)line_stride;
     const uint32_t dma_con2 = native_a
         ? (native_a_split_m ? (uint32_t)(full_M - m)
                             : (0x10000000u - (uint32_t)full_M * 3u))
         : 0u;
-    const uint32_t core_size0 = native_a
+    const uint32_t core_size0 = aw ? (uint32_t(m / aw - 1) << 16) | uint32_t(aw - 1) : native_a
         ? (uint32_t)(m - 1)
         : ((uint32_t)(m - 1) << 16);
 
-    const uint32_t dst_surf_stride = native_d
+    const uint32_t dst_surf_stride = dw ? uint32_t(dw * 16) : native_d
         ? (uint32_t)(full_M * FP16_NATIVE_ROW_BYTES)
         : (1u << 4);
-    const uint32_t dst_w = native_d ? (uint32_t)(m - 1) : 0u;
-    const uint32_t dst_h = native_d ? 0u : (uint32_t)(m - 1);
+    const uint32_t dst_w = dw ? uint32_t(dw - 1) : native_d ? (uint32_t)(m - 1) : 0u;
+    const uint32_t dst_h = dw ? uint32_t(m / dw - 1) : native_d ? 0u : (uint32_t)(m - 1);
+    if (dw) notch_val = (align_up(full_N, 32) / (16 / bytes) - 1) * dw;
     const uint32_t dst_notch = native_d
         ? 0u
         : ((uint32_t)notch_val << 16) | (uint32_t)notch_val;
-    const uint32_t wdma_size1 = native_d
-        ? (uint32_t)(m - 1)
-        : ((uint32_t)(m - 1) << 16);
-    const uint32_t surface_add = native_d
+    const uint32_t wdma_size1 = (dst_h << 16) | dst_w;
+    const uint32_t surface_add = dw ? uint32_t(dw * bytes * 16) : native_d
         ? (uint32_t)full_M * bytes * 16u
         : (uint32_t)bytes << 4;
 
@@ -463,7 +482,7 @@ int build_regcmd(const rk_npu_matmul_f16_config& cfg,
                  rk_npu_mem* regcmd, rk_npu_mem* task, BuildMeta* meta,
                  int batch_count = 1,
                  rknpu2_matmul_open::detail::FloatPrecision precision =
-                     rknpu2_matmul_open::detail::FloatPrecision::F16) {
+                     rknpu2_matmul_open::detail::FloatPrecision::F16, int task_m_tile = 0) {
     if (batch_count <= 0) return RK_NPU_ERR_PARAM;
     const int M = cfg.M, N = cfg.N, K = cfg.K;
     const rk_npu_fuse_op op = cfg.op;
@@ -477,7 +496,8 @@ int build_regcmd(const rk_npu_matmul_f16_config& cfg,
     const int n_tile = config_n_tile(cfg);
     const Layout input_layout = gemm_layout(
         std::min(n_tile, align_out), K, op != RK_NPU_FUSE_NONE, precision);
-    const int m_tile = m_tile_for(input_layout, native_a, precision);
+    const int m_tile = task_rows(input_layout, cfg, precision, task_m_tile);
+    if (m_tile < 1) return RK_NPU_ERR_PARAM;
     const int plan_tile_m = std::min(M, m_tile);
     const int plan_data_banks = std::min(
         std::max(ceil_div(plan_tile_m * input_layout.align_in * bytes,
@@ -493,7 +513,7 @@ int build_regcmd(const rk_npu_matmul_f16_config& cfg,
     meta->num_tasks = batch_count * n_tasks * m_tasks;
 
     rk_npu_matmul_sizes one{};
-    if (query_common(&cfg, precision, &one) != RK_NPU_OK)
+    if (query_common(&cfg, precision, &one, task_m_tile) != RK_NPU_OK)
         return RK_NPU_ERR_PARAM;
     meta->output_bytes = one.output_bytes * (uint64_t)batch_count;
     if (regcmd->size < one.regcmd_bytes * (uint64_t)batch_count ||
@@ -533,17 +553,19 @@ int build_regcmd(const rk_npu_matmul_f16_config& cfg,
                     (uint64_t)start * (native_a ? FP16_NATIVE_ROW_BYTES
                                                 : meta->input_row_bytes);
                 meta->weight_off[ti] = batch_weight_off + tile_weight_off;
-                meta->output_off[ti] = batch_output_off + tile_output_off +
+                meta->output_off[ti] = d_panel(cfg)
+                    ? batch_output_off + uint64_t(n_start) * d_panel(cfg) * bytes + uint64_t(start) * align_out * bytes
+                    : batch_output_off + tile_output_off +
                     (uint64_t)start * (native_d
                         ? FP16_NATIVE_ROW_BYTES
                         : tile_layout.align_out * output_row_bytes_per_channel);
                 meta->operand_off[ti] = batch_operand_off + tile_operand_off;
-                make_f16_regs(bodies[ti], tile_m, M, tile_n, K,
+                make_f16_regs(bodies[ti], tile_m, M, N, tile_n, K,
                               in_dma + meta->input_off[ti],
                               wt_dma + meta->weight_off[ti],
                               out_dma + meta->output_off[ti],
                               op, operand_dma + meta->operand_off[ti],
-                              plan_data_banks, native_a, native_d, precision);
+                              plan_data_banks, native_a, native_d, a_panel(cfg), d_panel(cfg), precision);
                 meta->base[ti] = off;
                 meta->body_size[ti] = (int)bodies[ti].size();
                 meta->start[ti] = start;
@@ -577,11 +599,13 @@ extern "C" void rk_npu_matmul_f16_config_init(rk_npu_matmul_f16_config* cfg,
 
 namespace {
 int query_common(const rk_npu_matmul_f16_config* cfg, FloatPrecision precision,
-                 rk_npu_matmul_sizes* out) {
+                 rk_npu_matmul_sizes* out, int task_m_tile) {
     if (!valid_config(cfg) || !out) return RK_NPU_ERR_PARAM;
     if (precision != FloatPrecision::F16 && precision != FloatPrecision::BF16 &&
         precision != FloatPrecision::TF32) return RK_NPU_ERR_PARAM;
     if (precision != FloatPrecision::F16 && cfg->op != RK_NPU_FUSE_NONE)
+        return RK_NPU_ERR_PARAM;
+    if (task_m_tile < 0 || (precision != FloatPrecision::F16 && (a_panel(*cfg) || d_panel(*cfg))))
         return RK_NPU_ERR_PARAM;
     const int bytes = element_bytes(precision);
     const int M = cfg->M, N = cfg->N, K = cfg->K;
@@ -594,7 +618,8 @@ int query_common(const rk_npu_matmul_f16_config* cfg, FloatPrecision precision,
     // The larger-K CBUF recipe remains experimental. Reject it before submit.
     if (precision == FloatPrecision::TF32 && L.align_in > 4096)
         return RK_NPU_ERR_PARAM;
-    int m_tile = m_tile_for(L, a_native(*cfg), precision);
+    int m_tile = task_rows(L, *cfg, precision, task_m_tile);
+    if (m_tile < 1) return RK_NPU_ERR_PARAM;
     int num_tasks = ceil_div(M, m_tile) * ceil_div(align_out, n_tile);
 
     /* body = 108 plain-path regs; legacy fused adds EW + DPU-RDMA regs. */
@@ -635,8 +660,8 @@ extern "C" int rk_npu_matmul_f16_pack_a(const rk_npu_matmul_f16_config* cfg,
                            cfg->op != RK_NPU_FUSE_NONE);
     if (input->size < (uint64_t)M * L.align_in * FP16_BYTES) return RK_NPU_ERR_NOMEM;
     uint16_t* dst = (uint16_t*)input->vaddr;
-    if (a_native(*cfg))
-        rknpu2_matmul_open::cpu::f16_pack_a_native_k8_m8(M, K, L.align_in, A, dst);
+    if (a_native(*cfg) || a_panel(*cfg))
+        rknpu2_matmul_open::cpu::f16_pack_a_native_k8_m8(M, K, L.align_in, A, dst, a_panel(*cfg));
     else
         rknpu2_matmul_open::cpu::f16_pack_a_normal(M, K, L.align_in, A, dst);
     return RK_NPU_OK;
@@ -699,8 +724,8 @@ extern "C" int rk_npu_matmul_f16_unpack_d(const rk_npu_matmul_f16_config* cfg,
     const int align_out = std::max(MIN_CHANNEL_TILE,
                                    align_up(N, MIN_CHANNEL_TILE));
     const int n_tile = config_n_tile(*cfg);
-    if (d_native(*cfg)) {
-        rknpu2_matmul_open::cpu::f16_unpack_d_native_n8_m8(M, N, o, D);
+    if (d_native(*cfg) || d_panel(*cfg)) {
+        rknpu2_matmul_open::cpu::f16_unpack_d_native_n8_m8(M, N, o, D, d_panel(*cfg));
         return RK_NPU_OK;
     }
     if (n_tile == align_out) {
@@ -732,8 +757,8 @@ extern "C" int rk_npu_matmul_f16_unpack_d_f32(const rk_npu_matmul_f16_config* cf
     const int align_out = std::max(MIN_CHANNEL_TILE,
                                    align_up(N, MIN_CHANNEL_TILE));
     const int n_tile = config_n_tile(*cfg);
-    if (d_native(*cfg)) {
-        rknpu2_matmul_open::cpu::f16_unpack_d_f32_native_n8_m8(M, N, o, D);
+    if (d_native(*cfg) || d_panel(*cfg)) {
+        rknpu2_matmul_open::cpu::f16_unpack_d_f32_native_n8_m8(M, N, o, D, d_panel(*cfg));
         return RK_NPU_OK;
     }
     if (n_tile == align_out) {
@@ -761,7 +786,7 @@ extern "C" int rk_npu_matmul_f16_unpack_d_add_bias(
     const rk_npu_matmul_f16_config* cfg, const rk_npu_mem* output,
     const uint16_t* bias, uint16_t* D) {
     if (!valid_config(cfg) || !output || !output->vaddr || !bias || !D ||
-        cfg->op != RK_NPU_FUSE_NONE || d_native(*cfg) || cfg->n_tile != 0)
+        cfg->op != RK_NPU_FUSE_NONE || d_native(*cfg) || d_panel(*cfg) || cfg->n_tile != 0)
         return RK_NPU_ERR_PARAM;
     rk_npu_matmul_sizes sz{};
     int rc = rk_npu_matmul_f16_query(cfg, &sz);
@@ -807,9 +832,9 @@ extern "C" int rk_npu_matmul_f16_batch_pack_a(
     const Layout L = gemm_layout(
         std::min(config_n_tile(*cfg), align_out), cfg->K, false);
     uint16_t* dst = static_cast<uint16_t*>(input->vaddr);
-    if (a_native(*cfg))
+    if (a_native(*cfg) || a_panel(*cfg))
         rknpu2_matmul_open::cpu::f16_pack_a_native_k8_m8_batch(
-            B, cfg->M, cfg->K, L.align_in, A_bmk, dst);
+            B, cfg->M, cfg->K, L.align_in, A_bmk, dst, a_panel(*cfg));
     else
         rknpu2_matmul_open::cpu::f16_pack_a_normal_batch(
             B, cfg->M, cfg->K, L.align_in, A_bmk, dst);
@@ -848,9 +873,9 @@ extern "C" int rk_npu_matmul_f16_batch_unpack_d(
         return RK_NPU_ERR_NOMEM;
     const uint16_t* src = (const uint16_t*)output->vaddr;
     const uint64_t src_batch_stride = one.output_bytes / sizeof(uint16_t);
-    if (d_native(*cfg)) {
+    if (d_native(*cfg) || d_panel(*cfg)) {
         rknpu2_matmul_open::cpu::f16_unpack_d_native_n8_m8_batch(
-            B, cfg->M, cfg->N, src_batch_stride, src, D_bmn);
+            B, cfg->M, cfg->N, src_batch_stride, src, D_bmn, d_panel(*cfg));
         return RK_NPU_OK;
     }
     const int align_out = std::max(
@@ -1090,15 +1115,15 @@ bool configure_prepared(F16Prepared& p, const BuildMeta& meta) {
 bool prepare_common(rk_npu_iommu_domain* domain, int batch_count,
                     const rk_npu_matmul_f16_config* cfg, F16Prepared& p,
                     rknpu2_matmul_open::detail::FloatPrecision precision =
-                        rknpu2_matmul_open::detail::FloatPrecision::F16) {
+                        rknpu2_matmul_open::detail::FloatPrecision::F16, int task_m_tile = 0) {
     if (!domain || !domain->ctx || batch_count <= 0 || !valid_config(cfg) ||
         (batch_count > 1 && cfg->op != RK_NPU_FUSE_NONE))
         return false;
     rk_npu_matmul_sizes one{}, total{};
-    if (query_common(cfg, precision, &one) != RK_NPU_OK)
+    if (query_common(cfg, precision, &one, task_m_tile) != RK_NPU_OK)
         return false;
     if (batch_count == 1) total = one;
-    else if (rknpu2_matmul_open::detail::float_batch_query(batch_count, cfg, precision, &total) != RK_NPU_OK)
+    else if (rknpu2_matmul_open::detail::float_batch_query(batch_count, cfg, precision, &total, task_m_tile) != RK_NPU_OK)
         return false;
 
     p.ctx = domain->ctx;
@@ -1118,7 +1143,7 @@ bool prepare_common(rk_npu_iommu_domain* domain, int batch_count,
 
     BuildMeta meta;
     if (build_regcmd(*cfg, 0, 0, 0, 0, &p.regcmd, &p.task, &meta,
-                     batch_count, precision) != RK_NPU_OK) {
+                     batch_count, precision, task_m_tile) != RK_NPU_OK) {
         release_prepared(p);
         return false;
     }
@@ -1255,16 +1280,16 @@ int export_f16_batch_tasks(const rk_npu_matmul_f16_batch_plan* plan,
 
 void float_native_regs(std::vector<uint64_t>& regs, int m, int n, int k,
     uint64_t a, uint64_t b, uint64_t output, FloatPrecision precision) {
-    make_f16_regs(regs, m, m, n, k, a, b, output,
-        RK_NPU_FUSE_NONE, 0, 1, true, true, precision);
+    make_f16_regs(regs, m, m, n, n, k, a, b, output,
+        RK_NPU_FUSE_NONE, 0, 1, true, true, 0, 0, precision);
 }
 
 int float_batch_query(int batch_count, const rk_npu_matmul_f16_config* cfg,
-    FloatPrecision precision, rk_npu_matmul_sizes* out) {
+    FloatPrecision precision, rk_npu_matmul_sizes* out, int task_m_tile) {
     if (batch_count <= 0 || !cfg || cfg->op != RK_NPU_FUSE_NONE || !out)
         return RK_NPU_ERR_PARAM;
     rk_npu_matmul_sizes one{};
-    const int rc = query_common(cfg, precision, &one);
+    const int rc = query_common(cfg, precision, &one, task_m_tile);
     if (rc) return rc;
     if (one.num_tasks > INT_MAX / batch_count) return RK_NPU_ERR_PARAM;
     *out = one;
@@ -1277,7 +1302,7 @@ int float_batch_query(int batch_count, const rk_npu_matmul_f16_config* cfg,
     return RK_NPU_OK;
 }
 int float_batch_prepare(rk_npu_iommu_domain* domain, int batch_count,
-    const rk_npu_matmul_f16_config* cfg, FloatPrecision precision, FloatBatchPlan** out) {
+    const rk_npu_matmul_f16_config* cfg, FloatPrecision precision, FloatBatchPlan** out, int task_m_tile) {
     if (!out) return RK_NPU_ERR_PARAM;
     *out = nullptr;
     if (!domain || !domain->ctx || batch_count <= 0 || !valid_config(cfg) ||
@@ -1288,7 +1313,7 @@ int float_batch_prepare(rk_npu_iommu_domain* domain, int batch_count,
     FloatBatchPlan* plan = new (std::nothrow) FloatBatchPlan;
     if (!plan) return RK_NPU_ERR_NOMEM;
     try {
-        if (prepare_common(domain, batch_count, cfg, plan->p, precision)) {
+        if (prepare_common(domain, batch_count, cfg, plan->p, precision, task_m_tile)) {
             *out = plan;
             return RK_NPU_OK;
         }
@@ -1308,6 +1333,7 @@ void float_batch_free(FloatBatchPlan* plan) {
     release_prepared(plan->p);
     delete plan;
 }
+
 } // namespace rknpu2_matmul_open::detail
 
 extern "C" rk_npu_matmul_f16_plan* rk_npu_matmul_f16_prepare(

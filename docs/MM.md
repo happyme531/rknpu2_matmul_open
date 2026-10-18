@@ -79,7 +79,7 @@ workspace 为 input+output，B 对象另占 weight；device-only 不分配数据
 未 split 时每个任务计算完整 K：batch 分组、M 分行或 N 分列可独立并行，
 无跨核求和。任务按 batch、N tile、M tile 顺序生成，然后按任务数均分给各核。
 默认 `n_tile=0` 不主动切 N；若 batch=1 且 M 只生成一个 tile，就只有一个任务，
-实际使用一个核。设置正的 `n_tile` 可增加 N 方向任务，目前尚无自动 N 切块搜索。
+实际使用一个核。设置正的 `n_tile` 可增加 N 方向任务；原始 plan 接口不进行性能搜索。
 
 `RK_NPU_MM_SPLIT_K` 在 **plan 创建时**读取：
 
@@ -177,7 +177,55 @@ desc.c_type = RK_NPU_MM_F32;
 - `test_mm_header_c`：新头文件与旧头文件共同通过 C 编译。
 
 板端测试打印的首次完整调用耗时只是诊断值，没有定频/充分预热，不能作为性能比较。
-当前无 autotuner，整数新后端尚未接入；旧接口继续提供原来的能力。
+浮点 MM 的显式 autotuner 见下节；整数新后端尚未接入此原始接口。
+
+## 浮点 MM 显式自动调优
+
+[`rk_npu_mm_tune.h`](../include/rk_npu_mm_tune.h) 为静态权重提供独立调优入口，
+支持连续 `A[M,K]`、`B[K,N]`、`C[M,N]`，不含 batch、转置和 stride。
+FP16/BF16 权重均使用对应的 `uint16_t` 位模式。主机 A/C 可选择原始 16 位存储
+或 FP32；FP32 模式在完整调用内转换输入、扩展输出，并可加 FP32 bias。
+16 位输出也支持 bias，先在 FP32 中相加，再舍入回存储类型。
+
+FP16 搜索主机 M tile、N tile、硬件 task M 上限，以及 normal/native/panel8/panel16
+的合法 A/C 布局组合。FP32 主机模式还比较单独转换与转换合并 pack/collect。
+先用短测量筛选每个布局/K 分块的种子，再用配置的 loops/repeats 细化 task M 和
+主机 IO 路径，只有细化阶段的结果参与排名。BF16 保留 normal/native、M/N tile
+和单独转换的搜索，调优时会执行对应的 CPU 校准运算，须由调用方显式发起。
+
+默认允许 FP16 K 分块：搜索完整 K，以及 256/512/1024/2048 和对齐后的 K/2、K/3，
+只保留小于完整 K 且不超过 32 份的方案；当前候选生成仅在 `K>1024` 时加入分块。
+分块 GEMM 将 FP16 partial 留在设备侧，再用独立 NPU FP16 Add 树归约。
+归约不是融合进 GEMM，每层会产生一次 FP16 舍入。它可能改变抵消、溢出和模型输出，
+不承诺与完整 K 逐位一致。需要比较精度时，在配置初始化前设置
+`RK_NPU_MM_K_TILING=off`，并单独生成该策略的 profile；默认启用仍可选中完整 K。
+该接口固定原始 plan 的 `split_k=0`，不读取 `RK_NPU_MM_SPLIT_K`。
+
+调优使用确定性、按目标类型舍入的合成输入，并逐元素对照独立 CPU 参考；
+每个样本测量 `rk_npu_mm_tuned_run` 的完整逻辑调用，包含转换、padding、packing、
+同步、submit/wait、归约、输出收集及 bias。workspace 创建与权重上传单列计时。
+提交错误终止搜索；结束后恢复调用前的 CPU affinity 和 OpenMP 设置。
+执行时由调用方应用 strategy 的 CPU mask/线程数，并保持调优时的 NPU 资源条件。
+
+推荐的生命周期：
+
+1. 准备阶段初始化 `rk_npu_mm_autotune_config`，显式调用 `rk_npu_mm_autotune_cached`。
+2. 模型加载时用 `rk_npu_mm_tuned_weights_create` 上传基线和已调优形状选中的 K 分块。
+   同一 K/N、dtype、资源及测量配置下，权重不绑定逻辑 M；源 B 随后即可释放。
+3. 推理只调用 `rk_npu_mm_autotune_cache_load`。cache miss 时用
+   `rk_npu_mm_strategy_default`；若 `rk_npu_mm_tuned_weights_match` 返回 cache miss，
+   同样使用基线。新 profile 不会隐式重建已加载的权重。
+4. 创建并复用 `rk_npu_mm_tuned_workspace`，运行 `rk_npu_mm_tuned_run_weights`。
+   热路径不分配内存、不调优、不重新打包 B，也不写 cache。
+
+cache key 区分形状、dtype、主机 IO/bias、CPU/NPU mask、K 策略、测量配置、驱动和
+调度版本。只读取当前格式，旧实验或损坏文件视为 miss，须显式重新调优。
+`cache_load` 自身没有设备提交或文件写入；不要把会搜索的 `_cached` 放进普通推理。
+带目录的常驻权重创建只读取该目录记录的分块；传 NULL 仅上传基线。
+同一个 workspace 不支持并发；ctx 必须晚于所有设备对象释放。
+
+测试入口为 `test_mm_tune --cpu`、`--fp16`、`--panel-fp16` 和 `--k-tiles`。
+`--bf16` 单独选择 BF16 调优测试；默认或 `--help` 只显示帮助。
 
 ### 2026-09-29 初始 FP16 验证记录
 

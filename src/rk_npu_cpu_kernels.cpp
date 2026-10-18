@@ -1,4 +1,5 @@
 #include "rk_npu_cpu_kernels.h"
+#include "rk_npu_float_layout.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1822,7 +1823,7 @@ void f16_pack_a_normal_split(int M, int K, int split_count, int part_k,
 }
 
 void f16_pack_a_native_k8_m8(int M, int K, int align_in,
-                             const uint16_t* src, uint16_t* dst) {
+                             const uint16_t* src, uint16_t* dst, int panel_rows) {
     constexpr int subK = 8;
     const int kb_count = align_in / subK;
     const uint64_t elems = (uint64_t)kb_count * M * subK;
@@ -1846,7 +1847,7 @@ void f16_pack_a_native_k8_m8(int M, int K, int align_in,
                                 ? subK : (K > k0 ? K - k0 : 0);
                 if (valid <= 0) continue;
                 for (int r = r0; r < r1; ++r) {
-                    uint16_t* out = dst + ((size_t)kb * M + r) * subK;
+                    uint16_t* out = dst + detail::float_native_offset(M, align_in, r, kb * subK, panel_rows);
                     const uint16_t* in = src + (size_t)r * K + k0;
                     if (valid == subK)
                         copy16_u8((uint8_t*)out, (const uint8_t*)in);
@@ -1864,7 +1865,7 @@ void f16_pack_a_native_k8_m8(int M, int K, int align_in,
         const int valid = (k0 + subK <= K) ? subK : (K > k0 ? K - k0 : 0);
         if (valid <= 0) continue;
         for (int r = 0; r < M; ++r) {
-            uint16_t* out = dst + ((size_t)kb * M + r) * subK;
+            uint16_t* out = dst + detail::float_native_offset(M, align_in, r, kb * subK, panel_rows);
             const uint16_t* in = src + (size_t)r * K + k0;
             if (valid == subK)
                 copy16_u8((uint8_t*)out, (const uint8_t*)in);
@@ -1875,14 +1876,14 @@ void f16_pack_a_native_k8_m8(int M, int K, int align_in,
 }
 
 void f16_pack_a_native_k8_m8_batch(int B, int M, int K, int align_in,
-                                   const uint16_t* src, uint16_t* dst) {
+                                   const uint16_t* src, uint16_t* dst, int panel_rows) {
     if (B <= 0 || M <= 0 || K <= 0 || align_in < K || !src || !dst) return;
     const uint64_t one_elems = (uint64_t)M * align_in;
 #pragma omp parallel for schedule(static) if((uint64_t)B * one_elems >= (1u << 18))
     for (int b = 0; b < B; ++b)
         f16_pack_a_native_k8_m8(
             M, K, align_in, src + (uint64_t)b * M * K,
-            dst + (uint64_t)b * one_elems);
+            dst + (uint64_t)b * one_elems, panel_rows);
 }
 
 void f16_pack_b_native_n16_k32(int K, int N, int align_in, int align_out,
@@ -2159,14 +2160,14 @@ void f16_unpack_d_f32_compact_strided(int M, int N, int align_out,
 }
 
 void f16_unpack_d_native_n8_m8(int M, int N,
-                               const uint16_t* src, uint16_t* dst) {
+                               const uint16_t* src, uint16_t* dst, int panel_rows) {
     f16_unpack_d_native_n8_m8_batch(
-        1, M, N, (uint64_t)M * N, src, dst);
+        1, M, N, (uint64_t)M * N, src, dst, panel_rows);
 }
 
 void f16_unpack_d_native_n8_m8_batch(int B, int M, int N,
                                      uint64_t src_batch_stride,
-                                     const uint16_t* src, uint16_t* dst) {
+                                     const uint16_t* src, uint16_t* dst, int panel_rows) {
     if (B <= 0 || M <= 0 || N <= 0 || !src || !dst ||
         src_batch_stride < (uint64_t)M * N)
         return;
@@ -2189,7 +2190,7 @@ void f16_unpack_d_native_n8_m8_batch(int B, int M, int N,
         if (rows == row_block) {
             for (; nb < full_nb; ++nb) {
                 const uint16_t* in =
-                    batch_src + ((size_t)nb * M + r0) * subN;
+                    batch_src + detail::float_native_offset(M, ((N + 31) & ~31), r0, nb * subN, panel_rows);
                 const uint16x8x4_t value = vld1q_u16_x4(in);
                 vst1q_u16(out + (size_t)0 * N + nb * subN,
                           value.val[0]);
@@ -2205,7 +2206,7 @@ void f16_unpack_d_native_n8_m8_batch(int B, int M, int N,
         for (; nb < full_nb; ++nb) {
             for (int row = 0; row < rows; ++row) {
                 const uint16_t* in = batch_src +
-                    ((size_t)nb * M + r0 + row) * subN;
+                    detail::float_native_offset(M, ((N + 31) & ~31), r0 + row, nb * subN, panel_rows);
 #if defined(__aarch64__) && defined(__ARM_NEON)
                 vst1q_u16(out + (size_t)row * N + nb * subN,
                           vld1q_u16(in));
@@ -2221,14 +2222,14 @@ void f16_unpack_d_native_n8_m8_batch(int B, int M, int N,
             for (int row = 0; row < rows; ++row)
                 std::memcpy(out + (size_t)row * N + n0,
                             batch_src +
-                                ((size_t)nb * M + r0 + row) * subN,
+                                detail::float_native_offset(M, ((N + 31) & ~31), r0 + row, nb * subN, panel_rows),
                             (size_t)valid * sizeof(uint16_t));
         }
     }
 }
 
 void f16_unpack_d_f32_native_n8_m8(int M, int N,
-                                   const uint16_t* src, float* dst) {
+                                   const uint16_t* src, float* dst, int panel_rows) {
     if (M <= 0 || N <= 0 || !src || !dst) return;
     constexpr int subN = 8;
     const int nb_count = (N + subN - 1) / subN;
@@ -2238,7 +2239,7 @@ void f16_unpack_d_f32_native_n8_m8(int M, int N,
         for (int nb = 0; nb < nb_count; ++nb) {
             const int n0 = nb * subN;
             const int valid = std::min(subN, N - n0);
-            const uint16_t* in = src + ((size_t)nb * M + r) * subN;
+            const uint16_t* in = src + detail::float_native_offset(M, ((N + 31) & ~31), r, nb * subN, panel_rows);
             for (int i = 0; i < valid; ++i)
                 out[n0 + i] = half_to_float(in[i]);
         }

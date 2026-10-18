@@ -112,6 +112,13 @@ int rk_npu_attention_f16_run(rk_npu_ctx* ctx,
     rk_npu_attention_f16_workspace* workspace, rk_npu_attention_f16_cache* cache,
     const uint16_t* q, int query_rows, int query_start, float* output,
     rk_npu_attention_f16_timings* timings, const rk_npu_attention_f16_boolean_mask* mask);
+/* Same execution and FP32 softmax/output reductions; stores the final result
+ * directly as compact FP16 [query_heads,query_rows,head_dim], 2 bytes/element.
+ * No full-size FP32 output tensor is constructed. */
+int rk_npu_attention_f16_run_half(rk_npu_ctx* ctx,
+    rk_npu_attention_f16_workspace* workspace, rk_npu_attention_f16_cache* cache,
+    const uint16_t* q, int query_rows, int query_start, uint16_t* output,
+    rk_npu_attention_f16_timings* timings, const rk_npu_attention_f16_boolean_mask* mask);
 /* Append one K/V[Hkv,head_dim] then run Q[Hq,head_dim]. Includes growth, graph updates,
  * cache sync and output processing. Submit/sync failures poison the affected
  * cache; reload it before reuse. Failed submits require a new workspace. */

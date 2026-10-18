@@ -1,8 +1,13 @@
 #include "rk_npu_mm.h"
+#include "rk_npu_mm_tune.h"
 #include "rk_npu_matmul_f16.h"
 #include "rk_npu_quant_matmul.h"
 
 int rk_mm_header_smoke(void) {
+    rk_npu_mm_autotune_config tune;
+    rk_npu_mm_strategy strategy;
+    rk_npu_mm_autotune_config_init(&tune, 129, 160, 96);
+    if (rk_npu_mm_strategy_default(&tune, &strategy)) return -1;
     rk_npu_mm_desc d;
     rk_npu_mm_options o;
     rk_npu_mm_plan* p = 0;

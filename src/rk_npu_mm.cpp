@@ -4,6 +4,10 @@
 #include "rk_npu_half_bits.h"
 #include "rk_npu_bfloat_bits.h"
 #include "rk_npu_float_backend.h"
+#include "rk_npu_float_layout.h"
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
@@ -19,6 +23,8 @@ struct rk_npu_mm_plan {
     rk_npu_matmul_f16_config cfg{}; // one batch/split item
     rk_npu_matmul_sizes one{};
     int items = 0;
+    int task_m_tile = 0;
+    int k_tile = 0;
 };
 
 struct rk_npu_mm_workspace {
@@ -126,23 +132,28 @@ int build_plan(const rk_npu_mm_desc& src, const rk_npu_mm_options& opt,
     if (mask != 1 && mask != 2 && mask != 4 && mask != 3 && mask != 7)
         return RK_NPU_ERR_PARAM;
     for (auto layout : {o.a_layout, o.c_layout})
-        if (layout != RK_NPU_MM_LAYOUT_NORMAL && layout != RK_NPU_MM_LAYOUT_NATIVE)
+        if (layout < RK_NPU_MM_LAYOUT_NORMAL || layout > RK_NPU_MM_LAYOUT_PANEL16)
             return RK_NPU_ERR_PARAM;
     const int align_n = align_up(d.N, 32);
     if (o.n_tile < 0 || o.n_tile > align_n || o.n_tile % 32 ||
         o.split_k < -1 || o.split_k > 3) return RK_NPU_ERR_PARAM;
-    if (o.split_k == -1) {
+    if (p.k_tile) {
+        if (d.a_type != RK_NPU_MM_F16 || p.k_tile < 32 || p.k_tile % 32 ||
+            p.k_tile >= d.K || o.split_k >= 2) return RK_NPU_ERR_PARAM;
+        o.split_k = 0;
+    } else if (o.split_k == -1) {
         const char* env = std::getenv("RK_NPU_MM_SPLIT_K");
         if (!env || !std::strcmp(env, "1")) o.split_k = 1;
         else if (!std::strcmp(env, "0")) o.split_k = 0;
         else return RK_NPU_ERR_PARAM;
     }
     const int cores = __builtin_popcount(mask);
-    int splits = o.split_k >= 2 ? o.split_k :
+    int splits = p.k_tile ? ceil_div(d.K,p.k_tile) : o.split_k >= 2 ? o.split_k :
         (o.split_k && d.K >= 2048 && d.batch_count < cores ? cores : 1);
-    if (splits > cores || (splits > 1 && d.K < splits * ka)) return RK_NPU_ERR_PARAM;
+    if ((!p.k_tile && splits > cores) || splits > 32 ||
+        (!p.k_tile && splits > 1 && d.K < splits * ka)) return RK_NPU_ERR_PARAM;
     p.info.split_count = splits;
-    p.info.part_k = splits == 1 ? d.K : align_up(ceil_div(d.K, splits), ka);
+    p.info.part_k = p.k_tile ? p.k_tile : splits == 1 ? d.K : align_up(ceil_div(d.K, splits), ka);
     // K=5120 unsplit timed out in the initial TF32 CBUF recipe. Keep each
     // slice within the validated range; never silently force another split.
     if (tf32 && align_up(p.info.part_k, 16) > 4096) return RK_NPU_MM_ERR_UNSUPPORTED;
@@ -151,17 +162,15 @@ int build_plan(const rk_npu_mm_desc& src, const rk_npu_mm_options& opt,
     if (tasks_bound > INT_MAX / 112) return RK_NPU_MM_ERR_UNSUPPORTED;
     p.items = d.batch_count * splits;
     rk_npu_matmul_f16_config_init(&p.cfg, d.M, d.N, p.info.part_k, RK_NPU_FUSE_NONE);
-    p.cfg.a_layout = o.a_layout == RK_NPU_MM_LAYOUT_NATIVE ?
-        RK_NPU_F16_A_LAYOUT_NATIVE_K8_M8 : RK_NPU_F16_A_LAYOUT_NORMAL;
-    p.cfg.d_layout = o.c_layout == RK_NPU_MM_LAYOUT_NATIVE ?
-        RK_NPU_F16_D_LAYOUT_NATIVE_N8_M8 : RK_NPU_F16_D_LAYOUT_NORMAL_PADDED;
+    p.cfg.a_layout = static_cast<rk_npu_f16_a_layout>(o.a_layout);
+    p.cfg.d_layout = static_cast<rk_npu_f16_d_layout>(o.c_layout);
     p.cfg.n_tile = o.n_tile;
     p.cfg.core_mask = mask;
     p.cfg.timeout_ms = o.timeout_ms;
     const auto precision = precision_for(d.a_type);
-    int rc = detail::float_batch_query(1, &p.cfg, precision, &p.one);
+    int rc = detail::float_batch_query(1, &p.cfg, precision, &p.one, p.task_m_tile);
     if (rc) return rc;
-    rc = detail::float_batch_query(p.items, &p.cfg, precision, &p.info.device);
+    rc = detail::float_batch_query(p.items, &p.cfg, precision, &p.info.device, p.task_m_tile);
     if (rc) return rc;
     const auto& z = p.info.device;
     for (auto bytes : {z.input_bytes, z.weight_bytes, z.output_bytes,
@@ -224,8 +233,8 @@ int pack_typed(const rk_npu_mm_plan* p, const void* host, uint64_t bytes,
             for (int k = 0; k < valid_k; ++k) {
                 const uint64_t s = d.trans_a ? (uint64_t)(k0 + k) * d.lda + u :
                                                (uint64_t)u * d.lda + k0 + k;
-                const uint64_t t = i.options.a_layout == RK_NPU_MM_LAYOUT_NATIVE ?
-                    ((uint64_t)(k / atom) * d.M + u) * atom + k % atom : (uint64_t)u * ak + k;
+                const uint64_t t = i.options.a_layout != RK_NPU_MM_LAYOUT_NORMAL ?
+                    detail::float_native_offset(d.M, ak, u, k, detail::float_panel_width(i.options.a_layout), atom) : (uint64_t)u * ak + k;
                 out[t] = in[s];
             }
         }
@@ -299,6 +308,15 @@ int submit(rk_npu_mm_workspace& w, rk_npu_mem* a, rk_npu_mem* b, rk_npu_mem* c) 
     if (rc) return rc;
     return detail::float_batch_run(w.domain->ctx, w.execution, a, b, c);
 }
+int packed_compatible(const rk_npu_mm_workspace& w,const rk_npu_mm_packed_b& packed) {
+    const auto& i=w.plan.info;const auto& q=packed.plan.info;
+    if(packed.domain->ctx!=w.domain->ctx)return RK_NPU_ERR_PARAM;
+    if(packed.domain->id!=w.domain->id)return RK_NPU_ERR_DOMAIN;
+    return q.desc.a_type!=i.desc.a_type || q.desc.b_type!=i.desc.b_type ||
+        q.desc.c_type!=i.desc.c_type || q.desc.K!=i.desc.K || q.desc.N!=i.desc.N ||
+        q.desc.batch_count!=i.desc.batch_count || q.split_count!=i.split_count ||
+        q.part_k!=i.part_k ? RK_NPU_ERR_PARAM:RK_NPU_OK;
+}
 int host_run(rk_npu_mm_workspace* w, const void* a, uint64_t ab,
              const void* b, uint64_t bb, const rk_npu_mm_packed_b* packed,
              void* c, uint64_t cb) {
@@ -316,14 +334,8 @@ int host_run(rk_npu_mm_workspace* w, const void* a, uint64_t ab,
     if (overlap(a, i.host_a_bytes, c, i.host_c_bytes) ||
         (!packed && overlap(b, i.host_b_bytes, c, i.host_c_bytes))) return RK_NPU_ERR_PARAM;
     if (packed) {
-        const auto& q = packed->plan.info;
-        if (packed->domain->ctx != w->domain->ctx) return RK_NPU_ERR_PARAM;
-        if (packed->domain->id != w->domain->id) return RK_NPU_ERR_DOMAIN;
-        if (q.desc.a_type != i.desc.a_type || q.desc.b_type != i.desc.b_type ||
-            q.desc.c_type != i.desc.c_type ||
-            q.desc.K != i.desc.K || q.desc.N != i.desc.N ||
-            q.desc.batch_count != i.desc.batch_count || q.split_count != i.split_count ||
-            q.part_k != i.part_k) return RK_NPU_ERR_PARAM;
+        const int rc=packed_compatible(*w,*packed);
+        if(rc)return rc;
     }
     rk_npu_mem* weight = packed ? const_cast<rk_npu_mem*>(&packed->mem) : &w->b;
     int rc = rk_npu_mm_pack_a(&w->plan, a, ab, &w->a);
@@ -361,6 +373,25 @@ extern "C" int rk_npu_mm_plan_create(const rk_npu_mm_desc* d, const rk_npu_mm_op
     rk_npu_mm_options_init(&defaults);
     std::unique_ptr<rk_npu_mm_plan> p(new (std::nothrow) rk_npu_mm_plan);
     if (!p) return RK_NPU_ERR_NOMEM;
+    int rc = build_plan(*d, o ? *o : defaults, *p);
+    if (!rc) *out = p.release();
+    return rc;
+}
+extern "C" int rk_npu_mm_plan_create_tiled(const rk_npu_mm_desc* d, const rk_npu_mm_options* o,
+    int task_m_tile, rk_npu_mm_plan** out) {
+    return rk_npu_mm_plan_create_partitioned(d,o,task_m_tile,0,out);
+}
+extern "C" int rk_npu_mm_plan_create_partitioned(const rk_npu_mm_desc* d, const rk_npu_mm_options* o,
+    int task_m_tile,int k_tile,rk_npu_mm_plan** out) {
+    if (!out) return RK_NPU_ERR_PARAM;
+    *out = nullptr;
+    if (!d || task_m_tile < 0 || k_tile < 0) return RK_NPU_ERR_PARAM;
+    rk_npu_mm_options defaults;
+    rk_npu_mm_options_init(&defaults);
+    std::unique_ptr<rk_npu_mm_plan> p(new (std::nothrow) rk_npu_mm_plan);
+    if (!p) return RK_NPU_ERR_NOMEM;
+    p->task_m_tile = task_m_tile;
+    p->k_tile = k_tile;
     int rc = build_plan(*d, o ? *o : defaults, *p);
     if (!rc) *out = p.release();
     return rc;
@@ -404,8 +435,8 @@ extern "C" int rk_npu_mm_unpack_c(const rk_npu_mm_plan* p, const rk_npu_mem* pac
         const int batch = row / d.M, m = row % d.M;
         for (int n = 0; n < d.N; ++n) {
             uint64_t offset;
-            if (i.options.c_layout == RK_NPU_MM_LAYOUT_NATIVE)
-                offset = ((uint64_t)(n / 8) * d.M + m) * 8 + n % 8;
+            if (i.options.c_layout != RK_NPU_MM_LAYOUT_NORMAL)
+                offset = detail::float_native_offset(d.M, an, m, n, detail::float_panel_width(i.options.c_layout));
             else {
                 const int n0 = n / nt * nt, width = std::min(nt, an - n0);
                 offset = (uint64_t)d.M * n0 + (uint64_t)m * width + n - n0;
@@ -442,7 +473,7 @@ extern "C" int rk_npu_mm_workspace_create(rk_npu_iommu_domain* domain,
         }
         if (rc) return rc;
         const auto precision = precision_for(p->info.desc.a_type);
-        rc = detail::float_batch_prepare(domain, p->items, &p->cfg, precision, &w->execution);
+        rc = detail::float_batch_prepare(domain, p->items, &p->cfg, precision, &w->execution, p->task_m_tile);
         if (rc) return rc;
         *out = w.release(); return RK_NPU_OK;
     } catch (const std::bad_alloc&) { return RK_NPU_ERR_NOMEM; }
@@ -476,10 +507,96 @@ extern "C" int rk_npu_mm_run_packed_b(rk_npu_mm_workspace* w, const void* a, uin
     if (!b) return RK_NPU_ERR_PARAM;
     return host_run(w, a, ab, nullptr, 0, b, c, cb);
 }
+extern "C" int rk_npu_mm_run_packed_b_f32(rk_npu_mm_workspace* w, const float* a,
+    const rk_npu_mm_packed_b* b, const float* bias, float* c, int rows) {
+    if (!w || !a || !b || !c) return RK_NPU_ERR_PARAM;
+    BusyGuard lock(w);
+    if (!lock.w) return RK_NPU_ERR_BUSY;
+    const auto& p = w->plan;
+    const auto& i = p.info;
+    const auto& d = i.desc;
+    if (w->mode != RK_NPU_MM_HOST_PACKED_B || rows < 1 || rows > d.M ||
+        d.batch_count != 1 || d.trans_a || d.lda != uint64_t(d.K) || d.ldc != uint64_t(d.N))
+        return RK_NPU_ERR_PARAM;
+    if (d.a_type != RK_NPU_MM_F16 || i.split_count != 1) return RK_NPU_MM_ERR_UNSUPPORTED;
+    const uint64_t ab = uint64_t(rows) * d.K * 4, cb = uint64_t(rows) * d.N * 4;
+    if (!addressable(a, ab, 4) || !addressable(c, cb, 4) || overlap(a, ab, c, cb)) return RK_NPU_ERR_PARAM;
+    const auto& q = b->plan.info;
+    if (b->domain->ctx != w->domain->ctx) return RK_NPU_ERR_PARAM;
+    if (b->domain->id != w->domain->id) return RK_NPU_ERR_DOMAIN;
+    if (q.desc.a_type != d.a_type || q.desc.N != d.N || q.desc.K != d.K ||
+        q.desc.batch_count != 1 || q.split_count != 1) return RK_NPU_ERR_PARAM;
+    auto* input = static_cast<uint16_t*>(w->a.vaddr);
+    const int ak = align_up(d.K, 32), an = align_up(d.N, 32);
+    const int aw = detail::float_panel_width(i.options.a_layout);
+#pragma omp parallel for schedule(static) if(uint64_t(d.M) * ak >= (1u << 18))
+    for (int rb = 0; rb < ceil_div(d.M, 8); ++rb) {
+        for (int m = rb * 8; m < std::min(d.M, rb * 8 + 8); ++m) {
+            for (int k = 0; k < ak; k += 8) {
+                uint16_t value[8]{};
+                if (m < rows) {
+                    int j = 0;
+#if defined(__aarch64__)
+                    if (k + 8 <= d.K) {
+                        const auto lo = vcvt_f16_f32(vld1q_f32(a + size_t(m) * d.K + k));
+                        const auto hi = vcvt_f16_f32(vld1q_f32(a + size_t(m) * d.K + k + 4));
+                        vst1q_u16(value, vreinterpretq_u16_f16(vcombine_f16(lo, hi)));
+                        j = 8;
+                    }
+#endif
+                    for (; j < 8 && k + j < d.K; ++j) value[j] = bits::float_to_half(a[size_t(m) * d.K + k + j]);
+                }
+                const uint64_t off = i.options.a_layout == RK_NPU_MM_LAYOUT_NORMAL
+                    ? uint64_t(m) * ak + k : detail::float_native_offset(d.M, ak, m, k, aw);
+                std::memcpy(input + off, value, sizeof(value));
+            }
+        }
+    }
+    int rc = rk_npu_mem_sync(w->domain->ctx, &w->a, RK_NPU_SYNC_TO_DEVICE);
+    if (!rc) rc = submit(*w, &w->a, const_cast<rk_npu_mem*>(&b->mem), &w->c);
+    if (!rc) rc = rk_npu_mem_sync(w->domain->ctx, &w->c, RK_NPU_SYNC_FROM_DEVICE);
+    if (rc) return rc;
+    const auto* input_c = static_cast<const uint16_t*>(w->c.vaddr);
+    const int nt = i.options.n_tile ? i.options.n_tile : an;
+    const int cw = detail::float_panel_width(i.options.c_layout);
+#pragma omp parallel for schedule(static) if(uint64_t(rows) * d.N >= (1u << 18))
+    for (int rb = 0; rb < ceil_div(rows, 4); ++rb) {
+        for (int n = 0; n < d.N; n += 8) {
+            const int n0 = n / nt * nt, width = std::min(nt, an - n0);
+            for (int m = rb * 4; m < std::min(rows, rb * 4 + 4); ++m) {
+                const uint64_t off = i.options.c_layout == RK_NPU_MM_LAYOUT_NORMAL
+                    ? uint64_t(d.M) * n0 + uint64_t(m) * width + n - n0
+                    : detail::float_native_offset(d.M, an, m, n, cw);
+                const auto* src = input_c + off;
+                int j = 0;
+#if defined(__aarch64__)
+                if (n + 8 <= d.N) {
+                    const auto v = vreinterpretq_f16_u16(vld1q_u16(src));
+                    auto lo = vcvt_f32_f16(vget_low_f16(v)), hi = vcvt_f32_f16(vget_high_f16(v));
+                    if (bias) { lo = vaddq_f32(lo, vld1q_f32(bias + n)); hi = vaddq_f32(hi, vld1q_f32(bias + n + 4)); }
+                    vst1q_f32(c + size_t(m) * d.N + n, lo); vst1q_f32(c + size_t(m) * d.N + n + 4, hi);
+                    j = 8;
+                }
+#endif
+                for (; j < 8 && n + j < d.N; ++j)
+                    c[size_t(m) * d.N + n + j] = bits::half_to_float(src[j]) + (bias ? bias[n + j] : 0.f);
+            }
+        }
+    }
+    return RK_NPU_OK;
+}
 extern "C" int rk_npu_mm_run_device(rk_npu_mm_workspace* w, rk_npu_mem* a,
     rk_npu_mem* b, rk_npu_mem* c) {
     if (!w) return RK_NPU_ERR_PARAM;
     BusyGuard lock(w);
     if (!lock.w) return RK_NPU_ERR_BUSY;
     return submit(*w, a, b, c);
+}
+extern "C" int rk_npu_mm_run_device_packed_b(rk_npu_mm_workspace* w,rk_npu_mem* a,
+    const rk_npu_mm_packed_b* b,rk_npu_mem* c) {
+    if(!w || !b)return RK_NPU_ERR_PARAM;
+    BusyGuard lock(w);
+    if(!lock.w)return RK_NPU_ERR_BUSY;
+    const int rc=packed_compatible(*w,*b);
+    return rc?rc:submit(*w,a,const_cast<rk_npu_mem*>(&b->mem),c);
 }

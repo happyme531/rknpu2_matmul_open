@@ -24,7 +24,8 @@ typedef enum {
     RK_NPU_MM_TF32 = 6 /* FP32 input container, TF32 arithmetic */
 } rk_npu_mm_dtype;
 typedef enum {
-    RK_NPU_MM_LAYOUT_NORMAL = 0, RK_NPU_MM_LAYOUT_NATIVE = 1
+    RK_NPU_MM_LAYOUT_NORMAL = 0, RK_NPU_MM_LAYOUT_NATIVE = 1,
+    RK_NPU_MM_LAYOUT_PANEL8 = 2, RK_NPU_MM_LAYOUT_PANEL16 = 3
 } rk_npu_mm_layout;
 
 typedef struct rk_npu_mm_desc {
@@ -87,6 +88,18 @@ void rk_npu_mm_options_init(rk_npu_mm_options*);
  * Every create function sets *out=NULL on failure and returns an error code. */
 int rk_npu_mm_plan_create(const rk_npu_mm_desc*, const rk_npu_mm_options*,
                           rk_npu_mm_plan** out);
+/* Explicit hardware task M cap; 0 keeps the CBUF-derived default. Panels
+ * require physical M divisible by their width and round the task cap down
+ * to that width (a resulting zero cap is invalid). No ABI change
+ * to existing descriptors/options or the ordinary plan factory. */
+int rk_npu_mm_plan_create_tiled(const rk_npu_mm_desc*, const rk_npu_mm_options*,
+                                int task_m_tile, rk_npu_mm_plan** out);
+/* Explicit FP16 K partition, independent of the number of permitted cores.
+ * k_tile is 32-aligned, smaller than K, and produces at most 32 partials.
+ * options.split_k must not select a second split policy. Device output still
+ * contains FP16 partials; host unpack reduces them in FP32 as usual. */
+int rk_npu_mm_plan_create_partitioned(const rk_npu_mm_desc*, const rk_npu_mm_options*,
+    int task_m_tile, int k_tile, rk_npu_mm_plan** out);
 int rk_npu_mm_plan_get_info(const rk_npu_mm_plan*, rk_npu_mm_info*);
 void rk_npu_mm_plan_free(rk_npu_mm_plan*);
 
@@ -121,12 +134,22 @@ int rk_npu_mm_run(rk_npu_mm_workspace*, const void* A, uint64_t a_bytes,
                   const void* B, uint64_t b_bytes, void* C, uint64_t c_bytes);
 int rk_npu_mm_run_packed_b(rk_npu_mm_workspace*, const void* A, uint64_t a_bytes,
                            const rk_npu_mm_packed_b*, void* C, uint64_t c_bytes);
+/* Compact single-MM FP32 host IO, with conversion fused into device pack and
+ * output collection. Unsplit FP16 only; other precision/split combinations
+ * return MM_ERR_UNSUPPORTED. rows<=plan M;
+ * absent tail rows are zero-filled. Optional bias[N] remains FP32. */
+int rk_npu_mm_run_packed_b_f32(rk_npu_mm_workspace*, const float* A,
+    const rk_npu_mm_packed_b*, const float* bias, float* C, int rows);
 /* Any workspace mode. Device buffers must match this plan's packed layouts,
  * ctx/domain and queried sizes; output must not overlap either input.
  * Caller performs all data-buffer cache/ownership transitions. No pack, sync
  * or reduction occurs here; C holds c_type partials when split_count>1. */
 int rk_npu_mm_run_device(rk_npu_mm_workspace*, rk_npu_mem* A,
                          rk_npu_mem* B, rk_npu_mem* C);
+/* Device A/C with an immutable resident packed B; same layout, ownership and
+ * partial-output contract as run_device. No data pack, cache sync or reduce. */
+int rk_npu_mm_run_device_packed_b(rk_npu_mm_workspace*, rk_npu_mem* A,
+    const rk_npu_mm_packed_b*, rk_npu_mem* C);
 
 #ifdef __cplusplus
 }

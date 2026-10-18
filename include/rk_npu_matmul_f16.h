@@ -31,12 +31,18 @@ typedef enum {
     RK_NPU_F16_A_LAYOUT_NORMAL = 0,
     /* Native feature layout: A_native[k/8][m][k%8]. */
     RK_NPU_F16_A_LAYOUT_NATIVE_K8_M8 = 1,
+    /* Row panels: [m/panel][aligned_K/8][panel][8]; M must be divisible by panel width. */
+    RK_NPU_F16_A_LAYOUT_PANEL8 = 2,
+    RK_NPU_F16_A_LAYOUT_PANEL16 = 3,
 } rk_npu_f16_a_layout;
 
 typedef enum {
     RK_NPU_F16_D_LAYOUT_NORMAL_PADDED = 0,
     /* Native output layout: D_native[n/8][m][n%8]. */
     RK_NPU_F16_D_LAYOUT_NATIVE_N8_M8 = 1,
+    /* Row panels: [m/panel][aligned_N/8][panel][8]; FP16 only. */
+    RK_NPU_F16_D_LAYOUT_PANEL8 = 2,
+    RK_NPU_F16_D_LAYOUT_PANEL16 = 3,
 } rk_npu_f16_d_layout;
 
 /*

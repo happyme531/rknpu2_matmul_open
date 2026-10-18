@@ -190,7 +190,7 @@ struct Graph {
     double submit(int stage=0);
     void stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
     void center_scores(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
-    void finish(float* output,int tensor_rows=0,int tensor_offset=0);
+    void finish(void* output,int tensor_rows=0,int tensor_offset=0,bool half_output=false);
 };
 struct Workspace {
     Lease lease;
@@ -202,10 +202,10 @@ struct Workspace {
     bool full_causal_prefill=false; // MLA query chunks reuse one valid-KV graph.
     Workspace(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,Shape s={}):lease(d),cfg(c),shape(s){}
     void geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t);
-    rk_npu_attention_f16_timings run(Cache& cache,const uint16_t* q,int rows,int start,float* output,
-        const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows=0,int tensor_offset=0);
-    rk_npu_attention_f16_timings run_gqa(Cache& cache,const uint16_t* q,int rows,int start,float* output,
-        const rk_npu_attention_f16_boolean_mask* mask);
+    rk_npu_attention_f16_timings run(Cache& cache,const uint16_t* q,int rows,int start,void* output,
+        const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows=0,int tensor_offset=0,bool half_output=false);
+    rk_npu_attention_f16_timings run_gqa(Cache& cache,const uint16_t* q,int rows,int start,void* output,
+        const rk_npu_attention_f16_boolean_mask* mask,bool half_output=false);
     void prepare_gqa(Cache& cache,int rows,int start);
 };
 inline void context(rk_npu_ctx* ctx,rk_npu_iommu_domain* d){if(!ctx || ctx!=d->ctx)throw Error{RK_NPU_ERR_PARAM};}

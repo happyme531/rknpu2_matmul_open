@@ -119,6 +119,7 @@ Runtime settings are described in [ENV.md](ENV.md) and the operator guides.
 | Experimental FP16 Gated MLA | [rk_npu_mla_f16.h](include/rk_npu_mla_f16.h) | Ling tiny H16/QK192/V128, expanded or absorbed latent512 KV; [guide](docs/MLA.md) |
 | Scalar GDN prefill | [rk_npu_gdn.h](include/rk_npu_gdn.h) | C7 Hk16/Hv32, d128; ordinary/compensated TF32, canonical FP32 state, fused CPU Conv/SiLU/L2 producer; [guide](docs/GDN.md) |
 | Unified raw MM/BMM (new) | [rk_npu_mm.h](include/rk_npu_mm.h) | FP16/BF16/TF32, transpose/strides, dynamic or typed packed B, multicore and default-enabled automatic split-K; [guide](docs/MM.md) |
+| Floating MM autotuning | [rk_npu_mm_tune.h](include/rk_npu_mm_tune.h) | Static FP16/BF16 weights, complete-call layout/tile search, resident weights and load-only profiles; FP16 supports device partial reduction; [guide](docs/MM.md#浮点-mm-显式自动调优) |
 | Legacy INT8 BMM | [rk_npu_matmul.h](include/rk_npu_matmul.h) | Distinct weights per batch item |
 | Add + RMSNorm | [rk_npu_add_rmsnorm_f16.h](include/rk_npu_add_rmsnorm_f16.h) | Fixed shapes: M=1/128, D=4096, eps=1e-5 |
 

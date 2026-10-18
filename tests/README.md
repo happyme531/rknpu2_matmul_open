@@ -18,6 +18,9 @@ Two executables sweep the `int8 × int8 → fp32` matmul over a wide M / N / K g
 | `test_mm --cpu` / `--board` | FP16/BF16 MM/BMM: transpose/strides, broadcast, split-K, typed packed B reuse, device mode, conversion/range and ownership; only `--cpu` is registered with CTest |
 | `test_mm_tf32 --cpu` / `--board` | TF32 dtype with FP32 containers/output: byte-exact packing oracle, K16 tails, multi-core/BMM/split-K, truncation boundaries, ranges and mixed-weight rejection |
 | `test_mm_header_c` | new raw MM/BMM header alongside legacy C headers |
+| `test_mm_tune --cpu` | floating-MM policy, fallback and cache-miss validation without device work; included in CTest |
+| `test_mm_tune --fp16` / `--bf16` | explicit dtype tuning, full-output oracle, cache invalidation, affinity restoration and resident-weight lifetime; BF16 runs only when selected |
+| `test_mm_tune --panel-fp16` / `--k-tiles` | FP16 panel/task/FP32-IO layouts and partial/device-reduce regressions, including tails and packed-weight mismatches |
 | `bench_f16` | explicit FP16 shape benchmark with normal/native A/D, cacheable memory, batch, multicore, N tiling, and split-K |
 | `test_quant_matmul` | board correctness smoke for typed APIs, weight/workspace sharing, mismatch/BUSY guards, 100 domain switches, and autotuners |
 | `tune_quant_matmul` | CLI for single-call pipelined autotuning of `i8i8i32`, dynamic `f16i8f16`, or static-per-token `f16i8f16` |

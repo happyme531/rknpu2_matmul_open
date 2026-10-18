@@ -248,9 +248,9 @@ void f16_pack_a_normal_batch(int B, int M, int K, int align_in,
 void f16_pack_a_normal_split(int M, int K, int split_count, int part_k,
                              const uint16_t* src, uint16_t* dst);
 void f16_pack_a_native_k8_m8(int M, int K, int align_in,
-                             const uint16_t* src, uint16_t* dst);
+                             const uint16_t* src, uint16_t* dst, int panel_rows = 0);
 void f16_pack_a_native_k8_m8_batch(int B, int M, int K, int align_in,
-                                   const uint16_t* src, uint16_t* dst);
+                                   const uint16_t* src, uint16_t* dst, int panel_rows = 0);
 void f16_pack_b_native_n16_k32(int K, int N, int align_in, int align_out,
                                const uint16_t* src, uint16_t* dst);
 /* Update compact src[rows,N] at rows [first,first+rows) of a native B.
@@ -294,12 +294,12 @@ void f16_unpack_d_f32_compact_strided(int M, int N, int align_out,
                                       int dst_row_stride, int dst_col_offset,
                                       float* dst);
 void f16_unpack_d_native_n8_m8(int M, int N,
-                               const uint16_t* src, uint16_t* dst);
+                               const uint16_t* src, uint16_t* dst, int panel_rows = 0);
 void f16_unpack_d_native_n8_m8_batch(int B, int M, int N,
                                      uint64_t src_batch_stride,
-                                     const uint16_t* src, uint16_t* dst);
+                                     const uint16_t* src, uint16_t* dst, int panel_rows = 0);
 void f16_unpack_d_f32_native_n8_m8(int M, int N,
-                                   const uint16_t* src, float* dst);
+                                   const uint16_t* src, float* dst, int panel_rows = 0);
 /* Sum split-major compact FP16 partials in FP32, de-pad rows, then emit one
  * compact row-major result.  src_split_stride is measured in uint16_t
  * elements and normally equals M*align_out. */

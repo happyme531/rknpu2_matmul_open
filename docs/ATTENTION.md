@@ -129,6 +129,11 @@ four per KV head, and output buffers retain their existing native layout.
 Core partitions write disjoint head ranges; there are no cross-core intermediates
 or device barriers. All partitions are submitted together in one blocking ioctl;
 CPU output synchronization and FP32 accumulation/normalization happen once.
+`rk_npu_attention_f16_run_half` uses the same computation and writes the final
+normalized result directly as compact FP16, without a full FP32 output tensor.
+The ordinary `run` entry point continues to return FP32. The `query` size's
+`output_bytes` describes that FP32 result; callers of `run_half` allocate two
+bytes per logical output element.
 
 Each core's PC tail is terminated separately. Driver subcore slots follow the
 existing board-validated ABI: 0/1 for dual core, 2/3/4 for triple core, and the

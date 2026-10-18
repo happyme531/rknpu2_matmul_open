@@ -658,7 +658,7 @@ void Graph::center_scores(int start,const rk_npu_attention_f16_boolean_mask* mas
     }
     if(!finite.load())throw Error{RK_NPU_ERR_PARAM};
 }
-void Graph::finish(float* output,int tensor_rows,int tensor_offset){
+void Graph::finish(void* output,int tensor_rows,int tensor_offset,bool half_output){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.output_finish", "query_rows", rows);
     const size_t stride=size_t(shape.value_dim+32)*m,count=sum.size();
     const int output_stride=tensor_rows?tensor_rows:rows;
@@ -682,14 +682,19 @@ void Graph::finish(float* output,int tensor_rows,int tensor_offset){
             const float* correction=lut?bound->value_sum(shape.shared_kv?0:hi,span):nullptr;
             for(int cb=0;cb<shape.value_dim/8;++cb){
                 const auto* src=sum.data()+size_t(cb)*m*8+r*8;
-                auto* dst=output+((size_t(shape.first_head(cfg,hi))+r/rows)*output_stride+tensor_offset+r%rows)*shape.value_dim+cb*8;
+                const size_t target=((size_t(shape.first_head(cfg,hi))+r/rows)*output_stride+tensor_offset+r%rows)*shape.value_dim+cb*8;
 #ifdef ATTENTION_NEON
                 auto lo=vld1q_f32(src),high=vld1q_f32(src+4);
                 if(lut){lo=vsubq_f32(lo,vmulq_n_f32(vld1q_f32(correction+cb*8),delta));
                     high=vsubq_f32(high,vmulq_n_f32(vld1q_f32(correction+cb*8+4),delta));}
-                vst1q_f32(dst,vmulq_n_f32(lo,inverse));vst1q_f32(dst+4,vmulq_n_f32(high,inverse));
+                lo=vmulq_n_f32(lo,inverse);high=vmulq_n_f32(high,inverse);
+                if(half_output)vst1q_u16(static_cast<uint16_t*>(output)+target,
+                    vreinterpretq_u16_f16(vcombine_f16(vcvt_f16_f32(lo),vcvt_f16_f32(high))));
+                else {auto* dst=static_cast<float*>(output)+target;vst1q_f32(dst,lo);vst1q_f32(dst+4,high);}
 #else
-                for(int j=0;j<8;++j)dst[j]=(src[j]-(lut?delta*correction[cb*8+j]:0))*inverse;
+                for(int j=0;j<8;++j){const float value=(src[j]-(lut?delta*correction[cb*8+j]:0))*inverse;
+                    if(half_output)static_cast<uint16_t*>(output)[target+j]=half(value);
+                    else static_cast<float*>(output)[target+j]=value;}
 #endif
             }
         }
@@ -724,8 +729,8 @@ void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_ti
     }
     t.tail_stage_us=elapsed(a,b);t.prepare_us=elapsed(b,Clock::now());t.compute_length=span;t.tasks=graph->tasks;
 }
-rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,int rows,int start,float* output,
-    const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows,int tensor_offset){
+rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,int rows,int start,void* output,
+    const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows,int tensor_offset,bool half_output){
     RK_NPU_TRACE_EVENT("rknpu", "attention.run", "query_rows", rows, "query_start", start,
         "query_heads", cfg.query_heads, "kv_heads", cfg.kv_heads,
         "head_dim", cfg.head_dim, "kv_length", cache.length,
@@ -760,7 +765,7 @@ rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,i
     { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.output_sync");
       graph->partial.range(0,size_t(cfg.kv_heads)*graph->blocks*(shape.value_dim+32)*graph->m*2,RK_NPU_SYNC_FROM_DEVICE); }
     auto synced=Clock::now();
-    graph->finish(output,tensor_rows,tensor_offset);auto done=Clock::now();t.mask_update_us=elapsed(prepared,masked);t.query_pack_us=elapsed(masked,packed);
+    graph->finish(output,tensor_rows,tensor_offset,half_output);auto done=Clock::now();t.mask_update_us=elapsed(prepared,masked);t.query_pack_us=elapsed(masked,packed);
     t.submit_us=elapsed(packed,computed);t.output_sync_us=elapsed(computed,synced);t.finish_us=elapsed(synced,done);t.total_us=elapsed(begin,done);return t;
 }
 
@@ -820,15 +825,15 @@ void Workspace::prepare_gqa(Cache& cache,int rows,int start){
         rk_npu_attention_f16_timings part{};geometry(cache,std::min(block_rows,rows-first),start+first,part);
     }
 }
-rk_npu_attention_f16_timings Workspace::run_gqa(Cache& cache,const uint16_t* query,int rows,int start,float* output,
-    const rk_npu_attention_f16_boolean_mask* mask){
-    if(rows==1)return run(cache,query,rows,start,output,mask);
+rk_npu_attention_f16_timings Workspace::run_gqa(Cache& cache,const uint16_t* query,int rows,int start,void* output,
+    const rk_npu_attention_f16_boolean_mask* mask,bool half_output){
+    if(rows==1)return run(cache,query,rows,start,output,mask,0,0,half_output);
     if(!query || !output)throw Error{RK_NPU_ERR_PARAM};
     compatible(*this,cache);validate_mask(cfg,mask,rows,cache.length);const auto begin=Clock::now();
     const int length=prefix_length(cfg,cache,rows,start);int block_rows;rk_npu_attention_f16_sizes sizes{};
     check(query_gqa(cfg,cache.capacity,rows,length,sizes,block_rows));
     const double planning_us=elapsed(begin,Clock::now());
-    if(block_rows==rows){auto t=run(cache,query,rows,start,output,mask);
+    if(block_rows==rows){auto t=run(cache,query,rows,start,output,mask,0,0,half_output);
         t.prepare_us+=planning_us;t.total_us=elapsed(begin,Clock::now());return t;}
     rk_npu_attention_f16_timings total{};
     total.prepare_us=planning_us;
@@ -836,7 +841,7 @@ rk_npu_attention_f16_timings Workspace::run_gqa(Cache& cache,const uint16_t* que
         const int count=std::min(block_rows,rows-first);
         auto view=mask?*mask:rk_npu_attention_f16_boolean_mask{};
         if(mask && view.query_rows!=1)view.query_offset+=first;
-        add_timings(total,run(cache,query,count,start+first,output,mask?&view:nullptr,rows,first));
+        add_timings(total,run(cache,query,count,start+first,output,mask?&view:nullptr,rows,first,half_output));
     }
     total.total_us=elapsed(begin,Clock::now());return total;
 }
@@ -889,6 +894,11 @@ int rk_npu_attention_f16_run(rk_npu_ctx* ctx,rk_npu_attention_f16_workspace* w,r
     const uint16_t* q,int rows,int start,float* output,rk_npu_attention_f16_timings* timings,const rk_npu_attention_f16_boolean_mask* mask){
     if(!w || !c)return RK_NPU_ERR_PARAM;return api([&]{context(ctx,w->lease.domain);Lock a(w->busy),b(c->busy);
         const auto t=w->run_gqa(*c,q,rows,start,output,mask);if(timings)*timings=t;});
+}
+int rk_npu_attention_f16_run_half(rk_npu_ctx* ctx,rk_npu_attention_f16_workspace* w,rk_npu_attention_f16_cache* c,
+    const uint16_t* q,int rows,int start,uint16_t* output,rk_npu_attention_f16_timings* timings,const rk_npu_attention_f16_boolean_mask* mask){
+    if(!w || !c)return RK_NPU_ERR_PARAM;return api([&]{context(ctx,w->lease.domain);Lock a(w->busy),b(c->busy);
+        const auto t=w->run_gqa(*c,q,rows,start,output,mask,true);if(timings)*timings=t;});
 }
 int rk_npu_attention_f16_decode_step(rk_npu_ctx* ctx,rk_npu_attention_f16_workspace* w,rk_npu_attention_f16_cache* c,
     const uint16_t* q,const uint16_t* k,const uint16_t* v,float* output,rk_npu_attention_f16_timings* timings,const rk_npu_attention_f16_boolean_mask* mask){
