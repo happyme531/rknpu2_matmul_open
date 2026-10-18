@@ -6,7 +6,10 @@
 #include "rk_npu_matmul_f16.h"
 #include <vector>
 
+struct rk_npu_mm_packed_b;
 namespace rknpu2_matmul_open::detail {
+int float_packed_b_view(const rk_npu_mm_packed_b*, rk_npu_iommu_domain*,
+    int N, int K, const rk_npu_mem**);
 enum class FloatPrecision : uint32_t { F16 = 2, BF16 = 3, TF32 = 7 };
 /* Bound native A/B/output register body, no allocation or submit. Dimensions
  * must be positive multiples of 16 and supported by the floating backend. */

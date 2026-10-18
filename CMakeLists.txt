@@ -86,6 +86,7 @@ set(RK_NPU_SRCS
   src/rk_npu_attention_f16_cache.cpp # persistent native KV and tail staging
   src/rk_npu_mla_f16.cpp      # Ling tiny gated MLA: expanded / absorbed latent cache
   src/rk_npu_mm.cpp           # additive raw MM/BMM descriptor and FP16 executor
+  src/rk_npu_mm_gelu.cpp      # fused FP16 GEMM/bias/GELU
   src/rk_npu_mm_tune.cpp      # explicit FP16/BF16 complete-call tuning
   src/rk_npu_float_reduce.cpp # device-resident FP16 partial Add tree
   src/rk_npu_add_rmsnorm_f16.cpp)
@@ -108,6 +109,7 @@ set(RK_NPU_PUBLIC_HEADERS
   include/rk_npu_attention_f16.h
   include/rk_npu_mla_f16.h
   include/rk_npu_mm.h
+  include/rk_npu_mm_gelu.h
   include/rk_npu_mm_tune.h
   include/rk_npu_add_rmsnorm_f16.h)
 
@@ -302,6 +304,8 @@ add_executable(test_w4a8_multiplier tests/test_w4a8_multiplier.cpp)
 target_link_libraries(test_w4a8_multiplier PRIVATE rk_npu_matmul)
 add_executable(test_autotune_cpu tests/test_autotune_cpu.cpp)
 target_link_libraries(test_autotune_cpu PRIVATE rk_npu_matmul)
+add_executable(test_mm_gelu tests/test_mm_gelu.cpp)
+target_link_libraries(test_mm_gelu PRIVATE rk_npu_matmul)
 add_executable(test_mm_tune tests/test_mm_tune.cpp)
 target_link_libraries(test_mm_tune PRIVATE rk_npu_matmul)
 add_executable(test_w4a8_tune tests/test_w4a8_tune.cpp)
@@ -314,6 +318,7 @@ if(BUILD_TESTING)
   add_test(NAME w4a8_swiglu_cpu COMMAND test_w4a8_swiglu --cpu)
   add_test(NAME i4_bounds COMMAND test_i4_bounds)
   add_test(NAME autotune_cpu COMMAND test_autotune_cpu)
+  add_test(NAME mm_gelu_cpu COMMAND test_mm_gelu --cpu)
   add_test(NAME mm_tune_cpu COMMAND test_mm_tune --cpu)
 endif()
 
@@ -381,7 +386,7 @@ add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_cpu_kernels test_i4_cpu test_w4a4_linear_cpu test_w4a8_cpu
   test_w4a8_reduction test_w4a8_swiglu test_i4_bounds test_autotune_cpu test_panel_layout
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
-  test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c test_mm_tune
+  test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c test_mm_tune test_mm_gelu
   test_w4a4_linear_header_c test_moe_w8_header_c test_mm test_mm_header_c test_mm_tf32
   test_attention_f16 test_attention_f16_header_c test_mla_f16 test_mla_f16_header_c
   test_gdn test_gdn_static test_gdn_header_c)

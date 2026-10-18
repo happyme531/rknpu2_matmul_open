@@ -1,3 +1,4 @@
+#include "rk_npu_mm_gelu.h"
 #include "rk_npu_matmul_f16.h"
 #include "rk_npu_add_rmsnorm_f16.h"
 

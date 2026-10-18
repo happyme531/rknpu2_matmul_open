@@ -600,3 +600,14 @@ extern "C" int rk_npu_mm_run_device_packed_b(rk_npu_mm_workspace* w,rk_npu_mem* 
     const int rc=packed_compatible(*w,*b);
     return rc?rc:submit(*w,a,const_cast<rk_npu_mem*>(&b->mem),c);
 }
+
+int detail::float_packed_b_view(const rk_npu_mm_packed_b* b, rk_npu_iommu_domain* domain,
+    int n, int k, const rk_npu_mem** out) {
+    if (!b || !domain || !out || b->domain->ctx != domain->ctx) return RK_NPU_ERR_PARAM;
+    if (b->domain->id != domain->id) return RK_NPU_ERR_DOMAIN;
+    const auto& i = b->plan.info;
+    if (i.desc.b_type != RK_NPU_MM_F16 || i.desc.N != n || i.desc.K != k ||
+        i.desc.batch_count != 1 || i.split_count != 1) return RK_NPU_ERR_PARAM;
+    *out = &b->mem;
+    return RK_NPU_OK;
+}

@@ -1,3 +1,4 @@
+#include "rk_npu_mm_gelu.h"
 #include "rk_npu_mm_tune.h"
 #include "rk_npu_autotune_common.h"
 #include "rk_npu_autotune_cache.h"
@@ -730,4 +731,14 @@ extern "C" int rk_npu_mm_tuned_run_weights(rk_npu_mm_tuned_workspace* work,
     const int rc=rk_npu_mm_tuned_weights_match(weights,&work->strategy);if(rc)return rc;
     const auto& b=weights->variants.at(weight_partition(work->strategy));
     return rk_npu_mm_tuned_run(work,a,ab,b.get(),bias,c,cb);
+}
+
+extern "C" int rk_npu_mm_gelu_run_weights(rk_npu_mm_gelu_workspace* work,
+    const uint16_t* a, uint64_t bytes, const rk_npu_mm_tuned_weights* weights,
+    const float* bias, rk_npu_mm_gelu_view* view) {
+    if (view) *view = {};
+    if (!weights || weights->dtype != RK_NPU_MM_F16) return RK_NPU_ERR_PARAM;
+    const auto found = weights->variants.find({1, weights->K});
+    if (found == weights->variants.end()) return RK_NPU_ERR_CACHE_MISS;
+    return rk_npu_mm_gelu_run(work, a, bytes, found->second.get(), bias, view);
 }

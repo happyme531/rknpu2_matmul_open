@@ -264,3 +264,16 @@ dtype/旧 descriptor 大小/K 分片上限检查。板端 TF32、FP16/BF16、旧
 TF32 覆盖 K=4096 不分片、K=5120/11008 自动分片，以及截断边界和数值范围。
 证据见父工作区 `docs/tf32_mm_2026-09-29.md` 和
 `tools/tf32_probe/results/2026-09-29/integration/report.json`。
+
+
+## Fused FP16 GEMM + bias + GELU
+
+`rk_npu_mm_gelu.h` provides a prepared `GEMM → channel bias → tanh GELU LUT` path. It reuses a full-K `rk_npu_mm_packed_b` or the baseline allocation already held by `rk_npu_mm_tuned_weights`. Workspaces can be shared by sequential layers with the same logical M/N/K and domain; run patches weight addresses and copies only bias[N], without re-uploading weights, allocating memory, searching or touching tuning caches.
+
+Initialize `rk_npu_mm_gelu_config`, set the allowed core mask (1/2/4/3/7), then call `rk_npu_mm_gelu_prepare`. A is compact FP16, bias is compact FP32. Physical M rounds to8 and N/K to32, with zero padding. Default N tile balances aligned N over the allowed cores; explicit N tile must be32-aligned. Existing CBUF rules choose hardware M tasks. The DPU notch limits N to32768; M/K are limited to65504 and must also satisfy the ordinary floating backend's limits. This path uses full K, independently of `RK_NPU_MM_K_TILING`: nonlinear GELU cannot be applied independently to partial sums. It does not consume ordinary GEMM autotuning scores.
+
+`rk_npu_mm_gelu_run[_weights]` returns a borrowed mapped FP32 carrier view after device sync. Collect the logical output directly using the index formula in the header and multiply by `view.scale` (1/8192), optionally narrowing to FP16. Ignore padded rows/channels. The view lasts until the next run or workspace destruction; the caller must serialize both execution and consumption. The workspace retains its domain; the context must outlive all device objects.
+
+DPU processing and output use FP32 to avoid BN index-gain saturation and the direct FP16 LUT writer's zero-code anomaly. The signed Q13 LUT interpolates at1/128 steps over[-4,4], extrapolates the positive tail as identity and the negative tail as zero. Bias and GELU precede the final FP16 rounding, so this differs from a separately rounded GEMM, CPU bias and CPU tanh GELU. It is an approximation, not FP32 GELU; evaluate final model features as well as isolated operator errors. Every participating core reloads the LUT on every submit.
+
+`test_mm_gelu --cpu` checks the public contract without device access. Under an exclusive board lock, `test_mm_gelu --board` compares dense outputs with an independent double-precision oracle, covers M/N/K padding, all supported core masks, weight/bias rebinding and large positive/negative tails. No BF16 CPU arithmetic is used.
