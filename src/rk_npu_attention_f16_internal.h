@@ -3,6 +3,7 @@
 #include "rk_npu_internal.h"
 #include "rk_npu_half_bits.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -50,6 +51,14 @@ inline uint32_t core_mask(const rk_npu_attention_f16_config& c){
     uint32_t selected=c.core_mask?c.core_mask:1;
     while(c.kv_heads>0 && __builtin_popcount(selected)>c.kv_heads)selected&=~(1u<<(31-__builtin_clz(selected)));
     return selected;
+}
+inline float lut_value_limit(int kv_tile){return 32752.f/(kv_tile*1.001f);}
+inline bool lut_tasks_fit(const rk_npu_attention_f16_config& cfg,int physical_rows,
+    int span,int matmul_tasks,bool split){
+    const uint64_t extra=uint64_t(cfg.kv_heads)*
+        ceil_div(uint64_t(physical_rows)*span,uint64_t(4096))+
+        (split?__builtin_popcount(core_mask(cfg)):0);
+    return uint64_t(matmul_tasks)+extra<=4095;
 }
 inline uint64_t next_identity(){static std::atomic<uint64_t> serial{1};return serial.fetch_add(1);}
 struct Lease {
@@ -119,6 +128,7 @@ struct Cache {
     DirtySyncPolicy dirty_sync=experimental_dirty_sync_policy();
     bool lut_exp=[](){const char* p=std::getenv("RK_NPU_ATTN_LUT_EXP");return !p || !std::strcmp(p,"1");}();
     std::vector<float> value_total,value_prefix;
+    std::vector<uint16_t> value_absmax_prefix;
     uint64_t identity=next_identity();
     std::atomic<bool> busy{false};
     Buffer key,value,tail;
@@ -144,13 +154,19 @@ struct Cache {
     void stage_tail(int span);
     void write(int position,const uint16_t* k,const uint16_t* v,int source_stride,int source_position);
     void add_value_sum(const uint16_t* v,int count,int first);
+    void add_value_bound(const uint16_t* v,int count,int first);
+    // Prefix bounds for softmax mode selection; below the smallest switching
+    // threshold, the full-cache bound is also sufficient and avoids a scan.
+    void softmax_bounds(int count,uint16_t* out)const;
+    void extend_softmax_bounds(int first,int count,uint16_t* out)const;
     const float* value_sum(int hi,int span)const{
         return span>=length?value_total.data()+size_t(hi)*shape.value_dim:
             value_prefix.data()+(size_t(span/32)*h()+hi)*shape.value_dim;
     }
-    bool use_lut()const{
+    bool use_lut(const uint16_t* bounds=nullptr)const{
         if(!lut_exp || cfg.flags!=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX)return false;
-        for(int hi=0;hi<h();++hi)if(widen(value_absmax[hi])>32752.f/(cfg.kv_tile*1.001f))return false;
+        const float limit=lut_value_limit(cfg.kv_tile);
+        for(int hi=0;hi<h();++hi)if(widen((bounds?bounds:value_absmax)[hi])>limit)return false;
         return true;
     }
 };
@@ -170,21 +186,20 @@ struct Graph {
     std::vector<float> sum;
     std::vector<float> softmax_scratch;
     std::vector<Binding> bindings;
+    uint16_t value_absmax[32]{};
     Cache* bound=nullptr;
     uint64_t bound_generation=~uint64_t(0),bound_tail_generation=~uint64_t(0);
     uint64_t bound_identity=0;
     int mask_start=-1;
     rk_npu_attention_f16_boolean_mask saved_mask{};
-    bool can_lut(const Cache& cache)const{
+    bool can_lut(const Cache& cache,const uint16_t* bounds=nullptr)const{
         // Long contexts can exceed the descriptor limit after adding DPU
         // exponent tasks. Keep the existing CPU path for those geometries.
-        const uint64_t extra=uint64_t(cfg.kv_heads)*ceil_div(m*span,4096)+
-            (lut_split?__builtin_popcount(core_mask(cfg)):0);
-        return cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX && cache.use_lut() &&
-            uint64_t(matmul_tasks)+extra<=4095;
+        return cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX && cache.use_lut(bounds) &&
+            lut_tasks_fit(cfg,m,span,matmul_tasks,lut_split);
     }
-    explicit Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,int s,Cache& cache,Shape shape,Graph* reuse=nullptr);
-    void bind(Cache& cache);
+    explicit Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,int s,Cache& cache,Shape shape,Graph* reuse=nullptr,const uint16_t* bounds=nullptr);
+    void bind(Cache& cache,const uint16_t* bounds=nullptr);
     void update_mask(int start,const rk_npu_attention_f16_boolean_mask* boolean,int length);
     void pack_q(const uint16_t* query,int tensor_rows=0,int tensor_offset=0);
     double submit(int stage=0);
@@ -207,6 +222,7 @@ struct Workspace {
     rk_npu_attention_f16_timings run_gqa(Cache& cache,const uint16_t* q,int rows,int start,void* output,
         const rk_npu_attention_f16_boolean_mask* mask,bool half_output=false);
     void prepare_gqa(Cache& cache,int rows,int start);
+    int causal_rows(const Cache& cache,int rows,int start)const;
 };
 inline void context(rk_npu_ctx* ctx,rk_npu_iommu_domain* d){if(!ctx || ctx!=d->ctx)throw Error{RK_NPU_ERR_PARAM};}
 inline void compatible(const Workspace& w,const Cache& c){

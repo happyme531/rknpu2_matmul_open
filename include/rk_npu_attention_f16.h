@@ -67,8 +67,9 @@ typedef struct rk_npu_attention_f16_workspace rk_npu_attention_f16_workspace;
 void rk_npu_attention_f16_config_init(rk_npu_attention_f16_config* cfg);
 /* Pure CPU sizing/validation. kv_length is the causal prefix to compute, not
  * allocated cache capacity. Buffer sizes describe the largest internal segment;
- * output_bytes covers [query_heads,query_rows,head_dim], tasks sums the QK/PV
- * tasks in all segments. Native LUT execution adds DPU tasks at run time. */
+ * output_bytes covers [query_heads,query_rows,head_dim], tasks estimates QK/PV
+ * work for layout segments. Runtime numerical-mode splits and native LUT
+ * execution can add tasks; run timings report their actual sum. */
 int rk_npu_attention_f16_query(const rk_npu_attention_f16_config* cfg,
     int capacity, int query_rows, int kv_length, rk_npu_attention_f16_sizes* sizes);
 
@@ -107,7 +108,10 @@ int rk_npu_attention_f16_prepare_query(rk_npu_ctx* ctx,
  * query position for causal mode. Each causal row attends through query_start+row.
  * No-mask/boolean modes use all valid KV; query rows can exceed KV length.
  * The library splits query rows for native layout limits and restores compact
- * output order. Computing an earlier prefill chunk never reads reserved padding. */
+ * output order. Stable causal GQA also splits at softmax mode boundaries to
+ * retain each row's single-token AR exp/normalization path. Future KV never
+ * changes an earlier row's LUT/CPU or FP16-normalization mode.
+ * Computing an earlier prefill chunk never reads reserved padding. */
 int rk_npu_attention_f16_run(rk_npu_ctx* ctx,
     rk_npu_attention_f16_workspace* workspace, rk_npu_attention_f16_cache* cache,
     const uint16_t* q, int query_rows, int query_start, float* output,

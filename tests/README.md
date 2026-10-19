@@ -15,6 +15,7 @@ Two executables sweep the `int8 × int8 → fp32` matmul over a wide M / N / K g
 | `test_cpu_kernels` | host-only correctness/perf check for the OpenMP A/B pack and C/D unpack kernels; use `--perf` for microbench output |
 | `test_batch` | verifies batched same-shape BMM and compares B single submits vs one batched submit |
 | `test_batch_f16` | verifies distinct-weight FP16 BMM, N/M tiling, output tails, and multicore submission |
+| `test_attention_f16_causal --cpu` / `--board` | causal batch/AR equality, CPU softmax boundaries, masked future V and high-V truncate/abort; only `--cpu` is registered with CTest |
 | `test_mm --cpu` / `--board` | FP16/BF16 MM/BMM: transpose/strides, broadcast, split-K, typed packed B reuse, device mode, conversion/range and ownership; only `--cpu` is registered with CTest |
 | `test_mm_tf32 --cpu` / `--board` | TF32 dtype with FP32 containers/output: byte-exact packing oracle, K16 tails, multi-core/BMM/split-K, truncation boundaries, ranges and mixed-weight rejection |
 | `test_mm_header_c` | new raw MM/BMM header alongside legacy C headers |
@@ -221,3 +222,24 @@ checks all legal recipes against exact CPU INT32 GEMM, plus typed static/dynamic
 outputs. `tools/layout_probe/validate_autotune.py` runs the recorded shape/mask
 coverage under an exclusive lock and temporarily fixed governors, restores them
 on failure, and stops on any failing command.
+
+## Causal Attention transactions
+
+`test_attention_f16_causal --cpu` checks null-parameter rejection without opening
+a device. Native stable causal GQA owns its numerical mode selection; callers
+append a complete batch and use the ordinary Attention run API.
+
+Run `./build/test_attention_f16_causal --board` explicitly on RK3588. It acquires
+the existing lowlevel/legacy submit locks, or reuses the lowlevel lock FD passed
+by a parent runner through `LLM_INFER_LOCK_FD`. The cases compare every FP32
+output bit-for-bit with sequential AR, cover LUT-disabled/high-V/descriptor
+boundaries, and verify high-V
+partial commit/abort across K32 and KV-tile boundaries. They also cover preloaded
+single-row queries at an aligned prefix, single/dual/triple-core submissions,
+internal GQA 32+1 row splitting, and bulk append/load checkpoints retained across
+reserve and rollback.
+CPU tests cover both sides of length 1024 and the exact 3+1 split for four
+queries starting at 1021. Descriptor counts also ensure uniform short/long CPU
+batches retain batching. Future V=64/65000 exercises LUT, delayed normalization
+and probability gain transitions without affecting an earlier visible prefix.
+The test is a correctness check; it does not report performance.

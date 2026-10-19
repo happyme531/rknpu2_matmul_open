@@ -90,6 +90,7 @@ void Cache::reserve(int requested){
     nk.sync(RK_NPU_SYNC_TO_DEVICE);nv.sync(RK_NPU_SYNC_TO_DEVICE);
     key.swap(nk);value.swap(nv);capacity=next;blocks=nb;++generation;
     if(lut_exp){value_total.resize(size_t(h())*shape.value_dim);value_prefix.resize(size_t(capacity/32+1)*h()*shape.value_dim);}
+    value_absmax_prefix.resize(size_t(capacity/32+1)*h());
     tail_epoch=~uint64_t(0);
 }
 
@@ -110,8 +111,8 @@ void Cache::load(const uint16_t* k,const uint16_t* v,int count){
     reserve(count);
     poisoned=true;length=0;key.zero();value.zero();ones(value,h(),blocks,n(),cfg.kv_tile,shape.value_dim,count);
     if(lut_exp){std::fill(value_total.begin(),value_total.end(),0);add_value_sum(v,count,0);}
-    for(int hi=0;hi<h();++hi)
-        value_absmax[hi]=value_bound(v?v+size_t(hi)*count*shape.value_dim:nullptr,size_t(count)*shape.value_dim);
+    std::fill(value_absmax_prefix.begin(),value_absmax_prefix.end(),uint16_t(0));
+    add_value_bound(v,count,0);
     const int d=shape.key_dim,tile=cfg.kv_tile;
     for(int hi=0;hi<h();++hi)for(int pos=0;pos<count;++pos)for(int kb=0;kb<d/32;++kb)
         std::memcpy(key.data()+size_t(hi)*capacity*d+((size_t(pos/16)*(d/32)+kb)*16+pos%16)*32,
@@ -143,8 +144,7 @@ void Cache::append(const uint16_t* k,const uint16_t* v,int count,double* reserve
     const int dirty_sync_groups=dirty_sync.for_length(last);
     try {
         { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.cache_pack", "rows", count);
-        for(int hi=0;hi<h();++hi)
-            value_absmax[hi]=value_bound(v+size_t(hi)*count*shape.value_dim,size_t(count)*shape.value_dim,value_absmax[hi]);
+        add_value_bound(v,count,first);
         // Single-token decode has no measured packing benefit. Keep its
         // original scatter; block transposes target multi-token prefill.
         if(count==1)write(first,k,v,1,0);
@@ -224,9 +224,57 @@ void Cache::truncate(int count){
             }
         }
     }
+    // Restore the bound of exactly the retained prefix. A discarded high V
+    // must not change LUT/CPU softmax selection after transaction rollback.
+    for(int hi=0;hi<h();++hi){
+        uint16_t maximum=value_absmax_prefix[size_t(count/32)*h()+hi];
+        for(int pos=count/32*32;pos<count;++pos){
+            const int inner=pos%cfg.kv_tile;
+            const auto* src=value.data()+voffset(hi,pos/cfg.kv_tile);
+            for(int c=0;c<shape.value_dim;++c)
+                maximum=std::max(maximum,uint16_t(src[((size_t(c/16)*(cfg.kv_tile/32)+inner/32)*16+c%16)*32+inner%32]&0x7fff));
+        }
+        value_absmax[hi]=maximum;
+    }
     length=count;++epoch;dirty_first=count;dirty_count=0;tail_epoch=~uint64_t(0);
-    // CPU softmax masks retained native rows beyond length. The historical V
-    // bound remains conservative for every retained/replaced prefix.
+    // CPU softmax masks retained native rows beyond length.
+}
+
+void Cache::add_value_bound(const uint16_t* v,int count,int first){
+    for(int hi=0;hi<h();++hi){
+        uint16_t maximum=first?value_absmax[hi]:0;
+        const auto* src=v?v+size_t(hi)*count*shape.value_dim:nullptr;
+        for(int pos=0;pos<count;++pos){
+            maximum=value_bound(src?src+size_t(pos)*shape.value_dim:nullptr,shape.value_dim,maximum);
+            if((first+pos+1)%32==0)
+                value_absmax_prefix[size_t((first+pos+1)/32)*h()+hi]=maximum;
+        }
+        value_absmax[hi]=maximum;
+    }
+}
+
+void Cache::softmax_bounds(int count,uint16_t* out)const{
+    if(count<0 || count>length)throw Error{RK_NPU_ERR_PARAM};
+    for(int hi=0;hi<h();++hi){
+        out[hi]=value_absmax[hi];
+        if(count==length || widen(out[hi])<=lut_value_limit(cfg.kv_tile))continue;
+        out[hi]=value_absmax_prefix[size_t(count/32)*h()+hi];
+    }
+    extend_softmax_bounds(count/32*32,count%32,out);
+}
+
+void Cache::extend_softmax_bounds(int first,int count,uint16_t* out)const{
+    for(int hi=0;hi<h();++hi){
+        // A full-cache bound already below every switching threshold can be
+        // reused for every prefix. Otherwise continue an exact prefix maximum.
+        if(out[hi]==value_absmax[hi])continue;
+        for(int pos=first;pos<first+count;++pos){
+            const int inner=pos%cfg.kv_tile;
+            const auto* src=value.data()+voffset(hi,pos/cfg.kv_tile);
+            for(int c=0;c<shape.value_dim;++c)
+                out[hi]=std::max(out[hi],uint16_t(src[((size_t(c/16)*(cfg.kv_tile/32)+inner/32)*16+c%16)*32+inner%32]&0x7fff));
+        }
+    }
 }
 
 void Cache::add_value_sum(const uint16_t* v,int count,int first){
