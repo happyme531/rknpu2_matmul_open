@@ -1,5 +1,8 @@
 # rknpu2_matmul_open
 
+[![Proudly Vibe Coded - Plasma Mix](https://vibecoded.fyi/badges/flat/main/proudly-vibe-coded-plasma-mix.svg)](https://vibecoded.fyi/)
+[![Coded with Codex](https://vibecoded.fyi/badges/flat/agents/codex.svg)](https://vibecoded.fyi/)
+
 Fully open source high-performance matrix multiplication library for LLM inference for the RK3588 RKNPU2.
 
 ## Features
