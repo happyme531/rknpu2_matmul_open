@@ -169,8 +169,8 @@ is 61.416 versus 62.182 core-ms. The probe pins individual workers; library
 workers inherit the caller mask. These are component replays; long projected
 inputs cycle 21 saved QKV rows, with synthetic gates and initial GDN state.
 
-[Validation summary](evidence/gdn-20261018.json) records counts, numerical
-errors, paired statistics and clock restoration. `tools/summarize_gdn.py`
+Local validation records include counts, numerical errors, paired statistics
+and clock restoration. `tools/summarize_gdn.py`
 also retains full numerical records and unfiltered samples in the local result
 directory's `verification.json`.
 

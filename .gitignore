@@ -15,4 +15,5 @@
 *.log
 /.cache/
 /tests/results/
+/docs/evidence/
 /third_party/perfetto-v58.2/
