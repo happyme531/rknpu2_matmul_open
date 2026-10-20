@@ -154,6 +154,15 @@ void cpu(){
         check(rk_npu_attention_f16_query(&c,32768,1,length,&s));const int span=(length+31)/32*32;
         require(s.tasks==8*((span+4095)/4096+(span+511)/512),"long QK/PV task sizing");
     }
+    {
+        auto image=c;image.query_heads=image.kv_heads;image.mask_mode=RK_NPU_ATTENTION_F16_NO_MASK;
+        image.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;image.max_query_rows=128;
+        for(int length:{32769,65536}){
+            image.initial_capacity=image.max_capacity=(length+31)/32*32;
+            check(rk_npu_attention_f16_query(&image,image.max_capacity,128,length,&s));
+            require(s.key_bytes==uint64_t(image.kv_heads)*image.max_capacity*image.head_dim*2,"caller-sized image K/V buffers");
+        }
+    }
     c.kv_heads=32;c.query_heads=128;c.kv_tile=256;
     require(rk_npu_attention_f16_query(&c,32768,1,32768,&s)==RK_NPU_ERR_PARAM,"long task-count limit");
     c.kv_heads=8;c.query_heads=32;c.kv_tile=512;

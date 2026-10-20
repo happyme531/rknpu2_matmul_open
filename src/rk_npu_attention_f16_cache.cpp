@@ -31,7 +31,7 @@ int validate(const rk_npu_attention_f16_config& c){
        c.query_heads%c.kv_heads || c.head_dim<32 || c.head_dim%32 ||
        !std::isfinite(c.softmax_scale) || c.softmax_scale<0 ||
        c.max_query_rows<1 || c.max_query_rows>128 || c.initial_capacity<32 ||
-       c.initial_capacity%32 || c.max_capacity<c.initial_capacity || c.max_capacity>32768 ||
+       c.initial_capacity%32 || c.max_capacity<c.initial_capacity ||
        c.max_capacity%32 || (c.kv_tile!=256 && c.kv_tile!=512 && c.kv_tile!=1024 &&
        c.kv_tile!=2048 && c.kv_tile!=4096) ||
        (c.core_mask!=0 && c.core_mask!=1 && c.core_mask!=2 && c.core_mask!=3 && c.core_mask!=4 && c.core_mask!=7) ||

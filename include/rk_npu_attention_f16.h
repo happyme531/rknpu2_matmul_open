@@ -34,7 +34,7 @@ typedef struct {
     int max_query_rows;       /* logical rows per call, 1..128; default 32 */
     int kv_tile;              /* 256/512/1024/2048/4096 */
     int initial_capacity;     /* multiple of 32 */
-    int max_capacity;         /* multiple of 32, <=32768 */
+    int max_capacity;         /* caller-provided allocation bound, multiple of 32 */
     uint32_t core_mask;       /* 1/2/4, dual 3, triple 7; 0 means 1.
                               * At least one KV head per selected core. */
     uint32_t timeout_ms;
