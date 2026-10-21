@@ -23,7 +23,7 @@ typedef struct rk_npu_w4a8_config {
     int M, N, K;            /* logical token rows; K <= INT32_MAX/1024 */
     int m_tile;             /* logical tokens, legacy 1..64; _ex panel8 allows more; physical rows doubled */
     int k_tile;             /* resolved 32..2048, multiple of 32; fixed in shared weights */
-    int n_tile;             /* multiple of 64, 64..4096 */
+    int n_tile;             /* multiple of 64, 64..8128; logical N may be larger */
     uint32_t npu_core_mask; /* 1/2/4/3/7, same N64 alignment as W4A4 */
     uint32_t timeout_ms;
     int pipeline;    /* SERIAL / PIPELINED / CHAIN; CHAIN packs all K, submits once,
