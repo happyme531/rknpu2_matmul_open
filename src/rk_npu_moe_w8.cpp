@@ -293,9 +293,9 @@ struct Commands {
 };
 
 static bool valid(const rk_npu_moe_w8_weight_config& c) {
-    return c.hidden>=64 && c.hidden<=1536 && c.hidden%32==0 &&
+    return c.hidden>=64 && c.hidden%32==0 &&
         c.intermediate>=32 && c.intermediate<=512 && c.intermediate%32==0 &&
-        c.routed_experts>=1 && c.routed_experts<=128 &&
+        c.routed_experts>=1 &&
         (c.shared_expert==0 || c.shared_expert==1);
 }
 static bool same(const rk_npu_moe_w8_weight_config& a,const rk_npu_moe_w8_weight_config& b) {
@@ -366,44 +366,100 @@ static void pack_w4(int k,int n,const int8_t* src,rk_npu_mem& dst,std::vector<in
     for(int row=0;row<k;++row)for(int col=0;col<n;++col)correction[col]+=8*src[size_t(row)*n+col];
     check(rknpu2_matmul_open::detail::pack_i4_weights(k,n,0,k,k,n,src,static_cast<uint8_t*>(dst.vaddr)));
 }
+enum class Mode { W8, RoutedW4SharedW8, W4 };
+static bool expert_is_w4(Mode mode,int expert,int routed) {
+    return mode==Mode::W4 || (mode==Mode::RoutedW4SharedW8 && expert<routed);
+}
+static bool uses_w8(Mode mode,const rk_npu_moe_w8_weight_config& c) {
+    return mode==Mode::W8 || (mode==Mode::RoutedW4SharedW8 && c.shared_expert);
+}
+static int gate_tile(Mode mode,int hidden) {
+    return mode==Mode::W4?std::min(hidden,512):hidden;
+}
+static bool valid_w4(const rk_npu_moe_w8_weight_config& c) {
+    return valid(c) && c.hidden%64==0 && c.intermediate%64==0 &&
+        c.hidden<=rknpu2_matmul_open::detail::I4_N_TILE_MAX;
+}
 struct Weights {
     Device device;
     rk_npu_moe_w8_weight_config config;
     Buffer gate,down,coeff;
+    std::vector<std::unique_ptr<Buffer>> gate_banks,down_banks;
     std::vector<rk_npu_mem> gw,dw;
     std::vector<std::vector<float>> gs,ds;
-    bool lut_scales=true,w4=false;
+    bool lut_scales=true;
+    Mode mode;
     std::vector<std::vector<int32_t>> gcor,dcor;
     Weights(rk_npu_iommu_domain* domain,const rk_npu_moe_w8_weight_config& c,
-            const rk_npu_moe_w8_expert* experts,bool mixed=false):device(domain),config(c),w4(mixed) {
+            const rk_npu_moe_w8_expert* experts,Mode recipe=Mode::W8):device(domain),config(c),mode(recipe) {
         const int H=c.hidden,N=c.intermediate,count=c.routed_experts+c.shared_expert;
-        const size_t units=mixed?size_t(c.routed_experts)+2*c.shared_expert:size_t(count)*2;
-        gate.alloc(device,units*H*N);down.alloc(device,units*N*H/2);
+        const bool w4=mode!=Mode::W8;
+        const int gate_k_tile=gate_tile(mode,H);
+        const size_t units=w4?size_t(c.routed_experts)+(mode==Mode::W4?1:2)*c.shared_expert:size_t(count)*2;
+        uint32_t bank_flags=RK_NPU_MEM_DATA_DEFAULT;
+        if(device.ctx->iommu_enabled && device.ctx->driver_version>=908)
+            bank_flags|=RK_NPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;
+        const int bank_experts=std::max<size_t>(1,(16u<<20)/(size_t(H)*N));
+        if(mode==Mode::W4) {
+            // Bound individual IOVA allocations while keeping every expert resident.
+            for(int first=0;first<count;first+=bank_experts) {
+                const size_t entries=std::min(bank_experts,count-first);
+                auto g=std::make_unique<Buffer>(),d=std::make_unique<Buffer>();
+                g->alloc(device,entries*H*N,bank_flags);
+                d->alloc(device,entries*N*H/2,bank_flags);
+                gate_banks.push_back(std::move(g));down_banks.push_back(std::move(d));
+            }
+        } else {
+            gate.alloc(device,units*H*N,bank_flags);
+            down.alloc(device,units*N*H/2,bank_flags);
+        }
         gcor.resize(count);dcor.resize(count);
         gw.resize(count);dw.resize(count);gs.resize(count);ds.resize(count);
-        if(N==512 && !mixed) {
+        if(N==512 && !w4) {
             coeff.alloc(device,size_t(count)*6144);
             std::memset(coeff.mem.vaddr,0,coeff.mem.size);
         } else lut_scales=false;
         for(int e=0;e<count;++e) {
+            const bool i4=expert_is_w4(mode,e,c.routed_experts);
+            const size_t offset=w4?size_t(e):size_t(e)*2;
+            if(mode==Mode::W4) {
+                gw[e]=gate_banks[e/bank_experts]->view(size_t(e%bank_experts)*H*N,size_t(H)*N);
+                dw[e]=down_banks[e/bank_experts]->view(size_t(e%bank_experts)*N*H/2,size_t(N)*H/2);
+            } else {
+                gw[e]=gate.view(offset*H*N,size_t(H)*N*(i4?1:2));
+                dw[e]=down.view(offset*N*H/2,size_t(N)*H/(i4?2:1));
+            }
+            if(!experts) {
+                gs[e].assign(2*N,1.f);ds[e].assign(H,1.f);gcor[e].assign(2*N,0);
+                dcor[e].assign(H,0);
+                continue;
+            }
             const auto& x=experts[e];
             if(!x.gate_up || !x.down || !x.gate_up_scales || !x.down_scales)throw Failure{RK_NPU_ERR_PARAM};
             gs[e].assign(x.gate_up_scales,x.gate_up_scales+2*N);
             ds[e].assign(x.down_scales,x.down_scales+H);
             for(const auto* scales:{&gs[e],&ds[e]})for(float s:*scales)
                 if(!(s>0) || !std::isfinite(s))throw Failure{RK_NPU_ERR_PARAM};
-            const bool i4=mixed && e<c.routed_experts;
-            const size_t offset=mixed?size_t(e):size_t(e)*2;
-            gw[e]=gate.view(offset*H*N,size_t(H)*N*(i4?1:2));
-            dw[e]=down.view(offset*N*H/2,size_t(N)*H/(i4?2:1));
-            rk_npu_matmul_i8_config gc,dc;
-            rk_npu_matmul_i8_config_init(&gc,1,2*N,H);rk_npu_matmul_i8_config_init(&dc,1,H,N);
-            if(i4) {
+            if(mode==Mode::W4) {
+                rknpu2_matmul_open::detail::I4WeightBound bound;
+                check(rknpu2_matmul_open::detail::bound_i4_weights(H,2*N,x.gate_up,gate_k_tile,bound));
+                gcor[e].assign(2*N,0);
+                for(int row=0;row<H;++row)for(int col=0;col<2*N;++col)
+                    gcor[e][col]+=8*x.gate_up[size_t(row)*2*N+col];
+                for(int first=0;first<H;first+=gate_k_tile) {
+                    const int width=std::min(gate_k_tile,H-first);
+                    check(rknpu2_matmul_open::detail::pack_i4_weights(H,2*N,first,width,width,2*N,
+                        x.gate_up,static_cast<uint8_t*>(gw[e].vaddr)+size_t(first)*N));
+                }
+                pack_w4(N,H,x.down,dw[e],dcor[e]);
+            } else if(i4) {
                 pack_w4(H,2*N,x.gate_up,gw[e],gcor[e]);pack_w4(N,H,x.down,dw[e],dcor[e]);
             } else {
+                rk_npu_matmul_i8_config gc,dc;
+                rk_npu_matmul_i8_config_init(&gc,1,2*N,H);rk_npu_matmul_i8_config_init(&dc,1,H,N);
                 check(rknpu2_matmul_open::detail::pack_i8_b(&gc,x.gate_up,&gw[e]));check(rknpu2_matmul_open::detail::pack_i8_b(&dc,x.down,&dw[e]));
             }
-            if(N==512 && !mixed) {
+            if(N==512 && !w4) {
                 auto* bytes=static_cast<uint8_t*>(coeff.mem.vaddr)+size_t(e)*6144;
                 auto* g=reinterpret_cast<uint16_t*>(bytes);auto* u=reinterpret_cast<uint32_t*>(bytes+4096);
                 for(int col=0;col<N;++col)try {
@@ -412,10 +468,20 @@ struct Weights {
                 } catch(const std::runtime_error&) {lut_scales=false;}
             }
         }
-        gate.sync(gate.mem.size,RK_NPU_SYNC_TO_DEVICE);down.sync(down.mem.size,RK_NPU_SYNC_TO_DEVICE);
-        if(N==512 && !mixed)coeff.sync(coeff.mem.size,RK_NPU_SYNC_TO_DEVICE);
+        if(experts) {
+            if(mode==Mode::W4) {
+                for(auto& b:gate_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
+                for(auto& b:down_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
+            } else {gate.sync(gate.mem.size,RK_NPU_SYNC_TO_DEVICE);down.sync(down.mem.size,RK_NPU_SYNC_TO_DEVICE);}
+        }
+        if(N==512 && !w4)coeff.sync(coeff.mem.size,RK_NPU_SYNC_TO_DEVICE);
     }
-    uint64_t bytes() const{return gate.mem.size+down.mem.size+coeff.mem.size;}
+    uint64_t bytes() const {
+        uint64_t sum=gate.mem.size+down.mem.size+coeff.mem.size;
+        for(const auto& b:gate_banks)sum+=b->mem.size;
+        for(const auto& b:down_banks)sum+=b->mem.size;
+        return sum;
+    }
 };
 struct Assignment {int token,slot;};
 struct Job {
@@ -424,17 +490,27 @@ struct Job {
     rk_npu_matmul_i8_config gcfg{},dcfg{};
     rk_npu_mem ga{},gc{},da{},dc{};
 };
+struct GateWave {
+    rk_npu_matmul_i8_config config{};
+    rk_npu_mem input{},weight{},output{};
+};
 struct OutputRow {const int32_t* data;const float* scales;int rows,row;float scale;const int32_t* correction=nullptr;};
+static int32_t integer_i4_at(const int32_t* data,int rows,int row,int n) {
+    const auto* p=reinterpret_cast<const int16_t*>(data)+size_t(n/8)*rows*16+row*16+n%8;
+    return 16*int32_t(p[0])+p[8];
+}
 static int32_t integer_at(const int32_t* data,int rows,int row,int n,const int32_t* correction) {
     if(!correction)return data[size_t(n/4)*rows*4+row*4+n%4];
-    const auto* p=reinterpret_cast<const int16_t*>(data)+size_t(n/8)*rows*16+row*16+n%8;
-    return 16*int32_t(p[0])+p[8]+correction[n];
+    return integer_i4_at(data,rows,row,n)+correction[n];
 }
 #if defined(__aarch64__)
+static int32x4_t integer_i4_4(const int32_t* data,int rows,int row,int n) {
+    const auto* p=reinterpret_cast<const int16_t*>(data)+size_t(n/8)*rows*16+row*16+n%8;
+    return vaddw_s16(vmull_n_s16(vld1_s16(p),16),vld1_s16(p+8));
+}
 static int32x4_t integer4(const int32_t* data,int rows,int row,int n,const int32_t* correction) {
     if(!correction)return vld1q_s32(data+size_t(n/4)*rows*4+row*4);
-    const auto* p=reinterpret_cast<const int16_t*>(data)+size_t(n/8)*rows*16+row*16+n%8;
-    return vaddw_s16(vmlal_n_s16(vld1q_s32(correction+n),vld1_s16(p),16),vld1_s16(p+8));
+    return vaddq_s32(integer_i4_4(data,rows,row,n),vld1q_s32(correction+n));
 }
 #endif
 struct Workspace {
@@ -443,30 +519,44 @@ struct Workspace {
     Buffer input,gate_a,gate_c,down_a,down_c,middle_gate,middle_up,lut_input,lut_output;
     Commands gather_cmd,gate_cmd,down_cmd,middle_cmd,lut_cmd,gate4_cmd,down4_cmd;
     Buffer input4;
-    bool w4=false,mixed_chain=false;
+    Mode mode;
+    bool mixed_chain=false;
+    int gate_k_tile=0,gate_waves=1;
+    size_t gate_wave_stride=0;
     std::vector<float> input_scales,hidden_scales;
     std::vector<std::vector<Assignment>> groups;
     std::vector<Assignment> ordered;
     std::vector<Job> jobs;
+    std::vector<GateWave> gate_items;
+    std::vector<int8_t> input_codes;
     std::vector<OutputRow> output_rows;
     std::atomic_flag busy=ATOMIC_FLAG_INIT;
-    Workspace(rk_npu_iommu_domain* domain,const rk_npu_moe_w8_config& c,bool mixed=false):device(domain),config(c),w4(mixed) {
+    Workspace(rk_npu_iommu_domain* domain,const rk_npu_moe_w8_config& c,Mode recipe=Mode::W8):device(domain),config(c),mode(recipe) {
         const int H=c.weights.hidden,N=c.weights.intermediate;
+        const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,c.weights);
+        gate_k_tile=gate_tile(mode,H);
+        gate_waves=(H+gate_k_tile-1)/gate_k_tile;
         const size_t max=size_t(c.max_rows)*(c.top_k+c.weights.shared_expert);
-        input.alloc(device,size_t(c.max_rows)*H);
-        gate_a.alloc(device,max*H);gate_c.alloc(device,max*2*N*4);
+        gate_wave_stride=max*2*N*4;
+        if(has_w8)input.alloc(device,size_t(c.max_rows)*H);
+        else input_codes.resize(size_t(c.max_rows)*H);
+        gate_a.alloc(device,max*H);gate_c.alloc(device,gate_wave_stride*gate_waves);
         down_a.alloc(device,max*N);down_c.alloc(device,max*H*4);
         gate_a.sync(gate_a.mem.size,RK_NPU_SYNC_TO_DEVICE);
-        gather_cmd.alloc(device,max*(mixed?2:1));gather_cmd.prepare_copies();
-        if(mixed) {
+        gather_cmd.alloc(device,max*(w4?2:1));gather_cmd.prepare_copies();
+        if(mode==Mode::RoutedW4SharedW8 && has_w8) {
             const char* option=std::getenv("RK_NPU_MOE_W4_MIXED");
             if(option && std::string(option)!="0" && std::string(option)!="1")throw Failure{RK_NPU_ERR_PARAM};
             mixed_chain=!option || std::string(option)=="1";
+        }
+        if(w4) {
             input4.alloc(device,size_t(c.max_rows+1)*H);
-            gate4_cmd.alloc(device,max/32+512,rknpu2_matmul_open::detail::I4_COMMAND_WORDS);
+            gate4_cmd.alloc(device,(max/32+512)*gate_waves,rknpu2_matmul_open::detail::I4_COMMAND_WORDS);
             down4_cmd.alloc(device,max/32+512,rknpu2_matmul_open::detail::I4_COMMAND_WORDS);
         }
-        gate_cmd.alloc(device,max/32+512);down_cmd.alloc(device,max/32+512);
+        if(has_w8) {
+            gate_cmd.alloc(device,max/32+512);down_cmd.alloc(device,max/32+512);
+        }
         input_scales.resize(c.max_rows);hidden_scales.resize(max);output_rows.resize(max);
         groups.resize(c.weights.routed_experts+c.weights.shared_expert);
         for(auto& g:groups)g.reserve(max);
@@ -492,13 +582,14 @@ struct Workspace {
         const int H=config.weights.hidden,N=config.weights.intermediate,R=config.weights.routed_experts;
         const int top=config.top_k,slots=top+config.weights.shared_expert,cores=config.npu_cores,threads=config.cpu_threads;
         const bool native=config.native_input,npu=config.middle==RK_NPU_MOE_MIDDLE_NPU_LUT;
-        if(w4!=weights.w4 || !same(config.weights,weights.config))throw Failure{RK_NPU_ERR_PARAM};
+        const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,config.weights);
+        if(mode!=weights.mode || !same(config.weights,weights.config))throw Failure{RK_NPU_ERR_PARAM};
         if(device.ctx->id!=weights.device.ctx->id || device.domain->id!=weights.device.domain->id)
             throw Failure{RK_NPU_ERR_DOMAIN};
         if(npu && !weights.lut_scales)throw Failure{RK_NPU_ERR_PARAM};
         for(int i=0;i<rows*top;++i)if(ids[i]<0 || ids[i]>=R || !std::isfinite(route_weights[i]) || route_weights[i]<0)
             throw Failure{RK_NPU_ERR_PARAM};
-        auto* q=static_cast<int8_t*>(input.mem.vaddr);
+        auto* q=has_w8?static_cast<int8_t*>(input.mem.vaddr):input_codes.data();
         if(f32) {
             workers(threads,[&](int w){for(int r=w;r<rows;r+=threads)
                 input_scales[r]=quantize(static_cast<const float*>(source)+size_t(r)*H,H,q+size_t(r)*H);});
@@ -525,7 +616,7 @@ struct Workspace {
         std::stable_sort(jobs.begin(),jobs.end(),[](const Job& a,const Job& b){return a.rows>b.rows;});
         std::array<size_t,3> cost{};
         for(auto& j:jobs) {
-            j.w4=w4 && j.expert<R;
+            j.w4=expert_is_w4(mode,j.expert,R);
             if(w4 && !j.w4 && !mixed_chain)j.core=0;
             else {j.core=int(std::min_element(cost.begin(),cost.begin()+cores)-cost.begin());cost[j.core]+=j.rows+32;}
             rk_npu_matmul_i8_config_init(&j.gcfg,j.rows,2*N,H);rk_npu_matmul_i8_config_init(&j.dcfg,j.rows,H,N);
@@ -541,10 +632,22 @@ struct Workspace {
         t.schedule_us=us(at);at=Clock::now();
         std::vector<rknpu2_matmul_open::detail::I8GroupItem> gi,di,g4,d4,all;std::vector<std::vector<I8Copy>> copies(jobs.size());
         std::vector<MiddleItem> middle;middle.reserve(npu?size_t(rows)*slots*2:0);
+        // Resize once before storing pointers in g4; retain the arena between calls.
+        if(mode==Mode::W4)gate_items.resize(jobs.size()*gate_waves);
         for(size_t index=0;index<jobs.size();++index) {
             auto& j=jobs[index];
             all.push_back({&j.gcfg,&j.ga,&weights.gw[j.expert],&j.gc,j.core});
-            (j.w4?g4:gi).push_back(all.back());
+            if(mode==Mode::W4) {
+                for(int wave=0;wave<gate_waves;++wave) {
+                    const int first=wave*gate_k_tile,width=std::min(gate_k_tile,H-first);
+                    auto& item=gate_items[index*gate_waves+wave];
+                    rk_npu_matmul_i8_config_init(&item.config,j.rows,2*N,width);
+                    check(rk_npu_mem_view(&j.ga,size_t(first)*j.rows,size_t(width)*j.rows,&item.input));
+                    check(rk_npu_mem_view(&weights.gw[j.expert],size_t(first)*N,size_t(width)*N,&item.weight));
+                    item.output=gate_c.view(size_t(wave)*gate_wave_stride+size_t(j.offset)*2*N*4,size_t(j.rows)*2*N*4);
+                    g4.push_back({&item.config,&item.input,&item.weight,&item.output,j.core});
+                }
+            } else (j.w4?g4:gi).push_back(all.back());
             (j.w4?d4:di).push_back({&j.dcfg,&j.da,&weights.dw[j.expert],&j.dc,j.core});
             for(int row=0;row<j.rows;) {
                 if(w4 && rows==1 && j.rows==1)break;
@@ -566,20 +669,26 @@ struct Workspace {
                 middle.push_back({j.core,j.rows,src+size_t(N)*j.rows*4,base+4096,middle_up.mem.dma_addr+dest,scale,false});
             }
         }
-        t.gather_tasks=uint32_t(gather_cmd.build_gather(all,copies));gate_cmd.build(gi);down_cmd.build(di);
+        t.gather_tasks=uint32_t(gather_cmd.build_gather(all,copies));
+        if(has_w8){gate_cmd.build(gi);down_cmd.build(di);}
         if(w4){gate4_cmd.build_i4(g4,mixed_chain?&gate_cmd:nullptr);down4_cmd.build_i4(d4,mixed_chain?&down_cmd:nullptr);}
         if(npu)t.middle_tasks=uint32_t(middle_cmd.build_middle(middle,cores));
-        t.build_us=us(at);at=Clock::now();input.sync(size_t(rows)*H,RK_NPU_SYNC_TO_DEVICE);
+        t.build_us=us(at);at=Clock::now();
+        if(has_w8)input.sync(size_t(rows)*H,RK_NPU_SYNC_TO_DEVICE);
         if(w4)input4.sync(size_t(rows+(rows==1))*H,RK_NPU_SYNC_TO_DEVICE);
         t.sync_us+=us(at);at=Clock::now();gather_cmd.run(device,cores,"gather",config.timeout_ms);
-        t.gather_us=us(at);at=Clock::now();if(!mixed_chain)t.gemm_tasks+=uint32_t(gate_cmd.run(device,cores,"gate",config.timeout_ms));
+        t.gather_us=us(at);at=Clock::now();if(has_w8 && !mixed_chain)t.gemm_tasks+=uint32_t(gate_cmd.run(device,cores,"gate",config.timeout_ms));
         if(w4)t.gemm_tasks+=uint32_t(gate4_cmd.run(device,cores,"gate4",config.timeout_ms));
         t.gate_us=us(at);at=Clock::now();
         if(npu) {
             lut_cmd.run(device,cores,"lut",config.timeout_ms);t.lut_load_us=us(at);at=Clock::now();
             middle_cmd.run(device,cores,"middle",config.timeout_ms);t.middle_npu_us=us(at);at=Clock::now();
             middle_gate.sync(size_t(rows)*slots*N*4,RK_NPU_SYNC_FROM_DEVICE);middle_up.sync(size_t(rows)*slots*N*4,RK_NPU_SYNC_FROM_DEVICE);
-        } else gate_c.sync(size_t(rows)*slots*2*N*4,RK_NPU_SYNC_FROM_DEVICE);
+        } else if(mode==Mode::W4)for(int wave=0;wave<gate_waves;++wave) {
+            auto active=gate_c.view(size_t(wave)*gate_wave_stride,size_t(rows)*slots*2*N*4);
+            check(rk_npu_mem_sync(device.ctx,&active,RK_NPU_SYNC_FROM_DEVICE));
+        }
+        else gate_c.sync(size_t(rows)*slots*2*N*4,RK_NPU_SYNC_FROM_DEVICE);
         t.sync_us+=us(at);at=Clock::now();
         workers(threads,[&](int worker){
             alignas(64) float gate[512],up[512],hidden[512];alignas(64) int8_t hidden_q[512];
@@ -596,10 +705,20 @@ struct Workspace {
                         for(int n=0;n<N;n+=4) {
                             const auto* corr=j.w4?weights.gcor[j.expert].data():nullptr;
 #if defined(__aarch64__)
-                            vst1q_f32(gate+n,vmulq_f32(vmulq_n_f32(vcvtq_f32_s32(integer4(acc,j.rows,row,n,corr)),sa),vld1q_f32(weights.gs[j.expert].data()+n)));
-                            vst1q_f32(up+n,vmulq_f32(vmulq_n_f32(vcvtq_f32_s32(integer4(acc,j.rows,row,n+N,corr)),sa),vld1q_f32(weights.gs[j.expert].data()+N+n)));
+                            auto dot=[&](int col){auto value=integer4(acc,j.rows,row,col,corr);
+                                if(mode==Mode::W4)for(int wave=1;wave<gate_waves;++wave) {
+                                    const auto* partial=reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(acc)+size_t(wave)*gate_wave_stride);
+                                    value=vaddq_s32(value,integer_i4_4(partial,j.rows,row,col));
+                                }return value;};
+                            vst1q_f32(gate+n,vmulq_f32(vmulq_n_f32(vcvtq_f32_s32(dot(n)),sa),vld1q_f32(weights.gs[j.expert].data()+n)));
+                            vst1q_f32(up+n,vmulq_f32(vmulq_n_f32(vcvtq_f32_s32(dot(n+N)),sa),vld1q_f32(weights.gs[j.expert].data()+N+n)));
 #else
-                            for(int lane=0;lane<4;++lane) {gate[n+lane]=(float(integer_at(acc,j.rows,row,n+lane,corr))*sa)*weights.gs[j.expert][n+lane];up[n+lane]=(float(integer_at(acc,j.rows,row,n+N+lane,corr))*sa)*weights.gs[j.expert][N+n+lane];}
+                            auto dot=[&](int col){int32_t value=integer_at(acc,j.rows,row,col,corr);
+                                if(mode==Mode::W4)for(int wave=1;wave<gate_waves;++wave) {
+                                    const auto* partial=reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(acc)+size_t(wave)*gate_wave_stride);
+                                    value+=integer_i4_at(partial,j.rows,row,col);
+                                }return value;};
+                            for(int lane=0;lane<4;++lane) {gate[n+lane]=(float(dot(n+lane))*sa)*weights.gs[j.expert][n+lane];up[n+lane]=(float(dot(n+N+lane))*sa)*weights.gs[j.expert][N+n+lane];}
 #endif
                         }
                         for(int n=0;n<N;++n)hidden[n]=(gate[n]/(1.f+std::exp(-gate[n])))*up[n];
@@ -624,7 +743,7 @@ struct Workspace {
         });
         for(int i=0;i<rows*slots;++i)if(!(hidden_scales[i]>0) || !std::isfinite(hidden_scales[i]))throw Failure{RK_NPU_ERR_PARAM};
         t.middle_cpu_us=us(at);at=Clock::now();down_a.sync(size_t(rows)*slots*N,RK_NPU_SYNC_TO_DEVICE);
-        t.sync_us+=us(at);at=Clock::now();if(!mixed_chain)t.gemm_tasks+=uint32_t(down_cmd.run(device,cores,"down",config.timeout_ms));
+        t.sync_us+=us(at);at=Clock::now();if(has_w8 && !mixed_chain)t.gemm_tasks+=uint32_t(down_cmd.run(device,cores,"down",config.timeout_ms));
         if(w4)t.gemm_tasks+=uint32_t(down4_cmd.run(device,cores,"down4",config.timeout_ms));
         t.down_us=us(at);at=Clock::now();down_c.sync(size_t(rows)*slots*H*4,RK_NPU_SYNC_FROM_DEVICE);
         t.sync_us+=us(at);at=Clock::now();
@@ -711,11 +830,65 @@ extern "C" int rk_npu_moe_w8_run_f32(rk_npu_moe_w8_workspace* ws,const rk_npu_mo
 extern "C" rk_npu_moe_w8_weights* rk_npu_moe_w4_weights_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_weight_config* c,const rk_npu_moe_w8_expert* experts) {
     if(!domain || !c || !experts || !rknpu2_matmul_open::moe::valid(*c) || c->hidden%64 || c->intermediate%64)return nullptr;
-    try{return new rk_npu_moe_w8_weights(domain,*c,experts,true);}catch(...){return nullptr;}
+    try{return new rk_npu_moe_w8_weights(domain,*c,experts,rknpu2_matmul_open::moe::Mode::RoutedW4SharedW8);}catch(...){return nullptr;}
 }
 extern "C" rk_npu_moe_w8_workspace* rk_npu_moe_w4_workspace_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_config* c) {
     if(!domain || !c || !rknpu2_matmul_open::moe::valid(*c) || c->weights.hidden%64 || c->weights.intermediate%64 ||
        c->middle!=RK_NPU_MOE_MIDDLE_CPU || c->native_input)return nullptr;
-    try{return new rk_npu_moe_w8_workspace(domain,*c,true);}catch(...){return nullptr;}
+    try{return new rk_npu_moe_w8_workspace(domain,*c,rknpu2_matmul_open::moe::Mode::RoutedW4SharedW8);}catch(...){return nullptr;}
+}
+
+extern "C" rk_npu_moe_w8_weights* rk_npu_moe_quant_weights_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* c,const rk_npu_moe_w8_expert* experts) {
+    if(!domain || !c || !experts || !rknpu2_matmul_open::moe::valid_w4(*c))return nullptr;
+    try{return new rk_npu_moe_w8_weights(domain,*c,experts,rknpu2_matmul_open::moe::Mode::W4);}catch(...){return nullptr;}
+}
+extern "C" rk_npu_moe_w8_workspace* rk_npu_moe_quant_workspace_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_config* c) {
+    if(!domain || !c || !rknpu2_matmul_open::moe::valid(*c) || !rknpu2_matmul_open::moe::valid_w4(c->weights) ||
+        c->middle!=RK_NPU_MOE_MIDDLE_CPU || c->native_input)return nullptr;
+    try{return new rk_npu_moe_w8_workspace(domain,*c,rknpu2_matmul_open::moe::Mode::W4);}catch(...){return nullptr;}
+}
+
+extern "C" rk_npu_moe_w8_weights* rk_npu_moe_quant_slots_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* c) {
+    if(!domain || !c || !rknpu2_matmul_open::moe::valid_w4(*c) || c->shared_expert)return nullptr;
+    try{return new rk_npu_moe_w8_weights(domain,*c,nullptr,rknpu2_matmul_open::moe::Mode::W4);}catch(...){return nullptr;}
+}
+
+extern "C" uint64_t rk_npu_moe_quant_expert_blob_bytes(const rk_npu_moe_w8_weights* w) {
+    if(!w || w->mode!=rknpu2_matmul_open::moe::Mode::W4)return 0;
+    return w->gw[0].size+w->dw[0].size+4*(w->gs[0].size()+w->ds[0].size()+w->gcor[0].size()+
+        w->dcor[0].size());
+}
+
+extern "C" int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* w,int e,void* data,uint64_t bytes) {
+    const uint64_t need=rk_npu_moe_quant_expert_blob_bytes(w);
+    if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()))return RK_NPU_ERR_PARAM;
+    auto* p=static_cast<uint8_t*>(data);
+    auto put=[&](const void* src,size_t n){std::memcpy(p,src,n);p+=n;};
+    put(w->gw[e].vaddr,w->gw[e].size);put(w->dw[e].vaddr,w->dw[e].size);
+    put(w->gs[e].data(),w->gs[e].size()*4);put(w->ds[e].data(),w->ds[e].size()*4);
+    put(w->gcor[e].data(),w->gcor[e].size()*4);
+    if(!w->dcor[e].empty())put(w->dcor[e].data(),w->dcor[e].size()*4);
+    return RK_NPU_OK;
+}
+
+extern "C" int rk_npu_moe_quant_import_expert(rk_npu_moe_w8_weights* w,int e,const void* data,uint64_t bytes) {
+    const uint64_t need=rk_npu_moe_quant_expert_blob_bytes(w);
+    if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()))return RK_NPU_ERR_PARAM;
+    try {
+        const auto* p=static_cast<const uint8_t*>(data);
+        auto get=[&](void* dst,size_t n){std::memcpy(dst,p,n);p+=n;};
+        get(w->gw[e].vaddr,w->gw[e].size);get(w->dw[e].vaddr,w->dw[e].size);
+        get(w->gs[e].data(),w->gs[e].size()*4);get(w->ds[e].data(),w->ds[e].size()*4);
+        get(w->gcor[e].data(),w->gcor[e].size()*4);
+        if(!w->dcor[e].empty())get(w->dcor[e].data(),w->dcor[e].size()*4);
+        for(const auto* v:{&w->gs[e],&w->ds[e]})for(float s:*v)if(!(s>0) || !std::isfinite(s))return RK_NPU_ERR_PARAM;
+        rknpu2_matmul_open::moe::check(rk_npu_mem_sync(w->device.ctx,&w->gw[e],RK_NPU_SYNC_TO_DEVICE));
+        rknpu2_matmul_open::moe::check(rk_npu_mem_sync(w->device.ctx,&w->dw[e],RK_NPU_SYNC_TO_DEVICE));
+        return RK_NPU_OK;
+    } catch(const rknpu2_matmul_open::moe::Failure& e) {return e.code;}
+    catch(...) {return RK_NPU_ERR_PARAM;}
 }
