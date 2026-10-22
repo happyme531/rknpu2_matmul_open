@@ -11,6 +11,10 @@ extern "C" {
 #endif
 
 typedef enum rk_npu_moe_middle {
+    /* Fused FP32 SwiGLU/maxabs and direct Down packing; nearest-even A8.
+     * AArch64 uses the shared degree-7 FP32 exp with [-80,80] saturation.
+     * NOTE: negative tails below -80 become signed zero; exact expf rounding
+     * and nonfinite semantics are not preserved. */
     RK_NPU_MOE_MIDDLE_CPU = 0,
     /* FP16-rounded gate/up scales, approximate SiLU LUT on [-8,8].
      * FP32 main tensors, 4096x internal carrier. Requires intermediate=512.

@@ -1,5 +1,5 @@
 #include "rk_npu_w4a8_cpu.h"
-#include "rk_npu_w4a8_swiglu_neon.h"
+#include "rk_npu_swiglu_fp32_neon.h"
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -81,7 +81,7 @@ void finish_swiglu(const W4A8Reduction &state, const W4A8SwiGLUPair &pair,
 #if defined(__aarch64__)
         auto vmax = vdupq_n_u32(0);
         for (int nb = 0; nb < 32; nb += 16) {
-            const auto current = w4swiglu::apply16<Collect>(gates + nb, ups + nb, out + nb);
+            const auto current = swiglu_fp32::apply16<Collect>(gates + nb, ups + nb, out + nb);
             if constexpr (Collect) vmax = vmaxq_u32(vmax, current);
         }
         if constexpr (Collect) maximum = vmaxvq_u32(vmax);

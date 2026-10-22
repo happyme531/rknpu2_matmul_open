@@ -1,6 +1,6 @@
 #include "rk_npu_w4a8.h"
 #include "../src/rk_npu_w4a8_cpu.h"
-#include "../src/rk_npu_w4a8_swiglu_neon.h"
+#include "../src/rk_npu_swiglu_fp32_neon.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -28,7 +28,7 @@ static void activation(const float *gu, float *out, int M, int F, int threads) {
         int n = block * 64;
 #if defined(__aarch64__)
         for (; n + 16 <= end; n += 16)
-            detail::w4swiglu::apply16<false>(g + n, g + F + n, y + n);
+            detail::swiglu_fp32::apply16<false>(g + n, g + F + n, y + n);
 #endif
         for (; n < end; ++n) y[n] = (g[n] / (1.f + std::exp(-g[n]))) * g[F + n];
     }

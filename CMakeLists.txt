@@ -56,6 +56,7 @@ set(RK_NPU_SRCS
   src/rk_npu_quant_matmul.cpp  # typed single-GEMM autotune/execution API
   src/rk_npu_matmul_i8.cpp     # int8 x int8 -> fp32 matmul
   src/rk_npu_moe_w8.cpp        # routed W8 SwiGLU, shared weights/workspace
+  src/rk_npu_moe_cpu.cpp       # fused W4/W8 expert middle and native A8 packing
   src/rk_npu_i4_cpu.cpp        # INT4 packing + INT16 partial reduction
   src/rk_npu_i4_bounds.cpp     # weight-only INT16 bounds and safe K selection
   src/rk_npu_i4_regs.cpp       # native W4A4 register body only
@@ -132,6 +133,7 @@ target_compile_options(rk_npu_matmul_static PRIVATE ${RK_NPU_AARCH64_FP16_FLAGS}
 target_link_libraries(rk_npu_matmul_static PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
 set_property(SOURCE src/rk_npu_gdn_prefill.cpp APPEND PROPERTY COMPILE_OPTIONS -O3 -ffp-contract=off)
 set_property(SOURCE src/rk_npu_w4a8_swiglu.cpp APPEND PROPERTY COMPILE_OPTIONS -O3)
+set_property(SOURCE src/rk_npu_moe_cpu.cpp APPEND PROPERTY COMPILE_OPTIONS -O3)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
   set_property(SOURCE src/rk_npu_gdn_prefill.cpp APPEND PROPERTY COMPILE_OPTIONS -mtune=cortex-a76)
 endif()
@@ -276,6 +278,11 @@ target_link_libraries(test_i8_dpu_chain PRIVATE rk_npu_matmul)
 
 add_executable(test_moe_w8 tests/test_moe_w8.cpp)
 target_link_libraries(test_moe_w8 PRIVATE rk_npu_matmul)
+add_executable(test_moe_cpu tests/test_moe_cpu.cpp)
+target_link_libraries(test_moe_cpu PRIVATE rk_npu_matmul)
+if(BUILD_TESTING)
+  add_test(NAME moe_cpu COMMAND test_moe_cpu)
+endif()
 add_executable(test_moe_quant tests/test_moe_quant.cpp)
 target_link_libraries(test_moe_quant PRIVATE rk_npu_matmul_static)
 add_library(test_moe_w8_header_c OBJECT tests/test_moe_w8_header.c)
@@ -400,6 +407,6 @@ add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_w4a8_reduction test_w4a8_swiglu test_w4a8_ffn test_i4_bounds test_autotune_cpu test_panel_layout
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
   test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c test_mm_tune test_mm_gelu
-  test_w4a4_linear_header_c test_moe_w8_header_c test_mm test_mm_header_c test_mm_tf32
+  test_w4a4_linear_header_c test_moe_w8_header_c test_moe_cpu test_mm test_mm_header_c test_mm_tf32
   test_attention_f16 test_attention_f16_header_c test_mla_f16 test_mla_f16_header_c
   test_gdn test_gdn_static test_gdn_header_c)

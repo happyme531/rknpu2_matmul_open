@@ -3,7 +3,7 @@
 #include <arm_neon.h>
 #endif
 
-namespace rknpu2_matmul_open::detail::w4swiglu {
+namespace rknpu2_matmul_open::detail::swiglu_fp32 {
 #if defined(__aarch64__)
 // NOTE: Degree-7 FP32 exp with branch-free exponent saturation to [-80,80].
 // Gates below -80 produce signed zero, truncating the tiny negative tail.

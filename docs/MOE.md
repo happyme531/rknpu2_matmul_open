@@ -45,15 +45,27 @@ Duplicate routed IDs are permitted, route coefficients are nonnegative finite
 values, and no normalization is implicit. The shared expert has coefficient1.
 The final sum follows route slot order, then the shared expert.
 
-Workspaces reject concurrent use with BUSY. Invalid routes, scales, NaNs,
+Workspaces reject concurrent use with BUSY. Invalid routes, scales, input NaNs,
 input/output overlap, mismatched shapes and domains are rejected. The operator
 does not reset or retry a failed NPU submission. Hot calls reuse all device
 allocations and templates; CPU scheduling vectors may allocate.
 
 ## Middle-stage choice
 
-CPU middle is the numerical default: INT32 GEMM, FP32 dequantization/SiLU/MUL,
+CPU middle uses INT32 GEMM, fused FP32 dequantization/SwiGLU/maxabs,
 nearest-even hidden quantization, INT32 down GEMM and FP32 weighted combine.
+W8, mixed W4/W8 and all-W4 experts share the same CPU middle kernel. It holds
+one hidden row, then quantizes directly into the Down input layout, avoiding
+separate gate/up arrays, a second maxabs scan and an intermediate A8 copy.
+
+AArch64 shares the degree-7 FP32 SwiGLU kernel with dense W4A8. Its exponent
+uses branch-free saturation to [-80,80], and gate<-80 maps to signed zero.
+NOTE: rounding, the tiny negative tail and nonfinite semantics can differ
+from scalar expf; no old activation kernel is selected as a fallback.
+The MoE scale rule and nearest-even rounding remain unchanged.
+NOTE: internal activations must remain finite, with representable nonzero row
+scales and reciprocals. The middle stage does not scan or validate intermediate
+values; public input validation remains at the API boundary.
 
 `config.middle=RK_NPU_MOE_MIDDLE_NPU_LUT` explicitly enables the approximate
 NPU dequantization/SiLU path for I=512. It uses FP16 coefficients, FP32 main
@@ -70,13 +82,16 @@ rounding, FP32 scale vectors, other host containers and thread stacks.
 
 ## Validation and integration
 
+- `test_moe_cpu` checks exact row scales/codes and ordinary-A8, native-A8 and
+  split-A4 layouts, W4 partial reconstruction, zero rows and output guards.
 - `test_moe_w8` checks independent integer/float references, A/B/A weight
   rebinding, batch transitions, duplicates, zero input, nearest-even input,
   invalid arguments, domain mismatch, and fewer jobs than requested cores.
 - `tools/ling_moe_probe/compare_api.cpp` compares both public input entries to
   the original real-weight experiment on two fixture slices, normal/native-A,
-  and CPU/NPU middle. All checked outputs match that corresponding experiment
-  bit for bit; this does not equate the approximate LUT path with CPU SiLU.
+  and CPU/NPU middle. Historical bitwise results predate the shared FP32
+  activation; current CPU comparisons must account for its documented rounding.
+  The approximate LUT path has its own numerical behavior.
 - The parent research workspace contains a MindNano adapter in
   `integrations/mindnano/`; it applies the API to the actual decoder factory
   and retains its original router. That adapter and its fixtures are not

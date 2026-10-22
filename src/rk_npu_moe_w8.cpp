@@ -4,6 +4,7 @@
 #include "rk_npu_internal.h"
 #include "rk_npu_moe_regs.h"
 #include "rk_npu_moe_w4_internal.h"
+#include "rk_npu_moe_cpu.h"
 #include "rk_npu_i4_cpu.h"
 #include "rk_npu_i4_regs.h"
 #include "rk_npu_i4_bounds.h"
@@ -14,7 +15,6 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
-#include <iostream>
 #include <limits>
 #include <memory>
 #include <new>
@@ -272,7 +272,7 @@ struct Commands {
         }
         for(int core=cores;core<3;++core)start[core]=count[core]=0;
     }
-    size_t run(Device& d,int cores,const char* stage="commands",uint32_t timeout=1000) {
+    size_t run(Device& d,int cores,uint32_t timeout) {
         const int total=int(count[0]+count[1]+count[2]);
         if(!total)return 0;
         while(cores>1 && !count[cores-1])--cores;
@@ -285,10 +285,8 @@ struct Commands {
         request.fence_fd=-1;request.iommu_domain_id=rk_npu_iommu_domain_id(d.domain);
         for(int core=0;core<cores;++core)
             request.subcore_task[cores==3?core+2:core]={start[core],count[core]};
-        if(std::getenv("RK_NPU_MOE_TRACE"))std::cerr<<"submit "<<stage<<" cores="<<cores<<" tasks="<<total<<std::endl;
         if(ioctl(d.ctx->fd,IOCTL_SUBMIT,&request)<0)
             throw Failure{RK_NPU_ERR_SUBMIT};
-        if(std::getenv("RK_NPU_MOE_TRACE"))std::cerr<<"done "<<stage<<std::endl;
         return size_t(total);
     }
 };
@@ -315,15 +313,16 @@ template<class F> static void workers(int count,const F& function) {
 #pragma omp parallel for num_threads(count) schedule(static)
     for(int worker=0;worker<count;++worker)function(worker);
 }
-// No exception can cross an OpenMP region. Zero marks invalid/nonfinite input.
-static float quantize(const float* input,int size,int8_t* output) {
+// Public input validation returns zero: exceptions cannot cross OpenMP.
+// Internal activations use the finite/representable contract in rk_npu_moe_cpu.h.
+template<bool ValidateInput> static float quantize(const float* input,int size,int8_t* output) {
     float maximum=0;
     for(int i=0;i<size;++i) {
-        if(!std::isfinite(input[i]))return 0;
+        if constexpr(ValidateInput)if(!std::isfinite(input[i]))return 0;
         maximum=std::max(maximum,std::abs(input[i]));
     }
     const float scale=maximum?maximum/127.f:1.f, inv=1.f/scale;
-    if(!(scale>0) || !std::isfinite(inv))return 0;
+    if constexpr(ValidateInput)if(!(scale>0) || !std::isfinite(inv))return 0;
     int i=0;
 #if defined(__aarch64__)
     const auto inverse=vdupq_n_f32(inv);
@@ -496,24 +495,6 @@ struct GateWave {
     rk_npu_mem input{},weight{},output{};
 };
 struct OutputRow {const int32_t* data;const float* scales;int rows,row;float scale;const int32_t* correction=nullptr;};
-static int32_t integer_i4_at(const int32_t* data,int rows,int row,int n) {
-    const auto* p=reinterpret_cast<const int16_t*>(data)+size_t(n/8)*rows*16+row*16+n%8;
-    return 16*int32_t(p[0])+p[8];
-}
-static int32_t integer_at(const int32_t* data,int rows,int row,int n,const int32_t* correction) {
-    if(!correction)return data[size_t(n/4)*rows*4+row*4+n%4];
-    return integer_i4_at(data,rows,row,n)+correction[n];
-}
-#if defined(__aarch64__)
-static int32x4_t integer_i4_4(const int32_t* data,int rows,int row,int n) {
-    const auto* p=reinterpret_cast<const int16_t*>(data)+size_t(n/8)*rows*16+row*16+n%8;
-    return vaddw_s16(vmull_n_s16(vld1_s16(p),16),vld1_s16(p+8));
-}
-static int32x4_t integer4(const int32_t* data,int rows,int row,int n,const int32_t* correction) {
-    if(!correction)return vld1q_s32(data+size_t(n/4)*rows*4+row*4);
-    return vaddq_s32(integer_i4_4(data,rows,row,n),vld1q_s32(correction+n));
-}
-#endif
 struct Workspace {
     Device device;
     rk_npu_moe_w8_config config;
@@ -524,7 +505,7 @@ struct Workspace {
     bool mixed_chain=false;
     int gate_k_tile=0,gate_waves=1;
     size_t gate_wave_stride=0;
-    std::vector<float> input_scales,hidden_scales;
+    std::vector<float> input_scales;
     std::vector<std::vector<Assignment>> groups;
     std::vector<Assignment> ordered;
     std::vector<Job> jobs;
@@ -558,7 +539,7 @@ struct Workspace {
         if(has_w8) {
             gate_cmd.alloc(device,max/32+512);down_cmd.alloc(device,max/32+512);
         }
-        input_scales.resize(c.max_rows);hidden_scales.resize(max);output_rows.resize(max);
+        input_scales.resize(c.max_rows);output_rows.resize(max);
         groups.resize(c.weights.routed_experts+c.weights.shared_expert);
         for(auto& g:groups)g.reserve(max);
         ordered.reserve(max);jobs.reserve(max);
@@ -593,7 +574,7 @@ struct Workspace {
         auto* q=has_w8?static_cast<int8_t*>(input.mem.vaddr):input_codes.data();
         if(f32) {
             workers(threads,[&](int w){for(int r=w;r<rows;r+=threads)
-                input_scales[r]=quantize(static_cast<const float*>(source)+size_t(r)*H,H,q+size_t(r)*H);});
+                input_scales[r]=quantize<true>(static_cast<const float*>(source)+size_t(r)*H,H,q+size_t(r)*H);});
         } else {
             std::memcpy(q,source,size_t(rows)*H);std::copy(scales,scales+rows,input_scales.begin());
         }
@@ -677,13 +658,13 @@ struct Workspace {
         t.build_us=us(at);at=Clock::now();
         if(has_w8)input.sync(size_t(rows)*H,RK_NPU_SYNC_TO_DEVICE);
         if(w4)input4.sync(size_t(rows+(rows==1))*H,RK_NPU_SYNC_TO_DEVICE);
-        t.sync_us+=us(at);at=Clock::now();gather_cmd.run(device,cores,"gather",config.timeout_ms);
-        t.gather_us=us(at);at=Clock::now();if(has_w8 && !mixed_chain)t.gemm_tasks+=uint32_t(gate_cmd.run(device,cores,"gate",config.timeout_ms));
-        if(w4)t.gemm_tasks+=uint32_t(gate4_cmd.run(device,cores,"gate4",config.timeout_ms));
+        t.sync_us+=us(at);at=Clock::now();gather_cmd.run(device,cores,config.timeout_ms);
+        t.gather_us=us(at);at=Clock::now();if(has_w8 && !mixed_chain)t.gemm_tasks+=uint32_t(gate_cmd.run(device,cores,config.timeout_ms));
+        if(w4)t.gemm_tasks+=uint32_t(gate4_cmd.run(device,cores,config.timeout_ms));
         t.gate_us=us(at);at=Clock::now();
         if(npu) {
-            lut_cmd.run(device,cores,"lut",config.timeout_ms);t.lut_load_us=us(at);at=Clock::now();
-            middle_cmd.run(device,cores,"middle",config.timeout_ms);t.middle_npu_us=us(at);at=Clock::now();
+            lut_cmd.run(device,cores,config.timeout_ms);t.lut_load_us=us(at);at=Clock::now();
+            middle_cmd.run(device,cores,config.timeout_ms);t.middle_npu_us=us(at);at=Clock::now();
             middle_gate.sync(size_t(rows)*slots*N*4,RK_NPU_SYNC_FROM_DEVICE);middle_up.sync(size_t(rows)*slots*N*4,RK_NPU_SYNC_FROM_DEVICE);
         } else if(mode==Mode::W4)for(int wave=0;wave<gate_waves;++wave) {
             auto active=gate_c.view(size_t(wave)*gate_wave_stride,size_t(rows)*slots*2*N*4);
@@ -692,60 +673,37 @@ struct Workspace {
         else gate_c.sync(size_t(rows)*slots*2*N*4,RK_NPU_SYNC_FROM_DEVICE);
         t.sync_us+=us(at);at=Clock::now();
         workers(threads,[&](int worker){
-            alignas(64) float gate[512],up[512],hidden[512];alignas(64) int8_t hidden_q[512];
+            alignas(64) float hidden[512];alignas(64) int8_t hidden_q[512];
             for(size_t index=worker;index<jobs.size();index+=threads) {
                 const auto& j=jobs[index];const auto* acc=static_cast<const int32_t*>(j.gc.vaddr);
                 auto* target=static_cast<int8_t*>(j.da.vaddr);
                 for(int row=0;row<j.rows;++row) {
                     const int offset=j.offset+row;const float sa=input_scales[ordered[offset].token];
+                    float scale;
                     if(npu) {
                         const auto* g=static_cast<const float*>(middle_gate.mem.vaddr)+size_t(offset)*N;
                         const auto* u=static_cast<const float*>(middle_up.mem.vaddr)+size_t(offset)*N;
                         for(int n=0;n<N;++n)hidden[n]=g[n]*u[n];
-                    } else {
-                        for(int n=0;n<N;n+=4) {
-                            const auto* corr=j.w4?weights.gcor[j.expert].data():nullptr;
-#if defined(__aarch64__)
-                            auto dot=[&](int col){auto value=integer4(acc,j.rows,row,col,corr);
-                                if(mode==Mode::W4)for(int wave=1;wave<gate_waves;++wave) {
-                                    const auto* partial=reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(acc)+size_t(wave)*gate_wave_stride);
-                                    value=vaddq_s32(value,integer_i4_4(partial,j.rows,row,col));
-                                }return value;};
-                            vst1q_f32(gate+n,vmulq_f32(vmulq_n_f32(vcvtq_f32_s32(dot(n)),sa),vld1q_f32(weights.gs[j.expert].data()+n)));
-                            vst1q_f32(up+n,vmulq_f32(vmulq_n_f32(vcvtq_f32_s32(dot(n+N)),sa),vld1q_f32(weights.gs[j.expert].data()+N+n)));
-#else
-                            auto dot=[&](int col){int32_t value=integer_at(acc,j.rows,row,col,corr);
-                                if(mode==Mode::W4)for(int wave=1;wave<gate_waves;++wave) {
-                                    const auto* partial=reinterpret_cast<const int32_t*>(reinterpret_cast<const uint8_t*>(acc)+size_t(wave)*gate_wave_stride);
-                                    value+=integer_i4_at(partial,j.rows,row,col);
-                                }return value;};
-                            for(int lane=0;lane<4;++lane) {gate[n+lane]=(float(dot(n+lane))*sa)*weights.gs[j.expert][n+lane];up[n+lane]=(float(dot(n+N+lane))*sa)*weights.gs[j.expert][N+n+lane];}
-#endif
-                        }
-                        for(int n=0;n<N;++n)hidden[n]=(gate[n]/(1.f+std::exp(-gate[n])))*up[n];
-                    }
-                    float scale=quantize(hidden,N,hidden_q);
-                    if(npu && scale>0) {
-                        bool zero=scale==1.f && std::all_of(hidden,hidden+N,[](float x){return x==0.f;});
+                        scale=quantize<false>(hidden,N,hidden_q);
+                        const bool zero=scale==1.f && std::all_of(hidden,hidden+N,[](float x){return x==0.f;});
                         scale=zero?1.f:scale/middle_lut_scale;
+                        if(!native)std::memcpy(target+size_t(row)*N,hidden_q,N);
+                        else for(int k=0;k<N;k+=16)std::memcpy(target+size_t(k/16)*j.rows*16+row*16,hidden_q+k,16);
+                    } else {
+                        const MiddleRow middle{acc,j.w4?weights.gcor[j.expert].data():nullptr,
+                            weights.gs[j.expert].data(),sa,j.rows,row,N,
+                            mode==Mode::W4?gate_waves:1,size_t(gate_wave_stride),target,
+                            j.w4?MiddleLayout::I4Native:native?MiddleLayout::I8Native:MiddleLayout::I8Normal};
+                        scale=swiglu_quantize_row(middle);
                     }
-                    hidden_scales[offset]=scale;
-                    if(!scale)continue;
-                    if(j.w4)for(int k=0;k<N;k+=32) {
-                        auto* high=reinterpret_cast<uint8_t*>(target)+size_t(k/32)*j.rows*32+row*32;
-                        split32(hidden_q+k,high,high+16);
-                    }
-                    else if(!native)std::memcpy(target+size_t(row)*N,hidden_q,N);
-                    else for(int k=0;k<N;k+=16)std::memcpy(target+size_t(k/16)*j.rows*16+row*16,hidden_q+k,16);
                     const auto a=ordered[offset];
                     output_rows[size_t(a.token)*slots+a.slot]={static_cast<const int32_t*>(j.dc.vaddr),weights.ds[j.expert].data(),j.rows,row,scale,j.w4?weights.dcor[j.expert].data():nullptr};
                 }
             }
         });
-        for(int i=0;i<rows*slots;++i)if(!(hidden_scales[i]>0) || !std::isfinite(hidden_scales[i]))throw Failure{RK_NPU_ERR_PARAM};
         t.middle_cpu_us=us(at);at=Clock::now();down_a.sync(size_t(rows)*slots*N,RK_NPU_SYNC_TO_DEVICE);
-        t.sync_us+=us(at);at=Clock::now();if(has_w8 && !mixed_chain)t.gemm_tasks+=uint32_t(down_cmd.run(device,cores,"down",config.timeout_ms));
-        if(w4)t.gemm_tasks+=uint32_t(down4_cmd.run(device,cores,"down4",config.timeout_ms));
+        t.sync_us+=us(at);at=Clock::now();if(has_w8 && !mixed_chain)t.gemm_tasks+=uint32_t(down_cmd.run(device,cores,config.timeout_ms));
+        if(w4)t.gemm_tasks+=uint32_t(down4_cmd.run(device,cores,config.timeout_ms));
         t.down_us=us(at);at=Clock::now();down_c.sync(size_t(rows)*slots*H*4,RK_NPU_SYNC_FROM_DEVICE);
         t.sync_us+=us(at);at=Clock::now();
         workers(threads,[&](int worker){
