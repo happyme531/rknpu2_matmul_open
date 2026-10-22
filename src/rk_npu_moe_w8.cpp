@@ -14,7 +14,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <new>
@@ -374,7 +373,7 @@ static bool uses_w8(Mode mode,const rk_npu_moe_w8_weight_config& c) {
     return mode==Mode::W8 || (mode==Mode::RoutedW4SharedW8 && c.shared_expert);
 }
 static int gate_tile(Mode mode,int hidden) {
-    return mode==Mode::W4?std::min(hidden,512):hidden;
+    return mode!=Mode::W8?std::min(hidden,512):hidden;
 }
 static bool valid_w4(const rk_npu_moe_w8_weight_config& c) {
     return valid(c) && c.hidden%64==0 && c.intermediate%64==0 &&
@@ -393,25 +392,27 @@ struct Weights {
     Weights(rk_npu_iommu_domain* domain,const rk_npu_moe_w8_weight_config& c,
             const rk_npu_moe_w8_expert* experts,Mode recipe=Mode::W8):device(domain),config(c),mode(recipe) {
         const int H=c.hidden,N=c.intermediate,count=c.routed_experts+c.shared_expert;
-        const bool w4=mode!=Mode::W8;
+        const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,c);
         const int gate_k_tile=gate_tile(mode,H);
-        const size_t units=w4?size_t(c.routed_experts)+(mode==Mode::W4?1:2)*c.shared_expert:size_t(count)*2;
+        const int w4_count=w4?c.routed_experts+(mode==Mode::W4?c.shared_expert:0):0;
         uint32_t bank_flags=RK_NPU_MEM_DATA_DEFAULT;
         if(device.ctx->iommu_enabled && device.ctx->driver_version>=908)
             bank_flags|=RK_NPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;
         const int bank_experts=std::max<size_t>(1,(16u<<20)/(size_t(H)*N));
-        if(mode==Mode::W4) {
+        if(w4) {
             // Bound individual IOVA allocations while keeping every expert resident.
-            for(int first=0;first<count;first+=bank_experts) {
-                const size_t entries=std::min(bank_experts,count-first);
+            for(int first=0;first<w4_count;first+=bank_experts) {
+                const size_t entries=std::min(bank_experts,w4_count-first);
                 auto g=std::make_unique<Buffer>(),d=std::make_unique<Buffer>();
                 g->alloc(device,entries*H*N,bank_flags);
                 d->alloc(device,entries*N*H/2,bank_flags);
                 gate_banks.push_back(std::move(g));down_banks.push_back(std::move(d));
             }
-        } else {
-            gate.alloc(device,units*H*N,bank_flags);
-            down.alloc(device,units*N*H/2,bank_flags);
+        }
+        if(has_w8) {
+            const size_t entries=mode==Mode::W8?count:c.shared_expert;
+            gate.alloc(device,entries*H*N*2,bank_flags);
+            down.alloc(device,entries*N*H,bank_flags);
         }
         gcor.resize(count);dcor.resize(count);
         gw.resize(count);dw.resize(count);gs.resize(count);ds.resize(count);
@@ -421,13 +422,13 @@ struct Weights {
         } else lut_scales=false;
         for(int e=0;e<count;++e) {
             const bool i4=expert_is_w4(mode,e,c.routed_experts);
-            const size_t offset=w4?size_t(e):size_t(e)*2;
-            if(mode==Mode::W4) {
+            if(i4) {
                 gw[e]=gate_banks[e/bank_experts]->view(size_t(e%bank_experts)*H*N,size_t(H)*N);
                 dw[e]=down_banks[e/bank_experts]->view(size_t(e%bank_experts)*N*H/2,size_t(N)*H/2);
             } else {
-                gw[e]=gate.view(offset*H*N,size_t(H)*N*(i4?1:2));
-                dw[e]=down.view(offset*N*H/2,size_t(N)*H/(i4?2:1));
+                const size_t offset=mode==Mode::W8?e:0;
+                gw[e]=gate.view(offset*H*N*2,size_t(H)*N*2);
+                dw[e]=down.view(offset*N*H,size_t(N)*H);
             }
             if(!experts) {
                 gs[e].assign(2*N,1.f);ds[e].assign(H,1.f);gcor[e].assign(2*N,0);
@@ -440,7 +441,7 @@ struct Weights {
             ds[e].assign(x.down_scales,x.down_scales+H);
             for(const auto* scales:{&gs[e],&ds[e]})for(float s:*scales)
                 if(!(s>0) || !std::isfinite(s))throw Failure{RK_NPU_ERR_PARAM};
-            if(mode==Mode::W4) {
+            if(i4) {
                 rknpu2_matmul_open::detail::I4WeightBound bound;
                 check(rknpu2_matmul_open::detail::bound_i4_weights(H,2*N,x.gate_up,gate_k_tile,bound));
                 gcor[e].assign(2*N,0);
@@ -452,8 +453,6 @@ struct Weights {
                         x.gate_up,static_cast<uint8_t*>(gw[e].vaddr)+size_t(first)*N));
                 }
                 pack_w4(N,H,x.down,dw[e],dcor[e]);
-            } else if(i4) {
-                pack_w4(H,2*N,x.gate_up,gw[e],gcor[e]);pack_w4(N,H,x.down,dw[e],dcor[e]);
             } else {
                 rk_npu_matmul_i8_config gc,dc;
                 rk_npu_matmul_i8_config_init(&gc,1,2*N,H);rk_npu_matmul_i8_config_init(&dc,1,H,N);
@@ -469,10 +468,11 @@ struct Weights {
             }
         }
         if(experts) {
-            if(mode==Mode::W4) {
+            if(w4) {
                 for(auto& b:gate_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
                 for(auto& b:down_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
-            } else {gate.sync(gate.mem.size,RK_NPU_SYNC_TO_DEVICE);down.sync(down.mem.size,RK_NPU_SYNC_TO_DEVICE);}
+            }
+            if(has_w8){gate.sync(gate.mem.size,RK_NPU_SYNC_TO_DEVICE);down.sync(down.mem.size,RK_NPU_SYNC_TO_DEVICE);}
         }
         if(N==512 && !w4)coeff.sync(coeff.mem.size,RK_NPU_SYNC_TO_DEVICE);
     }
@@ -490,7 +490,7 @@ struct Job {
     rk_npu_matmul_i8_config gcfg{},dcfg{};
     rk_npu_mem ga{},gc{},da{},dc{};
 };
-struct GateWave {
+struct GemmTask {
     rk_npu_matmul_i8_config config{};
     rk_npu_mem input{},weight{},output{};
 };
@@ -502,14 +502,14 @@ struct Workspace {
     Commands gather_cmd,gate_cmd,down_cmd,middle_cmd,lut_cmd,gate4_cmd,down4_cmd;
     Buffer input4;
     Mode mode;
-    bool mixed_chain=false;
     int gate_k_tile=0,gate_waves=1;
     size_t gate_wave_stride=0;
     std::vector<float> input_scales;
     std::vector<std::vector<Assignment>> groups;
     std::vector<Assignment> ordered;
     std::vector<Job> jobs;
-    std::vector<GateWave> gate_items;
+    std::vector<GemmTask> gate_items;
+    std::vector<GemmTask> shared_gate_items,shared_down_items;
     std::vector<int8_t> input_codes;
     std::vector<OutputRow> output_rows;
     std::atomic_flag busy=ATOMIC_FLAG_INIT;
@@ -526,11 +526,6 @@ struct Workspace {
         down_a.alloc(device,max*N);down_c.alloc(device,max*H*4);
         gate_a.sync(gate_a.mem.size,RK_NPU_SYNC_TO_DEVICE);
         gather_cmd.alloc(device,max*(w4?2:1));gather_cmd.prepare_copies();
-        if(mode==Mode::RoutedW4SharedW8 && has_w8) {
-            const char* option=std::getenv("RK_NPU_MOE_W4_MIXED");
-            if(option && std::string(option)!="0" && std::string(option)!="1")throw Failure{RK_NPU_ERR_PARAM};
-            mixed_chain=!option || std::string(option)=="1";
-        }
         if(w4) {
             input4.alloc(device,size_t(c.max_rows+1)*H);
             gate4_cmd.alloc(device,(max/32+512)*gate_waves,rknpu2_matmul_open::detail::I4_COMMAND_WORDS);
@@ -565,6 +560,7 @@ struct Workspace {
         const int top=config.top_k,slots=top+config.weights.shared_expert,cores=config.npu_cores,threads=config.cpu_threads;
         const bool native=config.native_input,npu=config.middle==RK_NPU_MOE_MIDDLE_NPU_LUT;
         const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,config.weights);
+        const bool mixed_chain=w4 && has_w8;
         if(mode!=weights.mode || !same(config.weights,weights.config))throw Failure{RK_NPU_ERR_PARAM};
         if(device.ctx->id!=weights.device.ctx->id || device.domain->id!=weights.device.domain->id)
             throw Failure{RK_NPU_ERR_DOMAIN};
@@ -599,8 +595,10 @@ struct Workspace {
         std::array<size_t,3> cost{};
         for(auto& j:jobs) {
             j.w4=expert_is_w4(mode,j.expert,R);
-            if(w4 && !j.w4 && !mixed_chain)j.core=0;
-            else {j.core=int(std::min_element(cost.begin(),cost.begin()+cores)-cost.begin());cost[j.core]+=j.rows+32;}
+            j.core=int(std::min_element(cost.begin(),cost.begin()+cores)-cost.begin());
+            // Shared N slices use all cores; charging their whole row job
+            // to one core would skew the remaining routed placement.
+            if(!mixed_chain || j.w4)cost[j.core]+=j.rows+32;
             rk_npu_matmul_i8_config_init(&j.gcfg,j.rows,2*N,H);rk_npu_matmul_i8_config_init(&j.dcfg,j.rows,H,N);
             for(auto* c:{&j.gcfg,&j.dcfg}) {
                 c->a_layout=native?RK_NPU_I8_A_LAYOUT_NATIVE_K16_M16:RK_NPU_I8_A_LAYOUT_NORMAL;
@@ -615,11 +613,17 @@ struct Workspace {
         std::vector<rknpu2_matmul_open::detail::I8GroupItem> gi,di,g4,d4,all;std::vector<std::vector<I8Copy>> copies(jobs.size());
         std::vector<MiddleItem> middle;middle.reserve(npu?size_t(rows)*slots*2:0);
         // Resize once before storing pointers in g4; retain the arena between calls.
-        if(mode==Mode::W4)gate_items.resize(jobs.size()*gate_waves);
+        if(w4)gate_items.resize(jobs.size()*gate_waves);
+        if(mixed_chain) {
+            const size_t shared_tasks=size_t(ceil_div(rows,tile))*cores;
+            shared_gate_items.resize(shared_tasks);
+            shared_down_items.resize(shared_tasks);
+        }
+        size_t shared_index=0;
         for(size_t index=0;index<jobs.size();++index) {
             auto& j=jobs[index];
             all.push_back({&j.gcfg,&j.ga,&weights.gw[j.expert],&j.gc,j.core});
-            if(mode==Mode::W4) {
+            if(j.w4) {
                 for(int wave=0;wave<gate_waves;++wave) {
                     const int first=wave*gate_k_tile,width=std::min(gate_k_tile,H-first);
                     auto& item=gate_items[index*gate_waves+wave];
@@ -629,8 +633,31 @@ struct Workspace {
                     item.output=gate_c.view(size_t(wave)*gate_wave_stride+size_t(j.offset)*2*N*4,size_t(j.rows)*2*N*4);
                     g4.push_back({&item.config,&item.input,&item.weight,&item.output,j.core});
                 }
-            } else (j.w4?g4:gi).push_back(all.back());
-            (j.w4?d4:di).push_back({&j.dcfg,&j.da,&weights.dw[j.expert],&j.dc,j.core});
+            } else if(!mixed_chain)gi.push_back(all.back());
+            if(j.w4)d4.push_back({&j.dcfg,&j.da,&weights.dw[j.expert],&j.dc,j.core});
+            else if(!mixed_chain)di.push_back({&j.dcfg,&j.da,&weights.dw[j.expert],&j.dc,j.core});
+            else {
+                // Shared experts have all tokens: split their N columns across
+                // cores while routed experts retain their existing K partials.
+                auto split=[&](const rk_npu_matmul_i8_config& config,const rk_npu_mem& a,
+                               const rk_npu_mem& b,const rk_npu_mem& c,
+                               std::vector<GemmTask>& storage,
+                               std::vector<rknpu2_matmul_open::detail::I8GroupItem>& items) {
+                    // Native INT8 output views require at least 256 bytes,
+                    // including M=1, so each N slice has at least 64 columns.
+                    const int tile=std::max(64,align_up(ceil_div(config.N,cores),32));
+                    for(int core=0,first=0;first<config.N;++core,first+=tile) {
+                        auto& item=storage[shared_index*cores+core];
+                        item.config=config;item.config.N=std::min(tile,config.N-first);item.input=a;
+                        check(rk_npu_mem_view(&b,size_t(first)*config.K,size_t(item.config.N)*config.K,&item.weight));
+                        check(rk_npu_mem_view(&c,size_t(first)*j.rows*4,size_t(item.config.N)*j.rows*4,&item.output));
+                        items.push_back({&item.config,&item.input,&item.weight,&item.output,core});
+                    }
+                };
+                split(j.gcfg,j.ga,weights.gw[j.expert],j.gc,shared_gate_items,gi);
+                split(j.dcfg,j.da,weights.dw[j.expert],j.dc,shared_down_items,di);
+                ++shared_index;
+            }
             for(int row=0;row<j.rows;) {
                 if(w4 && rows==1 && j.rows==1)break;
                 const int token=ordered[j.offset+row].token;int run=1;
@@ -666,7 +693,7 @@ struct Workspace {
             lut_cmd.run(device,cores,config.timeout_ms);t.lut_load_us=us(at);at=Clock::now();
             middle_cmd.run(device,cores,config.timeout_ms);t.middle_npu_us=us(at);at=Clock::now();
             middle_gate.sync(size_t(rows)*slots*N*4,RK_NPU_SYNC_FROM_DEVICE);middle_up.sync(size_t(rows)*slots*N*4,RK_NPU_SYNC_FROM_DEVICE);
-        } else if(mode==Mode::W4)for(int wave=0;wave<gate_waves;++wave) {
+        } else if(w4)for(int wave=0;wave<gate_waves;++wave) {
             auto active=gate_c.view(size_t(wave)*gate_wave_stride,size_t(rows)*slots*2*N*4);
             check(rk_npu_mem_sync(device.ctx,&active,RK_NPU_SYNC_FROM_DEVICE));
         }
@@ -692,7 +719,7 @@ struct Workspace {
                     } else {
                         const MiddleRow middle{acc,j.w4?weights.gcor[j.expert].data():nullptr,
                             weights.gs[j.expert].data(),sa,j.rows,row,N,
-                            mode==Mode::W4?gate_waves:1,size_t(gate_wave_stride),target,
+                            j.w4?gate_waves:1,size_t(gate_wave_stride),target,
                             j.w4?MiddleLayout::I4Native:native?MiddleLayout::I8Native:MiddleLayout::I8Normal};
                         scale=swiglu_quantize_row(middle);
                     }

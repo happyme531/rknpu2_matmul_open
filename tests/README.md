@@ -35,6 +35,7 @@ Two executables sweep the `int8 × int8 → fp32` matmul over a wide M / N / K g
 | `test_w4a8_ffn --cpu` / board default | row-scale edge cases and complete gate/up → SwiGLU → Down equality, zero/repeated inputs, mixed pipelines/layouts and nonfinite-middle rejection |
 | `test_w4a8`, `test_w4a8_multiplier` | board MSD output, reusable weights/workspaces, larger tiles and explicit saturation-risk multiplier |
 | `test_moe_cpu` | fused expert middle: native W8/W4 partials, exact row scales and nearest-even A8 codes, direct normal/native/split-A4 packing and guards |
+| `test_moe_w8 --w4-split [cores]` | joint routed W4/shared W8 with K512+64 partials, shared N slices, changing M and an independent integer/float oracle; optional 1/2/3 NPU cores |
 | `test_i4_header_c`, `test_w4a8_header_c` | compile-only targets for the integer and floating W4 C headers |
 | `test_autotune_cpu` | shared timing/failure handling, W8 cache compatibility, W4 bounds and cache invalidation, caller affinity |
 | `test_w4a8_tune` | board W4 tuning, selected-weight construction, full outputs, cache hits, family reuse and sampled saturation rejection |

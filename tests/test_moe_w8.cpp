@@ -49,13 +49,15 @@ static double relative(const std::vector<float>& got,const std::vector<float>& e
 }
 int main(int argc,char** argv) try {
     const bool npu=argc>1 && std::string(argv[1])=="--npu-middle";
-    const bool w4=argc>1 && std::string(argv[1])=="--w4";
+    const bool split=argc>1 && std::string(argv[1])=="--w4-split";
+    const bool w4=split || (argc>1 && std::string(argv[1])=="--w4");
     const auto create_weights=w4?rk_npu_moe_w4_weights_create:rk_npu_moe_w8_weights_create;
     const auto create_workspace=w4?rk_npu_moe_w4_workspace_create:rk_npu_moe_w8_workspace_create;
     auto* ctx=rk_npu_open(nullptr);require(ctx,"open NPU");
     auto* domain=rk_npu_iommu_domain_create(ctx,15);require(domain,"create domain");
-    const int H=64,N=npu?512:(w4?64:32),E=3,TOP=2,MAX=256;
+    const int H=split?576:64,N=npu?512:(w4?64:32),E=3,TOP=2,MAX=256;
     rk_npu_moe_w8_config config;rk_npu_moe_w8_config_init(&config,H,N,E,1,TOP,MAX);
+    if(argc>2)config.npu_cores=std::stoi(argv[2]);
     config.middle=npu?RK_NPU_MOE_MIDDLE_NPU_LUT:RK_NPU_MOE_MIDDLE_CPU;
     std::vector<Expert> a(E+1),b(E+1);std::vector<rk_npu_moe_w8_expert> av(E+1),bv(E+1);
     for(int e=0;e<=E;++e)for(int variant=0;variant<2;++variant) {

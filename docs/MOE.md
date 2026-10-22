@@ -100,8 +100,14 @@ rounding, FP32 scale vectors, other host containers and thread stacks.
 The public API above remains W8. An experimental private mixed backend in
 `src/rk_npu_moe_w4_internal.h` keeps routed weights in packed INT4 and the
 shared expert in INT8; see the adapter's `LING3_OPEN_MOE_W4` option. It reuses
-the same run/free functions with compatible mixed handles, requires H/I
-multiples of64, CPU middle and strictly certified full K. It rejects unsupported
-weights instead of relaxing bounds. `test_moe_w8 --w4` exercises this path.
-Group-wise W4, split-K mixed MoE, different shared-expert widths, router kernels,
+the same run/free functions with compatible mixed handles and requires H/I
+multiples of64 and CPU middle. Routed gate/up retains certified K<=512 partials
+and bounded weight banks; shared gate/up and Down split N across the active
+cores and join the mixed command chains. Input quantization and CPU middle
+use the MoE nearest-even rule for both expert types. Shared and routed widths
+must match; routing IDs must be ready before the joint call begins.
+The old `RK_NPU_MOE_W4_MIXED` experimental switch is removed; mixed handles
+always use joint command chains.
+`test_moe_w8 --w4` and `--w4-split` exercise one-wave and multi-wave mixed paths.
+Group-wise W4, different shared-expert widths, router kernels,
 and CPU/NPU request overlap are not implemented by this backend.
