@@ -70,6 +70,7 @@ set(RK_NPU_SRCS
   src/rk_npu_w4a4_linear.cpp   # fused FP32/FP16 W4A4 Linear C ABI
   src/rk_npu_w4a8_quant.cpp    # full-token A8 scale + fused MSD/native packing
   src/rk_npu_w4a8_output.cpp   # partial MSD reconstruction + floating output
+  src/rk_npu_w4a8_swiglu.cpp   # fused CPU SwiGLU, two-wave consumption and maxabs
   src/rk_npu_w4a8_chain.cpp    # one per-core PC chain over all K waves
   src/rk_npu_w4a8_npu_reduce.cpp # optional retained-partial INT32 Conv consumer
   src/rk_npu_w4a8.cpp          # shared scaled W4 weights + f32/f16 entry points
@@ -130,6 +131,7 @@ set_target_properties(rk_npu_matmul_static PROPERTIES OUTPUT_NAME rk_npu_matmul)
 target_compile_options(rk_npu_matmul_static PRIVATE ${RK_NPU_AARCH64_FP16_FLAGS})
 target_link_libraries(rk_npu_matmul_static PUBLIC OpenMP::OpenMP_CXX Threads::Threads)
 set_property(SOURCE src/rk_npu_gdn_prefill.cpp APPEND PROPERTY COMPILE_OPTIONS -O3 -ffp-contract=off)
+set_property(SOURCE src/rk_npu_w4a8_swiglu.cpp APPEND PROPERTY COMPILE_OPTIONS -O3)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
   set_property(SOURCE src/rk_npu_gdn_prefill.cpp APPEND PROPERTY COMPILE_OPTIONS -mtune=cortex-a76)
 endif()
@@ -302,6 +304,8 @@ add_executable(test_w4a8 tests/test_w4a8.cpp)
 target_link_libraries(test_w4a8 PRIVATE rk_npu_matmul)
 add_executable(test_w4a8_swiglu tests/test_w4a8_swiglu.cpp)
 target_link_libraries(test_w4a8_swiglu PRIVATE rk_npu_matmul)
+add_executable(test_w4a8_ffn tests/test_w4a8_ffn.cpp)
+target_link_libraries(test_w4a8_ffn PRIVATE rk_npu_matmul)
 add_executable(test_w4a8_chain tests/test_w4a8_chain.cpp)
 target_link_libraries(test_w4a8_chain PRIVATE rk_npu_matmul)
 add_executable(test_i4_bounds tests/test_i4_bounds.cpp)
@@ -322,6 +326,7 @@ if(BUILD_TESTING)
   add_test(NAME w4a8_cpu COMMAND test_w4a8_cpu)
   add_test(NAME w4a8_reduction COMMAND test_w4a8_reduction)
   add_test(NAME w4a8_swiglu_cpu COMMAND test_w4a8_swiglu --cpu)
+  add_test(NAME w4a8_ffn_cpu COMMAND test_w4a8_ffn --cpu)
   add_test(NAME i4_bounds COMMAND test_i4_bounds)
   add_test(NAME autotune_cpu COMMAND test_autotune_cpu)
   add_test(NAME mm_gelu_cpu COMMAND test_mm_gelu --cpu)
@@ -390,7 +395,7 @@ target_link_libraries(test_w4a8_tune_layout PRIVATE rk_npu_matmul)
 # programs use __fp16 and therefore cannot be built by an x86 compiler.
 add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_cpu_kernels test_i4_cpu test_w4a4_linear_cpu test_w4a8_cpu
-  test_w4a8_reduction test_w4a8_swiglu test_i4_bounds test_autotune_cpu test_panel_layout
+  test_w4a8_reduction test_w4a8_swiglu test_w4a8_ffn test_i4_bounds test_autotune_cpu test_panel_layout
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
   test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c test_mm_tune test_mm_gelu
   test_w4a4_linear_header_c test_moe_w8_header_c test_mm test_mm_header_c test_mm_tf32

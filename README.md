@@ -11,7 +11,7 @@ Fully open source high-performance matrix multiplication library for LLM inferen
 - w8a8 int8 per-channel per-token quantized matmul kernel, with hardware weight (de)compression support
 - w4a8 per-channel per-token quantized matmul kernel implemented with Mixed-precision Split-activation Decomposition
 - w4a4 FlatQuant linear kernel
-- Fused W4A8 gate/up projection and SwiGLU epilogue
+- Fused W4A8 gate/up projection, SwiGLU and Down with row-scale reuse
 - w8a8/w4a8 quantized MoE kernel
 - Very fast fused fp16 GQA (MHA, MQA) kernel
 - Fast fused fp16 MLA/gated MLA kernel, supporting both expanded and absorbed mode
@@ -115,7 +115,7 @@ Runtime settings are described in [ENV.md](ENV.md) and the operator guides.
 | Floating W4A8 | [rk_npu_w4a8.h](include/rk_npu_w4a8.h) | Packed INT4 weights, dynamic INT8 activations, FP16/FP32 output |
 | W4A8 autotuning | [rk_npu_w4a8_tune.h](include/rk_npu_w4a8_tune.h) | Weight-aware tile/layout search and strategy caches |
 | FlatQuant W4A4 Linear | [rk_npu_w4a4_linear.h](include/rk_npu_w4a4_linear.h) | NPU FP16 transforms followed by INT4 execution |
-| Fused W4A8 gate/up + SwiGLU | [rk_npu_w4a8.h](include/rk_npu_w4a8.h) | `rk_npu_w4a8_run_swiglu_f32`: packed gate/up columns, compact FP32 output, serial/pipeline/task-chain execution |
+| Fused W4A8 gate/up + SwiGLU / FFN | [rk_npu_w4a8.h](include/rk_npu_w4a8.h) | `rk_npu_w4a8_run_swiglu_f32` or `rk_npu_w4a8_run_ffn_f32`: compact FP32 middle, two-wave CPU fusion and optional Down scale reuse |
 | Routed W8 MoE | [rk_npu_moe_w8.h](include/rk_npu_moe_w8.h) | SwiGLU experts and optional shared expert; [MoE guide](docs/MOE.md) |
 | Raw FP16 GEMM/BMM | [rk_npu_matmul_f16.h](include/rk_npu_matmul_f16.h) | Optional fused MUL/ADD and explicit split-K |
 | Experimental FP16 Attention | [rk_npu_attention_f16.h](include/rk_npu_attention_f16.h) | GQA/MHA/MQA, causal/no-mask/boolean masks, fixed-shift or stable softmax, growing and truncatable native KV; [guide](docs/ATTENTION.md) |
@@ -149,10 +149,32 @@ See [execution and autotuning](docs/API.md) and [environment settings](ENV.md).
 `rk_npu_w4a8_run_swiglu_f32` combines the gate/up projection's final reduction,
 dequantization and SwiGLU epilogue. Pack weight columns as `[gate(F), up(F)]`,
 set `N=2*F`, and receive compact FP32 `[M,F]` output. It avoids materializing a
-complete floating gate/up tensor. Down projection remains a separate GEMM.
+complete floating gate/up tensor. With exactly two K waves, one CPU consumer
+reads both native partials directly and skips the intermediate accumulator
+write/read. Other wave counts use the general accumulation path.
 The entry point supports CPU reduction with native/panel8 inputs and
-serial, pipelined or task-chain execution. Its AArch64 SIMD exponential can
-round slightly differently from scalar `expf`; see the public header.
+serial, pipelined or task-chain execution. AArch64 uses a degree-7 FP32
+exponential with branch-free saturation to `[-80,80]` and no range fallback.
+Gates below -80 produce signed zero. This replaces the previous FP64 polynomial
+epilogue; rounding, the tiny negative tail and nonfinite semantics differ from
+scalar `expf`, as described in the public header's NOTE.
+
+`rk_npu_w4a8_run_ffn_f32` additionally executes Down and reuses the full-row
+scale collected from SwiGLU result registers. Supply distinct gate/up and Down
+workspaces with the same M and domain, `gate_up.N=2*down.K`, and caller-owned
+`A`, `middle`, `C` buffers. Both workspaces remain busy for the entire call;
+all scratch is preallocated at workspace creation. For example:
+
+```c
+rk_npu_w4a8_ffn_timings times;
+int rc = rk_npu_w4a8_run_ffn_f32(gate_up_workspace, gate_up_weights,
+    down_workspace, down_weights, input, middle, output, &times);
+```
+
+`middle` remains available on success. Down uses the same quantization,
+rounding and packing as `run_f32`, while `times.down.activation_scan_us` is zero:
+Down directly references the locked gate/up workspace's row scales. Nonfinite
+middle values fail before Down submits.
 
 ## Attention and KV cache
 

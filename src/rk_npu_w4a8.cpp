@@ -29,6 +29,7 @@ struct rk_npu_w4a8_workspace {
     uint32_t domain_id = 0;
     std::vector<float> scales, inverse;
     std::vector<int32_t> accumulator;
+    std::vector<uint32_t> row_maxima;
     std::vector<rknpu2_matmul_open::detail::W4A8SwiGLUPair> swiglu_pairs;
     std::atomic_flag busy = ATOMIC_FLAG_INIT;
     rknpu2_matmul_open::detail::I4Executor executor;
@@ -66,18 +67,38 @@ int backend_config(const rk_npu_w4a8_config &cfg, rk_npu_i4_config &out,
     return RK_NPU_OK;
 }
 
-int run(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *weights, const void *A, void *C,
-        bool half, rk_npu_w4a8_timings *metrics, bool swiglu = false) {
-    if (!ws || !weights || !A || !C || A == C)
+class WorkspaceLock {
+public:
+    explicit WorkspaceLock(rk_npu_w4a8_workspace &ws)
+        : busy_(ws.busy), held_(!busy_.test_and_set(std::memory_order_acquire)) {}
+    ~WorkspaceLock() { if (held_) busy_.clear(std::memory_order_release); }
+    explicit operator bool() const { return held_; }
+    WorkspaceLock(const WorkspaceLock&) = delete;
+    WorkspaceLock& operator=(const WorkspaceLock&) = delete;
+private:
+    std::atomic_flag &busy_;
+    bool held_;
+};
+
+int validate(const rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *weights,
+              const void *A, const void *C, bool swiglu) {
+    if (!ws || !weights || !A || !C || A == C ||
+        (swiglu && (ws->npu_reduce || ws->config.N % 64))) return RK_NPU_ERR_PARAM;
+    const auto &mem = weights->packed.memory();
+    const auto &wc = weights->packed.config();
+    if (mem.ctx_id != ws->ctx_id || mem.iommu_domain_id != ws->domain_id)
+        return RK_NPU_ERR_DOMAIN;
+    if (wc.K != ws->config.K || wc.N != ws->config.N || wc.k_tile != ws->config.k_tile)
         return RK_NPU_ERR_PARAM;
-    if (swiglu && (half || ws->npu_reduce || ws->config.N % 64))
-        return RK_NPU_ERR_PARAM;
-    if (ws->busy.test_and_set(std::memory_order_acquire))
-        return RK_NPU_ERR_BUSY;
-    struct Unlock {
-        std::atomic_flag &f;
-        ~Unlock() { f.clear(std::memory_order_release); }
-    } unlock{ws->busy};
+    return RK_NPU_OK;
+}
+
+// Caller holds workspace ownership. Prescaled input is private to the FFN
+// entrypoint, which has already checked every activation while collecting maxabs.
+int run_locked(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *weights,
+        const void *A, void *C, bool half, rk_npu_w4a8_timings *metrics,
+        bool swiglu = false, bool collect = false,
+        const rk_npu_w4a8_workspace *scale_source = nullptr) {
     const auto &c = ws->config;
     RK_NPU_TRACE_EVENT("rknpu", "w4a8.run", "M", c.M, "K", c.K, "N", c.N,
         "m_tile", c.m_tile, "k_tile", c.k_tile, "n_tile", c.n_tile,
@@ -86,39 +107,55 @@ int run(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *weights, const voi
         "npu_mask", c.npu_core_mask, "input_layout", int(ws->layout),
         "npu_reduce", ws->npu_reduce, "fp16_input", half,
         "swiglu_output", swiglu, "output_N", swiglu ? c.N / 2 : c.N);
-    const auto &wc = weights->packed.config();
-    const auto &mem = weights->packed.memory();
-    if (mem.ctx_id != ws->ctx_id || mem.iommu_domain_id != ws->domain_id)
-        return RK_NPU_ERR_DOMAIN;
-    if (wc.K != c.K || wc.N != c.N || wc.k_tile != c.k_tile)
-        return RK_NPU_ERR_PARAM;
     const auto start = Clock::now();
     rk_npu_w4a8_timings t{};
-    int rc;
-    {
+    // The FFN entrypoint holds both workspaces, so upstream scale metadata
+    // remains immutable throughout Down and can be consumed without a copy.
+    const float *scales = scale_source ? scale_source->scales.data() : ws->scales.data();
+    const float *inverse = scale_source ? scale_source->inverse.data() : ws->inverse.data();
+    int rc = RK_NPU_OK;
+    if (!scale_source) {
         RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.activation_scan", "M", c.M, "K", c.K);
         rc = rknpu2_matmul_open::detail::w4a8_scales(A, half, c.M, c.K, c.cpu_threads, ws->scales.data(), ws->inverse.data());
+        t.activation_scan_us = elapsed(start);
     }
-    t.activation_scan_us = elapsed(start);
     if (!rc) {
-        rknpu2_matmul_open::detail::W4A8Input input{A, half, c.M, c.K, ws->scales.data(), ws->inverse.data(), c.cpu_threads, ws->layout};
+        rknpu2_matmul_open::detail::W4A8Input input{A, half, c.M, c.K, scales, inverse, c.cpu_threads, ws->layout};
         rknpu2_matmul_open::detail::W4A8Reduction reduction{ws->accumulator.data(), weights->correction.data(),
-                                       ws->scales.data(), weights->scales.data(), C, half,
-                                       swiglu ? &ws->swiglu_pairs : nullptr};
+                                       scales, weights->scales.data(), C, half,
+                                       swiglu ? &ws->swiglu_pairs : nullptr,
+                                       collect ? ws->row_maxima.data() : nullptr, c.M + 16};
+        if (collect) std::fill(ws->row_maxima.begin(), ws->row_maxima.end(), 0u);
         rk_npu_i4_timings inner{};
         if(ws->chain) rc=ws->chain->run(weights->packed,input,reduction,inner);
         else rc = ws->executor.run(weights->packed, rknpu2_matmul_open::detail::w4a8_pack, &input, nullptr, &inner,
-                              ws->npu_reduce ? nullptr : rknpu2_matmul_open::detail::w4a8_reduce, &reduction);
+                              ws->npu_reduce ? nullptr : rknpu2_matmul_open::detail::w4a8_reduce, &reduction,
+                              swiglu && ws->executor.plan().wave_count() == 2
+                                  ? rknpu2_matmul_open::detail::w4a8_reduce_two : nullptr);
         t.quant_pack_us = inner.pack_us;
         t.sync_us = inner.sync_us;
         t.submit_us = inner.submit_us;
         t.reduce_us = inner.reduce_us;
         if (!rc && ws->npu_reduce) rc = ws->reducer.run(reduction,t);
+        if (!rc && collect) {
+            const auto begin = Clock::now();
+            rc = rknpu2_matmul_open::detail::w4a8_finish_scales(c.M, c.cpu_threads,
+                ws->row_maxima.data(), c.M + 16, ws->scales.data(), ws->inverse.data());
+            t.reduce_us += elapsed(begin);
+        }
     }
     t.total_us = elapsed(start);
     if (metrics)
         *metrics = t;
     return rc;
+}
+int run(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_weights *weights,
+        const void *A, void *C, bool half, rk_npu_w4a8_timings *metrics, bool swiglu = false) {
+    const int rc = validate(ws, weights, A, C, swiglu);
+    if (rc) return rc;
+    WorkspaceLock lock(*ws);
+    if (!lock) return RK_NPU_ERR_BUSY;
+    return run_locked(ws, weights, A, C, half, metrics, swiglu);
 }
 } // namespace
 
@@ -149,7 +186,11 @@ extern "C" int rk_npu_w4a8_memory_query_ex(const rk_npu_w4a8_config* cfg,
         try { rc=rknpu2_matmul_open::detail::W4A8NpuReduce::query(inner,layout,info); }
         catch(...) { return RK_NPU_ERR_NOMEM; }
         if(rc) return rc;
-    } else info.base.cpu_scratch_bytes+=uint64_t(cfg->M)*((uint64_t(cfg->N)+63)/64*64)*sizeof(int32_t);
+    } else {
+        info.base.cpu_scratch_bytes+=uint64_t(cfg->M)*((uint64_t(cfg->N)+63)/64*64)*sizeof(int32_t);
+        if (cfg->N % 64 == 0)
+            info.base.cpu_scratch_bytes+=(uint64_t(cfg->M)+16)*cfg->cpu_threads*sizeof(uint32_t);
+    }
     if(info.base.cpu_scratch_bytes>SIZE_MAX || info.base.weight_metadata_bytes>SIZE_MAX)
         return RK_NPU_ERR_NOMEM;
     info.workspace_bytes=info.base.backend.input_bytes+info.base.backend.partial_bytes+
@@ -280,6 +321,7 @@ extern "C" rk_npu_w4a8_workspace *rk_npu_w4a8_workspace_create_ex(rk_npu_iommu_d
         } else if(ws->executor.prepare(domain,inner,ws->npu_reduce,ws->layout))return nullptr;
         if(ws->npu_reduce && ws->reducer.prepare(domain,ws->executor.plan())) return nullptr;
         if(!ws->npu_reduce && cfg->N % 64 == 0) {
+            ws->row_maxima.resize((size_t(cfg->M) + 16) * cfg->cpu_threads);
             uint32_t starts[3]{}, counts[3]{};
             ws->swiglu_pairs = rknpu2_matmul_open::detail::w4a8_swiglu_pairs(
                 cfg->N, rknpu2_matmul_open::detail::i4_tiles(inner, starts, counts, ws->layout));
@@ -304,4 +346,32 @@ extern "C" int rk_npu_w4a8_run_f16(rk_npu_w4a8_workspace *ws, const rk_npu_w4a8_
 extern "C" int rk_npu_w4a8_run_swiglu_f32(rk_npu_w4a8_workspace *ws,
     const rk_npu_w4a8_weights *w, const float *A, float *middle, rk_npu_w4a8_timings *t) {
     return run(ws, w, A, middle, false, t, true);
+}
+
+extern "C" int rk_npu_w4a8_run_ffn_f32(rk_npu_w4a8_workspace *gate_up,
+    const rk_npu_w4a8_weights *gate_up_weights, rk_npu_w4a8_workspace *down,
+    const rk_npu_w4a8_weights *down_weights, const float *A, float *middle,
+    float *C, rk_npu_w4a8_ffn_timings *metrics) {
+    if (metrics) *metrics = {};
+    if (gate_up == down || middle == C || A == C)
+        return RK_NPU_ERR_PARAM;
+    int rc = validate(gate_up, gate_up_weights, A, middle, true);
+    if (rc) return rc;
+    rc = validate(down, down_weights, middle, C, false);
+    if (rc) return rc;
+    if (gate_up->config.M != down->config.M || gate_up->config.N / 2 != down->config.K)
+        return RK_NPU_ERR_PARAM;
+    if (gate_up->ctx_id != down->ctx_id || gate_up->domain_id != down->domain_id)
+        return RK_NPU_ERR_DOMAIN;
+    WorkspaceLock gate_lock(*gate_up);
+    if (!gate_lock) return RK_NPU_ERR_BUSY;
+    WorkspaceLock down_lock(*down);
+    if (!down_lock) return RK_NPU_ERR_BUSY;
+    const auto begin = Clock::now();
+    rk_npu_w4a8_ffn_timings t{};
+    rc = run_locked(gate_up, gate_up_weights, A, middle, false, &t.gate_up, true, true);
+    if (!rc) rc = run_locked(down, down_weights, middle, C, false, &t.down, false, false, gate_up);
+    t.total_us = elapsed(begin);
+    if (metrics) *metrics = t;
+    return rc;
 }

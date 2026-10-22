@@ -15,7 +15,8 @@ public:
                 bool retain_partials = false, I4InputLayout layout = I4InputLayout::Native);
     int run(const I4Weights& weights, rk_npu_i4_input_producer producer,
              void* user, int32_t* C, rk_npu_i4_timings* times,
-             I4PartialConsumer consumer = nullptr, void* consumer_user = nullptr);
+             I4PartialConsumer consumer = nullptr, void* consumer_user = nullptr,
+             I4TwoPartialConsumer two_consumer = nullptr);
     int K() const { return plan_.config().K; }
     const I4Plan& plan() const { return plan_; }
 private:

@@ -31,6 +31,8 @@ Two executables sweep the `int8 × int8 → fp32` matmul over a wide M / N / K g
 | `test_i4` | board integer W4A4, tails, multicore, producer callbacks and pipeline correctness |
 | `test_w4a8_cpu` | host/board FP32/FP16 quantization, parallel packing, tails and half conversion |
 | `test_w4a8_reduction` | independent native INT16/INT32 reduction oracle, first/middle/final waves, FP32/FP16, 1–4 threads, M/N tails, guards and sums above 2^24 |
+| `test_w4a8_swiglu --cpu` / board default | FP32 activation accuracy, native two-wave/general epilogues, exact row scales, M tails, panels, guards and weight rebinding |
+| `test_w4a8_ffn --cpu` / board default | row-scale edge cases and complete gate/up → SwiGLU → Down equality, zero/repeated inputs, mixed pipelines/layouts and nonfinite-middle rejection |
 | `test_w4a8`, `test_w4a8_multiplier` | board MSD output, reusable weights/workspaces, larger tiles and explicit saturation-risk multiplier |
 | `test_i4_header_c`, `test_w4a8_header_c` | compile-only targets for the integer and floating W4 C headers |
 | `test_autotune_cpu` | shared timing/failure handling, W8 cache compatibility, W4 bounds and cache invalidation, caller affinity |

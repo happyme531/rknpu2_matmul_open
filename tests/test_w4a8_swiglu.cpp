@@ -1,6 +1,6 @@
 #include "rk_npu_w4a8.h"
 #include "../src/rk_npu_w4a8_cpu.h"
-#include "../src/rk_npu_swiglu_neon.h"
+#include "../src/rk_npu_w4a8_swiglu_neon.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -27,10 +27,10 @@ static void activation(const float *gu, float *out, int M, int F, int threads) {
         const int end = std::min(F, block * 64 + 64);
         int n = block * 64;
 #if defined(__aarch64__)
-        for (; n + 4 <= end; n += 4)
-            vst1q_f32(y + n, detail::swiglu::apply4(vld1q_f32(g + n), vld1q_f32(g + F + n)));
+        for (; n + 16 <= end; n += 16)
+            detail::w4swiglu::apply16<false>(g + n, g + F + n, y + n);
 #endif
-        for (; n < end; ++n) y[n] = detail::swiglu::scalar(g[n], g[F + n]);
+        for (; n < end; ++n) y[n] = (g[n] / (1.f + std::exp(-g[n]))) * g[F + n];
     }
 }
 static void compare(const float *a, const float *b, size_t n) {
@@ -49,45 +49,25 @@ static void scalar_error() {
         gu[n] = float(int(rng() % 1600001) - 800000) * .0001f;
         gu[F + n] = float(int(rng() % 20001) - 10000) * .01f;
     }
-    // Mixed groups exercise the whole-four-lane scalar fallback.
-    for (int n = 0; n < 32; ++n) gu[n] = n % 2 ? -100.f : 100.f;
+    // Cover both ends of the FP32 exponential domain and large finite gates
+    // that previously wrapped the constructed exponent without saturation.
+    for (int n = 0; n < 32; ++n) gu[n] = n % 2 ? -80.f : 80.f;
+    const float extremes[] = {-100.f, 100.f, -10000.f, 10000.f,
+        -std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    for (int i = 0; i < int(sizeof(extremes) / sizeof(*extremes)); ++i) {
+        gu[32 + i] = extremes[i];
+        gu[F + 32 + i] = .5f;
+    }
     activation(gu.data(), out.data(), 1, F, 4);
     double largest = 0;
     for (int n = 0; n < F; ++n) {
-        const float expected = detail::swiglu::scalar(gu[n], gu[F + n]);
+        const float expected = (gu[n] / (1.f + std::exp(-gu[n]))) * gu[F + n];
         const double relative = std::fabs(double(out[n]) - expected) /
                                 std::max(1e-30, std::fabs(double(expected)));
         largest = std::max(largest, relative);
-        CHECK(relative <= 3e-7);
+        CHECK(relative <= 7e-7);
     }
     std::printf("PASS activation scalar maximum relative error %.9g\n", largest);
-}
-static void paired_activation() {
-#if defined(__aarch64__)
-    constexpr int count = 16384;
-    std::vector<float> gate(count), up(count), expected(count), out(count);
-    std::mt19937 rng(20261011);
-    for (int i = 0; i < count; ++i) {
-        gate[i] = float(int(rng() % 1600001) - 800000) * .0001f;
-        up[i] = float(int(rng() % 20001) - 10000) * .01f;
-    }
-    const float special[] = {0.f, -0.f, 80.f, -80.f, std::nextafter(80.f, INFINITY),
-        std::nextafter(-80.f, -INFINITY), 100.f, -100.f,
-        std::numeric_limits<float>::denorm_min(), INFINITY, -INFINITY,
-        std::numeric_limits<float>::quiet_NaN()};
-    for (int i = 0; i < int(sizeof(special) / sizeof(*special)); ++i) {
-        gate[i * 8 + i % 8] = special[i];
-        up[(i + 16) * 8 + i % 8] = special[i];
-    }
-    for (int i = 0; i < count; i += 4)
-        vst1q_f32(expected.data() + i,
-                  detail::swiglu::apply4(vld1q_f32(gate.data() + i), vld1q_f32(up.data() + i)));
-    for (int i = 0; i < count; i += 8)
-        detail::swiglu::apply8(vld1q_f32(gate.data() + i), vld1q_f32(up.data() + i),
-                              vld1q_f32(gate.data() + i + 4), vld1q_f32(up.data() + i + 4), out.data() + i);
-    compare(expected.data(), out.data(), count);
-    std::puts("PASS paired activation: bitwise output, mixed four-lane fallback and special values");
-#endif
 }
 static void native_reduction(int M, int F, int nt, int waves, int threads, bool panel) {
     rk_npu_i4_config cfg{2 * M, 2 * F, waves * 480, panel ? 16 : 128, 480, nt, F < 96 ? 1u : 7u, 500, 0, threads};
@@ -108,13 +88,35 @@ static void native_reduction(int M, int F, int nt, int waves, int threads, bool 
     for (int m = 0; m < M; ++m) as[m] = .01f + float(m % 11) * .001f;
     detail::W4A8Reduction normal{acc.data() + 16, correction.data(), as.data(), ws.data(), gu.data(), false};
     detail::W4A8Reduction fused{fused_acc.data() + 16, correction.data(), as.data(), ws.data(), out.data() + 16, false, &pairs};
+    const int stride = M + 16;
+    std::vector<uint32_t> maxima(size_t(stride) * threads);
+    fused.row_maxima = maxima.data();
+    fused.row_maxima_stride = stride;
+    std::vector<int16_t> first;
     for (int w = 0; w < waves; ++w) {
         for (auto &v : partial) v = int(rng() % 65536) - 32768;
+        if (w == 0 && waves == 2) first = partial;
         CHECK(!detail::w4a8_reduce_tiles(normal, cfg, tiles, w, waves, partial.data()));
         CHECK(!detail::w4a8_reduce_tiles(fused, cfg, tiles, w, waves, partial.data()));
     }
     activation(gu.data(), expected.data(), M, F, threads);
     compare(expected.data(), out.data() + 16, expected.size());
+    auto check_scales = [&] {
+        std::vector<float> scales(M), inverse(M), ref_scales(M), ref_inverse(M);
+        CHECK(!detail::w4a8_finish_scales(M, threads, maxima.data(), stride, scales.data(), inverse.data()));
+        CHECK(!detail::w4a8_scales(out.data() + 16, false, M, F, threads, ref_scales.data(), ref_inverse.data()));
+        compare(ref_scales.data(), scales.data(), M);
+        compare(ref_inverse.data(), inverse.data(), M);
+    };
+    check_scales();
+    if (waves == 2) {
+        std::fill(maxima.begin(), maxima.end(), 0u);
+        std::fill(fused_acc.begin(), fused_acc.end(), 0x12345678);
+        CHECK(!detail::w4a8_reduce_two_tiles(fused, cfg, first.data(), partial.data()));
+        compare(expected.data(), out.data() + 16, expected.size());
+        check_scales();
+        for (int32_t v : fused_acc) CHECK(v == 0x12345678);
+    }
     for (int i = 0; i < 16; ++i) {
         CHECK(out[i] == -12345.f && out[out.size() - 1 - i] == -12345.f);
         CHECK(fused_acc[i] == 0x12345678 && fused_acc[fused_acc.size() - 1 - i] == 0x12345678);
@@ -242,7 +244,6 @@ int main(int argc, char **argv) {
     try {
         if (argc > 1 && !std::strcmp(argv[1], "--cpu")) {
             scalar_error();
-            paired_activation();
             for (int M : {1, 2, 4, 8, 64, 65, 128}) for (int F : {32, 96, 128, 9728})
                 for (int threads : {1, 2, 3, 4}) for (int waves : {1, 2, 5})
                     native_reduction(M, F, threads % 2 ? 2048 : 4096, waves, threads, threads % 2);

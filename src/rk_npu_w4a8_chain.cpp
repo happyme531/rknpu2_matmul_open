@@ -133,7 +133,9 @@ int W4A8Chain::run(const I4Weights& weights,const W4A8Input& input,const W4A8Red
     begin=Clock::now();const auto* src=static_cast<const int16_t*>(p.partial.mem.vaddr);
     { RK_NPU_TRACE_EVENT("rknpu.detail", "w4a8.chain_reduce", "cpu_threads", p.cfg.cpu_threads);
     try {
-        for(int w=0;!rc && w<int(p.waves.size());++w)
+        if (p.waves.size()==2 && reduction.swiglu_pairs)
+            rc=w4a8_reduce_two_tiles(reduction,p.cfg,src,src+p.partial_stride/2);
+        else for(int w=0;!rc && w<int(p.waves.size());++w)
             rc=w4a8_reduce_tiles(reduction,p.cfg,p.tiles,w,int(p.waves.size()),src+uint64_t(w)*p.partial_stride/2);
     } catch(...) {rc=RK_NPU_ERR_PARAM;}
     }

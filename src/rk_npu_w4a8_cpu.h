@@ -26,10 +26,20 @@ struct W4A8Reduction {
     void *output;
     bool half;
     const std::vector<W4A8SwiGLUPair> *swiglu_pairs = nullptr;
+    uint32_t *row_maxima = nullptr; // private [cpu_threads, row_maxima_stride]
+    int row_maxima_stride = 0;
 };
 int w4a8_scales(const void *A, bool half, int M, int K, int threads, float *scales, float *inverse);
 int w4a8_pack(void *user, const rk_npu_i4_input_tile *tile);
 int w4a8_reduce(void *user, const I4Plan &plan, int wave, const int16_t *partial);
+// Private SwiGLU consumers assume geometry/state validated by workspace creation
+// and public entrypoints; the executor guarantees two synchronized partials.
+int w4a8_reduce_two(void *user, const I4Plan&, const int16_t*, const int16_t*);
+int w4a8_reduce_two_tiles(const W4A8Reduction&, const rk_npu_i4_config&,
+                          const int16_t*, const int16_t*);
+int w4a8_reduce_swiglu(const W4A8Reduction&, const rk_npu_i4_config&, const int16_t*, bool first);
+int w4a8_finish_scales(int M, int threads, const uint32_t *maxima, int stride,
+                       float *scales, float *inverse);
 // CPU-only boundary: NPU tiles describe storage, not the CPU work partition.
 int w4a8_reduce_tiles(const W4A8Reduction&, const rk_npu_i4_config&,
                       const std::vector<I4Tile>&, int wave, int waves, const int16_t* partial);

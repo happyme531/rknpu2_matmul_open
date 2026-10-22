@@ -53,9 +53,11 @@ int I4Executor::wait(rk_npu_i4_timings& times) {
 }
 int I4Executor::run(const I4Weights& weights, rk_npu_i4_input_producer producer,
                      void* user, int32_t* C, rk_npu_i4_timings* metrics,
-                     I4PartialConsumer consumer, void* consumer_user) {
-    if (!producer || (!C && !consumer && !plan_.retains_partials()) ||
-        (plan_.retains_partials() && (C || consumer))) return RK_NPU_ERR_PARAM;
+                     I4PartialConsumer consumer, void* consumer_user,
+                     I4TwoPartialConsumer two_consumer) {
+    if (!producer || (!C && !consumer && !two_consumer && !plan_.retains_partials()) ||
+        (plan_.retains_partials() && (C || consumer || two_consumer)) ||
+        (two_consumer && (C || plan_.wave_count()!=2))) return RK_NPU_ERR_PARAM;
     if (busy_.test_and_set(std::memory_order_acquire)) return RK_NPU_ERR_BUSY;
     struct Unlock { std::atomic_flag& f; ~Unlock() { f.clear(std::memory_order_release); } } unlock{busy_};
 #if RK_NPU_ENABLE_TRACE
@@ -67,8 +69,26 @@ int I4Executor::run(const I4Weights& weights, rk_npu_i4_input_producer producer,
     const auto start=Clock::now(); rk_npu_i4_timings times{};
     int rc=plan_.bind(weights);
     const int count=plan_.wave_count();
+    const int16_t* partials[2]{};
+    bool reading[2]{};
     auto reduce=[&](int wave) {
         if (plan_.retains_partials()) return RK_NPU_OK;
+        if (two_consumer) {
+            auto t=Clock::now();
+            const int opened=plan_.begin_partial(wave,&partials[wave]);
+            times.sync_us+=elapsed(t);
+            if (opened) return opened;
+            reading[wave]=true;
+            if (wave==0) return RK_NPU_OK;
+            t=Clock::now();
+            int result;
+            { RK_NPU_TRACE_EVENT("rknpu.detail", "i4.two_wave_reduce",
+                "cpu_threads", plan_.config().cpu_threads);
+              try { result=two_consumer(consumer_user,plan_,partials[0],partials[1]); }
+              catch (...) { result=RK_NPU_ERR_PARAM; } }
+            times.reduce_us+=elapsed(t);
+            return result;
+        }
         return consumer ? plan_.consume(wave,consumer,consumer_user,times) : plan_.reduce(wave,C,times);
     };
     if (!rc && !plan_.config().pipeline) {
@@ -91,6 +111,14 @@ int I4Executor::run(const I4Weights& weights, rk_npu_i4_input_producer producer,
             if (!rc) rc=submitted;
         }
         if (!rc) rc=reduce(count-1);
+    }
+    // Also close P0 after a later producer/submit/consumer failure. Any pending
+    // submit has been drained above before CPU ownership is released.
+    for (int w=0;w<2;++w) if (reading[w]) {
+        const auto t=Clock::now();
+        const int end=plan_.end_partial(w);
+        times.sync_us+=elapsed(t);
+        if (!rc) rc=end;
     }
     times.total_us=elapsed(start);
     if (metrics) *metrics=times;

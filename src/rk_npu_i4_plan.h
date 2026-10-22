@@ -40,6 +40,9 @@ class I4Plan;
 /* Called with synchronized native INT16 partials on the execution thread.
  * The plan owns begin/end CPU access; consumers must not retain the pointer. */
 using I4PartialConsumer = int (*)(void*, const I4Plan&, int wave, const int16_t*);
+/* Optional final consumer of exactly two K waves. The executor keeps both
+ * CPU read windows open until this callback returns; neither pointer escapes. */
+using I4TwoPartialConsumer = int (*)(void*, const I4Plan&, const int16_t*, const int16_t*);
 
 /* Persistent execution resources, independent of input producer and reduction
  * policy. Native partials are exposed here for future fused W4A8/FlatQuant

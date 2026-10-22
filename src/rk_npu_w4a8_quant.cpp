@@ -142,6 +142,23 @@ int w4a8_scales(const void *A, bool half, int M, int K, int threads, float *scal
     return half ? scales_impl(static_cast<const uint16_t *>(A), M, K, threads, scales, inverse)
                 : scales_impl(static_cast<const float *>(A), M, K, threads, scales, inverse);
 }
+int w4a8_finish_scales(int M, int threads, const uint32_t *maxima, int stride,
+                       float *scales, float *inverse) {
+    for (int m = 0; m < M; ++m) {
+        uint32_t bits = 0;
+        for (int t = 0; t < threads; ++t)
+            bits = std::max(bits, maxima[size_t(t) * stride + m]);
+        // Unsigned magnitude maxima retain nonfinite values as well as the
+        // exact finite FP32 maximum. Reject them before the Down submission.
+        if (bits >= 0x7f800000u) return RK_NPU_ERR_PARAM;
+        float maximum;
+        std::memcpy(&maximum, &bits, sizeof(maximum));
+        const float scale = maximum == 0 ? 1.f : std::max(maximum / 127.f, FLT_MIN);
+        scales[m] = scale;
+        inverse[m] = 1.f / scale;
+    }
+    return RK_NPU_OK;
+}
 int w4a8_pack(void *user, const rk_npu_i4_input_tile *t) {
     if (!user || !t)
         return RK_NPU_ERR_PARAM;

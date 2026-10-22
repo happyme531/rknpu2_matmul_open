@@ -34,7 +34,8 @@ typedef struct rk_npu_w4a8_config {
 typedef struct rk_npu_w4a8_memory_info {
     rk_npu_i4_memory_info backend;  /* physical 2*M native buffers and tasks */
     uint64_t weight_metadata_bytes; /* FP32 scale[N] + INT32 correction[N] */
-    uint64_t cpu_scratch_bytes;     /* native INT32 M*align64(N) + two float[M] arrays */
+    uint64_t cpu_scratch_bytes;     /* native INT32 M*align64(N), two float[M]
+                                      arrays and CPU SwiGLU row-max scratch */
 } rk_npu_w4a8_memory_info;
 
 /* Opt-in execution policies. Existing APIs keep native input + CPU reduction.
@@ -151,12 +152,40 @@ int rk_npu_w4a8_run_f16(rk_npu_w4a8_workspace *workspace, const rk_npu_w4a8_weig
  * before submit. Serial, pipelined, chain and native/panel8 inputs are supported.
  * The final CPU consumer writes middle directly from native integer partials;
  * no complete FP32 gate/up tensor is stored. reduce_us includes activation.
- * AArch64 uses a FP64 polynomial exponential rounded to FP32; floating
- * results can differ slightly from scalar expf.
+ * AArch64 uses a degree-7 FP32 exponential with branch-free saturation to
+ * [-80,80]; gate<-80 produces signed zero. NOTE: the tiny negative tail and
+ * exact expf rounding/nonfinite semantics are not preserved; there is no
+ * FP64/scalar fallback. Exactly two K waves are
+ * consumed together, avoiding the intermediate INT32 accumulator write/read.
  * The blocking, domain, non-reentrancy and failure contracts above also apply. */
 int rk_npu_w4a8_run_swiglu_f32(rk_npu_w4a8_workspace *workspace,
     const rk_npu_w4a8_weights *weights, const float *A, float *middle,
     rk_npu_w4a8_timings *timings);
+
+typedef struct rk_npu_w4a8_ffn_timings {
+    rk_npu_w4a8_timings gate_up, down;
+    double total_us;
+} rk_npu_w4a8_ffn_timings;
+
+/* Complete FP32 gate/up -> SwiGLU -> Down, with dynamic per-row A8 scales.
+ * gate_up.N=2*F, down.K=F, and both workspaces have the same M and domain.
+ * They must be distinct; gate_up requires the effective CPU reduction backend.
+ * Down supports every ordinary W4A8 backend/layout/pipeline. Weights retain
+ * their respective K/N/k_tile keys. A=[M,gate_up.K], middle=[M,F], C=[M,down.N]
+ * are compact, caller-owned, mutually non-aliasing FP32 buffers. middle is
+ * both output and scratch, and remains available after success.
+ *
+ * SwiGLU collects full-row maxabs directly from result registers. Down reuses
+ * the exact scale/inverse without rescanning middle. Zero rows, FLT_MIN and
+ * rounding follow run_f32. Nonfinite middle is rejected before Down submits;
+ * on any failure middle/C are unspecified. No per-run tensor/device allocation.
+ * Both workspaces are held BUSY for the entire blocking call. Timings may be
+ * NULL; down.activation_scan_us is zero (metadata is referenced directly).
+ */
+int rk_npu_w4a8_run_ffn_f32(rk_npu_w4a8_workspace *gate_up,
+    const rk_npu_w4a8_weights *gate_up_weights, rk_npu_w4a8_workspace *down,
+    const rk_npu_w4a8_weights *down_weights, const float *A, float *middle,
+    float *C, rk_npu_w4a8_ffn_timings *timings);
 
 #ifdef __cplusplus
 }

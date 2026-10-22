@@ -8,6 +8,11 @@ int w4a8_header_is_c(void) {
     rk_npu_w4a8_options_init(&strategy.execution);
     rk_npu_w4a8_options options;
     rk_npu_w4a8_memory_info_ex extended;
+    rk_npu_w4a8_ffn_timings ffn = {0};
+    int (*run_ffn)(rk_npu_w4a8_workspace *, const rk_npu_w4a8_weights *,
+        rk_npu_w4a8_workspace *, const rk_npu_w4a8_weights *, const float *,
+        float *, float *, rk_npu_w4a8_ffn_timings *) = rk_npu_w4a8_run_ffn_f32;
+    (void)ffn; (void)run_ffn;
     rk_npu_w4a8_options_init(&options);
     return rk_npu_w4a8_memory_query(&cfg, &info) |
         rk_npu_w4a8_memory_query_ex(&cfg, &options, &extended);
