@@ -96,6 +96,63 @@ int main() try {
         std::printf("W4 slot permutation checks passed\n");
     }
     require(rk_npu_moe_quant_import_expert(slots,0,blob.data(),bytes-1)==RK_NPU_ERR_PARAM,"reject short packed record");
+    // Existing W4 cache records must remain usable when a resident shared W8
+    // expert is attached. Compare imports/permutations with independently
+    // packed mixed weights; the shared expert is never a replaceable slot.
+    std::vector<int8_t> shared_gate(H*2*F),shared_down(F*H);
+    std::vector<float> shared_gs(2*F,.0003f),shared_ds(H,.0004f);
+    for(size_t i=0;i<shared_gate.size();++i)shared_gate[i]=int8_t(int((i*11+i/19)%255)-127);
+    for(size_t i=0;i<shared_down.size();++i)shared_down[i]=int8_t(int((i*13+i/17)%255)-127);
+    rk_npu_moe_w8_expert shared{shared_gate.data(),shared_gs.data(),shared_down.data(),shared_ds.data()};
+    auto mixed_experts=experts;mixed_experts.push_back(shared);
+    auto mixed_cfg=cfg;mixed_cfg.weights.shared_expert=1;
+    auto* mixed=rk_npu_moe_w4_weights_create(domain,&mixed_cfg.weights,mixed_experts.data());
+    auto* mixed_slots=rk_npu_moe_w4_slots_create(domain,&mixed_cfg.weights,&shared);
+    require(mixed&&mixed_slots,"create mixed resident/slot weights");
+    require(rk_npu_moe_quant_expert_blob_bytes(mixed_slots)==bytes,"mixed W4 cache record layout");
+    require(!rk_npu_moe_w4_slots_create(domain,&cfg.weights,&shared),"mixed slots require shared_expert=1");
+    require(!rk_npu_moe_w4_slots_create(domain,&mixed_cfg.weights,nullptr),"mixed slots require shared weights");
+    require(rk_npu_moe_quant_import_expert(mixed_slots,E,blob.data(),blob.size())==RK_NPU_ERR_PARAM,"shared W8 is not an import slot");
+    require(rk_npu_moe_quant_export_expert(mixed_slots,E,blob.data(),blob.size())==RK_NPU_ERR_PARAM,"shared W8 is not a W4 cache record");
+    require(rk_npu_moe_quant_import_expert(mixed_slots,0,blob.data(),bytes-1)==RK_NPU_ERR_PARAM,"reject short mixed record");
+    for(int cores:{1,2,3}) {
+        mixed_cfg.npu_cores=cores;
+        auto* mixed_work=rk_npu_moe_w4_workspace_create(domain,&mixed_cfg);
+        require(mixed_work,"create mixed workspace");
+        int rotation=0;
+        for(int rows:{1,5,128,1}) {
+            for(int e=0;e<E;++e) {
+                const int slot=(e+rotation)%E;
+                require(!rk_npu_moe_quant_export_expert(weights,e,blob.data(),blob.size()),"export all-W4 routed record");
+                require(!rk_npu_moe_quant_import_expert(mixed_slots,slot,blob.data(),blob.size()),"import mixed routed record");
+                require(!rk_npu_moe_quant_export_expert(mixed_slots,slot,roundtrip.data(),roundtrip.size()),"export mixed routed record");
+                require(blob==roundtrip,"mixed routed byte roundtrip");
+            }
+            std::vector<float> input(rows*H),actual(rows*H),expected(rows*H),routes(rows*K);
+            std::vector<int32_t> ids(rows*K),physical(rows*K);
+            for(size_t i=0;i<input.size();++i)input[i]=std::sin(float(i%97)*.13f)*.3f;
+            for(int r=0;r<rows;++r)for(int k=0;k<K;++k) {
+                // Include duplicate routes and non-unit sums; shared stays coefficient 1.
+                ids[r*K+k]=(r+(r%2?k:0))%E;
+                physical[r*K+k]=(ids[r*K+k]+rotation)%E;
+                routes[r*K+k]=k?.375f:.875f;
+            }
+            const int rc=rk_npu_moe_w8_run_f32(mixed_work,mixed,rows,input.data(),ids.data(),routes.data(),expected.data(),nullptr);
+            if(rc)std::fprintf(stderr,"mixed resident cores=%d rows=%d rc=%d\n",cores,rows,rc);
+            require(!rc,"run independently packed mixed weights");
+            require(!rk_npu_moe_w8_run_f32(mixed_work,mixed_slots,rows,input.data(),physical.data(),routes.data(),actual.data(),nullptr),"run mixed slots");
+            require(actual==expected,"mixed slot replacement changed routed/shared output");
+            for(int row:{0,rows/2,rows-1}) {
+                std::vector<float> serial(H);
+                require(!rk_npu_moe_w8_run_f32(mixed_work,mixed,1,input.data()+row*H,ids.data()+row*K,routes.data()+row*K,serial.data(),nullptr),"run mixed single-row control");
+                require(std::equal(serial.begin(),serial.end(),expected.begin()+row*H),"mixed batch gather changed single-row output");
+            }
+            ++rotation;
+        }
+        rk_npu_moe_w8_workspace_free(mixed_work);
+    }
+    rk_npu_moe_w8_weights_free(mixed_slots);rk_npu_moe_w8_weights_free(mixed);
+    std::puts("Mixed W4/W8 cache import and shared-expert checks passed");
     rk_npu_moe_w8_workspace_free(slot_work);rk_npu_moe_w8_weights_free(slots);
     rk_npu_moe_w8_workspace_free(work);rk_npu_moe_w8_weights_free(weights);
     rk_npu_iommu_domain_free(domain);rk_npu_close(ctx);

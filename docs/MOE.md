@@ -87,6 +87,13 @@ rounding, FP32 scale vectors, other host containers and thread stacks.
 - `test_moe_w8` checks independent integer/float references, A/B/A weight
   rebinding, batch transitions, duplicates, zero input, nearest-even input,
   invalid arguments, domain mismatch, and fewer jobs than requested cores.
+- `test_moe_quant` also imports existing all-W4 cache records into mixed slot
+  banks, rotates routed slots and compares with independently packed mixed
+  weights at M1/5/128 and 1/2/3 NPU cores. It checks that the shared W8 entry
+  cannot be exported or overwritten as a routed slot. Batch results also match
+  single-row controls at H2048, where gathering five rows exceeds one copy.
+- `test_moe_w8 --w4-wide` checks the H8128 boundary against an independent
+  integer/float oracle, including splitting one shared input row across copies.
 - `tools/ling_moe_probe/compare_api.cpp` compares both public input entries to
   the original real-weight experiment on two fixture slices, normal/native-A,
   and CPU/NPU middle. Historical bitwise results predate the shared FP32
@@ -97,11 +104,11 @@ rounding, FP32 scale vectors, other host containers and thread stacks.
   and retains its original router. That adapter and its fixtures are not
   bundled with this standalone library.
 
-The public API above remains W8. An experimental private mixed backend in
-`src/rk_npu_moe_w4_internal.h` keeps routed weights in packed INT4 and the
-shared expert in INT8; see the adapter's `LING3_OPEN_MOE_W4` option. It reuses
-the same run/free functions with compatible mixed handles and requires H/I
-multiples of64 and CPU middle. Routed gate/up retains certified K<=512 partials
+The public `rk_npu_moe_w4_weights_create` and `rk_npu_moe_w4_workspace_create`
+entries keep routed weights in packed INT4 and the shared expert in INT8.
+They reuse the same run/free functions with compatible mixed handles and
+require H/I multiples of64, H<=8128, normal input and CPU middle.
+Routed gate/up retains certified K<=512 partials
 and bounded weight banks; shared gate/up and Down split N across the active
 cores and join the mixed command chains. Input quantization and CPU middle
 use the MoE nearest-even rule for both expert types. Shared and routed widths
@@ -111,3 +118,17 @@ always use joint command chains.
 `test_moe_w8 --w4` and `--w4-split` exercise one-wave and multi-wave mixed paths.
 Group-wise W4, different shared-expert widths, router kernels,
 and CPU/NPU request overlap are not implemented by this backend.
+
+`rk_npu_moe_w4_slots_create(domain, config, shared)` creates mutable routed W4
+slots plus one immutable shared W8 expert (`shared_expert=1`). It packs shared
+weights once and imports routed weights through the existing quantized cache
+API. Routed records retain blob version 2 and the same byte layout as an
+all-W4 bank; existing stores need no repacking. Only routed indices may be
+imported or exported. Every selected routed slot must be initialized before
+execution, and imports must occur between blocking runs.
+
+The shared expert contributes once per input row with coefficient 1. A caller
+that expands one token into separate routed assignments must not attach shared
+weights to every such call: that repeats the shared computation and contribution.
+Paged runtimes may keep their once-per-token shared FFN separate until they can
+submit the routed assignments for each row together.
