@@ -1,4 +1,5 @@
 #include "rk_npu_moe_w8.h"
+#include "rk_npu_trace.h"
 #include "rk_npu_matmul.h"
 #include "rk_npu_internal.h"
 #include "rk_npu_moe_regs.h"
@@ -813,7 +814,20 @@ static int moe_run(rk_npu_moe_w8_workspace* ws,const rk_npu_moe_w8_weights* weig
     if(ws->busy.test_and_set(std::memory_order_acquire))return RK_NPU_ERR_BUSY;
     struct Unlock {std::atomic_flag& flag;~Unlock(){flag.clear(std::memory_order_release);}} unlock{ws->busy};
     rk_npu_moe_w8_timings result{};
-    try {ws->run(*weights,rows,input,f32,scales,ids,routes,output,result);if(timings)*timings=result;return RK_NPU_OK;}
+    try {
+        ws->run(*weights,rows,input,f32,scales,ids,routes,output,result);
+        // Export the existing stage measurements through the shared trace;
+        // this event's own duration is not the operator execution time.
+        { RK_NPU_TRACE_EVENT("rknpu", "moe.timings", "M", rows,
+            "input_us", result.input_us, "schedule_us", result.schedule_us,
+            "build_us", result.build_us, "sync_us", result.sync_us,
+            "gather_us", result.gather_us, "gate_us", result.gate_us,
+            "middle_npu_us", result.middle_npu_us, "middle_cpu_us", result.middle_cpu_us,
+            "down_us", result.down_us, "combine_us", result.combine_us,
+            "lut_load_us", result.lut_load_us, "total_us", result.total_us); }
+        if(timings)*timings=result;
+        return RK_NPU_OK;
+    }
     catch(const rknpu2_matmul_open::moe::Failure& e){return e.code;}
     catch(const std::bad_alloc&){return RK_NPU_ERR_NOMEM;}
     catch(...){return RK_NPU_ERR_PARAM;}
