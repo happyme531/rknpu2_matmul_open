@@ -27,7 +27,7 @@ typedef struct rk_npu_i4_config {
     int M, N, K;
     int m_tile; /* 1..128 */
     int k_tile; /* 32..2048, multiple of 32; must match the validated weights */
-    int n_tile; /* multiple of 64, 64..4096, per selected core */
+    int n_tile; /* multiple of 64, 64..8128, per selected core; logical N may be larger */
     uint32_t npu_core_mask; /* 1/2/4/3/7; need >= popcount(mask) N64 blocks */
     uint32_t timeout_ms;
     int pipeline; /* 0: serial, 1: pack/reduce while next NPU wave executes */

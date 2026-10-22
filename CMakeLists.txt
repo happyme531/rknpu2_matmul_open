@@ -276,6 +276,8 @@ target_link_libraries(test_i8_dpu_chain PRIVATE rk_npu_matmul)
 
 add_executable(test_moe_w8 tests/test_moe_w8.cpp)
 target_link_libraries(test_moe_w8 PRIVATE rk_npu_matmul)
+add_executable(test_moe_quant tests/test_moe_quant.cpp)
+target_link_libraries(test_moe_quant PRIVATE rk_npu_matmul_static)
 add_library(test_moe_w8_header_c OBJECT tests/test_moe_w8_header.c)
 target_include_directories(test_moe_w8_header_c PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

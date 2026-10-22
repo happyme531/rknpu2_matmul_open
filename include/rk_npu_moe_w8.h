@@ -4,6 +4,7 @@
  */
 #ifndef RK_NPU_MOE_W8_H
 #define RK_NPU_MOE_W8_H
+#define RK_NPU_MOE_QUANT_BLOB_VERSION 2u
 #include "rk_npu_common.h"
 #ifdef __cplusplus
 extern "C" {
@@ -21,9 +22,9 @@ typedef enum rk_npu_moe_middle {
 } rk_npu_moe_middle;
 
 typedef struct rk_npu_moe_w8_weight_config {
-    int hidden;       /* 64..1536, multiple of 32 */
+    int hidden;       /* >=64, multiple of 32 */
     int intermediate; /* 32..512, multiple of 32 */
-    int routed_experts; /* 1..128 */
+    int routed_experts; /* >=1 */
     int shared_expert;  /* 0 or 1; if present, expert index routed_experts */
 } rk_npu_moe_w8_weight_config;
 
@@ -74,6 +75,31 @@ void rk_npu_moe_w8_weights_free(rk_npu_moe_w8_weights* weights);
 rk_npu_moe_w8_workspace* rk_npu_moe_w8_workspace_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_config* config);
 void rk_npu_moe_w8_workspace_free(rk_npu_moe_w8_workspace* workspace);
+
+/* Certified K-sliced W4 gate/up and W4 down.
+ * Handles use the existing run/free/byte-query functions.
+ * Hidden/intermediate must be multiples of 64; hidden is at most 8128
+ * (the safe INT4 task width for subsequent INT8 execution).
+ * CPU middle and normal input are required. */
+rk_npu_moe_w8_weights* rk_npu_moe_quant_weights_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* config, const rk_npu_moe_w8_expert* experts);
+rk_npu_moe_w8_workspace* rk_npu_moe_quant_workspace_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_config* config);
+
+/* Mutable physical slot bank for routed experts (shared_expert=0).
+ * Every slot must be imported
+ * before it is selected. Import only between blocking runs using that bank.
+ * Packed records are native cache data for this kernel recipe, not checkpoint
+ * tensors. Export/import preserve integer codes, FP32 scales and INT4 corrections.
+ * Larger buffers are allowed so a file store can page-align its record stride.
+ * The caller owns logical expert -> physical slot mapping and slot lifetimes. */
+rk_npu_moe_w8_weights* rk_npu_moe_quant_slots_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* config);
+uint64_t rk_npu_moe_quant_expert_blob_bytes(const rk_npu_moe_w8_weights* weights);
+int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* weights,
+    int expert, void* data, uint64_t bytes);
+int rk_npu_moe_quant_import_expert(rk_npu_moe_w8_weights* weights,
+    int slot, const void* data, uint64_t bytes);
 
 /* Counts requested device payload bytes (no page rounding or CPU containers). */
 uint64_t rk_npu_moe_w8_weights_device_bytes(const rk_npu_moe_w8_weights* weights);

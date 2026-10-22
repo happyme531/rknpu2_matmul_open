@@ -114,7 +114,11 @@ static void i8_canary(rk_npu_iommu_domain* domain) {
     auto* p=rk_npu_matmul_workspace_create(domain,&s); CHECK(w && p);
     const int rc=rk_npu_i8i8i32_run(p,w,a.data(),c.data());
     rk_npu_matmul_workspace_free(p);rk_npu_i8i8i32_weights_free(w);
-    CHECK(!rc); CHECK(std::all_of(c.begin(),c.end(),[](int x){return x==-384;}));
+    CHECK(!rc);
+    for(size_t i=0;i<c.size();++i)if(c[i]!=-384) {
+        std::fprintf(stderr,"INT8 canary index=%zu expected=-384 got=%d\n",i,c[i]);
+        throw std::runtime_error("INT8 canary mismatch");
+    }
     std::puts("PASS existing INT8 canary after INT4");
 }
 
@@ -138,6 +142,14 @@ int main(int argc,char** argv) {
                 ordinary(domain,129,1025,257,64,256,128,mask,1);
             }
             ordinary(domain,2,64,4161,128,480,4096,1,1);
+            // The maximum safe tile and a larger logical N must both leave
+            // the next precision usable, without a reset or recovery submit.
+            for (int pipe:{0,1}) {
+                ordinary(domain,2,64,8128,128,480,8128,1,pipe);
+                i8_canary(domain);
+                ordinary(domain,2,64,8192,128,480,8128,1,pipe);
+                i8_canary(domain);
+            }
             // Cross the parallel-reduction threshold, compare every output
             // including unaligned row strides and N tails, not only samples.
             ordinary(domain,129,513,513,64,256,128,7,0);

@@ -54,6 +54,24 @@ int main() {
         CHECK(regs.size()==108 && (regs[34]&65535)==0x1110 && ((regs[34]>>16)&UINT32_MAX)==0x2000);
         CHECK(!rknpu2_matmul_open::detail::make_i4_regs(2,2048,64,0,0,0,regs));
         CHECK(rknpu2_matmul_open::detail::make_i4_regs(2,2080,64,0,0,0,regs)==RK_NPU_ERR_PARAM);
+        for(int n:{4160,8128}) {
+            CHECK(!rknpu2_matmul_open::detail::make_i4_regs(2,480,n,0,0,0,regs));
+            auto field=[&](uint16_t address) {
+                auto it=std::find_if(regs.begin(),regs.end(),[&](uint64_t word){return uint16_t(word)==address;});
+                CHECK(it!=regs.end());return uint32_t(*it>>16);
+            };
+            CHECK(field(0x403c)==(uint32_t(n-1)<<16|uint32_t(n-1)));
+            CHECK(field(0x4058)==uint32_t(n-1));
+            rk_npu_i4_config_init(&cfg,2,n,64);cfg.n_tile=n;
+            CHECK(!rk_npu_i4_memory_query(&cfg,&info));
+            CHECK(info.tasks_per_wave==1);
+        }
+        CHECK(rknpu2_matmul_open::detail::make_i4_regs(2,480,8192,0,0,0,regs)==RK_NPU_ERR_PARAM);
+        cfg.n_tile=8192;CHECK(rk_npu_i4_memory_query(&cfg,&info)==RK_NPU_ERR_PARAM);
+        // Only the hardware tile is capped; a logical N8192 uses 8128+64.
+        rk_npu_i4_config_init(&cfg,2,8192,64);cfg.n_tile=8128;
+        CHECK(!rk_npu_i4_memory_query(&cfg,&info));
+        CHECK(info.tasks_per_wave==2);
         std::puts("PASS i4 CPU: signed codes, padding, guard, widening, bounds, register layout");
     } catch (const std::exception& e) { std::fprintf(stderr,"FAIL %s\n",e.what()); return 1; }
 }

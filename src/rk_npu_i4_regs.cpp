@@ -8,8 +8,11 @@ int make_i4_regs(int m, int k, int n, uint64_t a, uint64_t b, uint64_t c,
                   std::vector<uint64_t>& out, I4InputLayout layout) {
     const bool panel = layout == I4InputLayout::Panel8 && m >= 8;
     if (layout != I4InputLayout::Native && layout != I4InputLayout::Panel8) return RK_NPU_ERR_PARAM;
+    // N8192 fits the channel fields and is INT4-exact, but corrupts subsequent
+    // INT8 jobs even at K32. Stop one N64 step below it; larger logical N uses
+    // multiple tiles. The N8128 -> INT8 transition is covered by test_i4.
     if (m < 1 || m > (panel ? 512 : 128) || k < 32 || k > I4_K_TILE_MAX || k % 32 ||
-        n < 64 || n > 4096 || n % 64 || ((a | b | c) & 15) ||
+        n < 64 || n > I4_N_TILE_MAX || n % 64 || ((a | b | c) & 15) ||
         (a | b | c) > UINT32_MAX) return RK_NPU_ERR_PARAM;
     if (panel && (m % 8 || i4_panel_banks(m,k) > 8)) return RK_NPU_ERR_PARAM;
     const int width = panel ? 8 : m, height = panel ? m / 8 : 1;

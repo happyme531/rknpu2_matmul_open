@@ -24,7 +24,7 @@ bool valid(const rk_npu_i4_config& c, I4InputLayout layout) {
         i4_panel_banks(i4_m_rows(c.M,c.m_tile,layout),align_up(std::min(c.K,c.k_tile),32)) > 8))
         return false;
     return weight_valid({c.K,c.N,c.k_tile}) && c.M > 0 && c.m_tile > 0 && c.m_tile <= (layout == I4InputLayout::Native ? 128 : 512) &&
-           c.n_tile >= 64 && c.n_tile <= 4096 && c.n_tile%64==0 &&
+           c.n_tile >= 64 && c.n_tile <= I4_N_TILE_MAX && c.n_tile%64==0 &&
            (c.npu_core_mask==1 || c.npu_core_mask==2 || c.npu_core_mask==4 ||
             c.npu_core_mask==3 || c.npu_core_mask==7) && align_up(c.N,64)/64 >= cores &&
            c.timeout_ms > 0 && (c.pipeline==0 || c.pipeline==1) && c.cpu_threads>=1 && c.cpu_threads<=4;

@@ -3,9 +3,11 @@
 
 #if RK_NPU_ENABLE_TRACE
 #include <atomic>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 
 PERFETTO_TRACK_EVENT_STATIC_STORAGE();
@@ -30,6 +32,9 @@ void start(const char *path) {
     std::call_once(initialized,[] {
         perfetto::TracingInitArgs args;
         args.backends = perfetto::kInProcessBackend;
+        // Detailed multicore traces burst faster than the service drains the
+        // default producer buffer; keep packets instead of losing sequences.
+        args.shmem_size_hint_kb = 16 * 1024;
         perfetto::Tracing::Initialize(args);
         perfetto::TrackEvent::Register();
     });
@@ -41,7 +46,14 @@ void start(const char *path) {
     source->set_name("track_event");
     perfetto::protos::gen::TrackEventConfig events;
     events.add_disabled_categories("*");
-    for (const char *category : {"llm","rknpu","rknpu.detail"}) events.add_enabled_categories(category);
+    if (const char *categories = std::getenv("RK_NPU_TRACE_CATEGORIES")) {
+        std::istringstream input(categories);
+        std::string category;
+        while (std::getline(input,category,','))
+            if (!category.empty()) events.add_enabled_categories(category);
+    } else {
+        for (const char *category : {"llm","rknpu","rknpu.detail"}) events.add_enabled_categories(category);
+    }
     source->set_track_event_config_raw(events.SerializeAsString());
     session = perfetto::Tracing::NewTrace(perfetto::kInProcessBackend);
     session->Setup(config);
