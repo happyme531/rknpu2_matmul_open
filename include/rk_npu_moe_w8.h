@@ -90,6 +90,24 @@ rk_npu_moe_w8_weights* rk_npu_moe_quant_weights_create(rk_npu_iommu_domain* doma
 rk_npu_moe_w8_workspace* rk_npu_moe_quant_workspace_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_config* config);
 
+/* Routed W4 plus optional shared W8, jointly scheduled on the active cores.
+ * Routed gate/up uses certified K<=512 partials; shared W8 retains full K.
+ * The W4 geometry, CPU-middle and normal-input requirements above apply.
+ * Shared and routed experts must have the same intermediate width.
+ * Existing run/free/timing functions accept these mixed handles. */
+rk_npu_moe_w8_weights* rk_npu_moe_w4_weights_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* config, const rk_npu_moe_w8_expert* experts);
+rk_npu_moe_w8_workspace* rk_npu_moe_w4_workspace_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_config* config);
+
+/* Mutable routed W4 slots with one immutable shared W8 expert.
+ * Requires shared_expert=1. Only routed slots may be imported/exported;
+ * their records are byte-compatible with the all-W4 slot bank below.
+ * The shared expert is packed once at creation and evaluated once per token,
+ * with coefficient 1, regardless of the routed top-k or slot identities. */
+rk_npu_moe_w8_weights* rk_npu_moe_w4_slots_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* config, const rk_npu_moe_w8_expert* shared);
+
 /* Mutable physical slot bank for routed experts (shared_expert=0).
  * Every slot must be imported
  * before it is selected. Import only between blocking runs using that bank.

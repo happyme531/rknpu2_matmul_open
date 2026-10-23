@@ -116,7 +116,7 @@ Runtime settings are described in [ENV.md](ENV.md) and the operator guides.
 | W4A8 autotuning | [rk_npu_w4a8_tune.h](include/rk_npu_w4a8_tune.h) | Weight-aware tile/layout search and strategy caches |
 | FlatQuant W4A4 Linear | [rk_npu_w4a4_linear.h](include/rk_npu_w4a4_linear.h) | NPU FP16 transforms followed by INT4 execution |
 | Fused W4A8 gate/up + SwiGLU / FFN | [rk_npu_w4a8.h](include/rk_npu_w4a8.h) | `rk_npu_w4a8_run_swiglu_f32` or `rk_npu_w4a8_run_ffn_f32`: compact FP32 middle, two-wave CPU fusion and optional Down scale reuse |
-| Routed W8 MoE | [rk_npu_moe_w8.h](include/rk_npu_moe_w8.h) | SwiGLU experts and optional shared expert; [MoE guide](docs/MOE.md) |
+| Routed W8/W4 MoE | [rk_npu_moe_w8.h](include/rk_npu_moe_w8.h) | SwiGLU experts, joint routed W4/shared W8, and packed routed slots; [MoE guide](docs/MOE.md) |
 | Raw FP16 GEMM/BMM | [rk_npu_matmul_f16.h](include/rk_npu_matmul_f16.h) | Optional fused MUL/ADD and explicit split-K |
 | Experimental FP16 Attention | [rk_npu_attention_f16.h](include/rk_npu_attention_f16.h) | GQA/MHA/MQA, causal/no-mask/boolean masks, fixed-shift or stable softmax, growing and truncatable native KV; [guide](docs/ATTENTION.md) |
 | Experimental FP16 Gated MLA | [rk_npu_mla_f16.h](include/rk_npu_mla_f16.h) | Ling tiny H16/QK192/V128, expanded or absorbed latent512 KV; [guide](docs/MLA.md) |

@@ -50,12 +50,13 @@ static double relative(const std::vector<float>& got,const std::vector<float>& e
 int main(int argc,char** argv) try {
     const bool npu=argc>1 && std::string(argv[1])=="--npu-middle";
     const bool split=argc>1 && std::string(argv[1])=="--w4-split";
-    const bool w4=split || (argc>1 && std::string(argv[1])=="--w4");
+    const bool wide=argc>1 && std::string(argv[1])=="--w4-wide";
+    const bool w4=split || wide || (argc>1 && std::string(argv[1])=="--w4");
     const auto create_weights=w4?rk_npu_moe_w4_weights_create:rk_npu_moe_w8_weights_create;
     const auto create_workspace=w4?rk_npu_moe_w4_workspace_create:rk_npu_moe_w8_workspace_create;
     auto* ctx=rk_npu_open(nullptr);require(ctx,"open NPU");
     auto* domain=rk_npu_iommu_domain_create(ctx,15);require(domain,"create domain");
-    const int H=split?576:64,N=npu?512:(w4?64:32),E=3,TOP=2,MAX=256;
+    const int H=wide?8128:(split?576:64),N=npu?512:(w4?64:32),E=3,TOP=2,MAX=256;
     rk_npu_moe_w8_config config;rk_npu_moe_w8_config_init(&config,H,N,E,1,TOP,MAX);
     if(argc>2)config.npu_cores=std::stoi(argv[2]);
     config.middle=npu?RK_NPU_MOE_MIDDLE_NPU_LUT:RK_NPU_MOE_MIDDLE_CPU;
@@ -73,7 +74,7 @@ int main(int argc,char** argv) try {
     for(int native=0;native<(w4?1:2);++native) {
         config.native_input=native;
         auto* ws=create_workspace(domain,&config);require(ws,"create workspace");
-        for(int rows:{1,5,128,256,1}) {
+        for(int rows:wide?std::vector<int>{1,5,1}:std::vector<int>{1,5,128,256,1}) {
             std::vector<int8_t> x(size_t(rows)*H);std::vector<float> scales(rows,.03125f),out(x.size(),0);
             std::vector<int32_t> ids(size_t(rows)*TOP);std::vector<float> routes(ids.size());
             for(size_t i=0;i<x.size();++i)x[i]=int8_t(int((i*7+i/5)%(w4?256:255))-(w4?128:127));
@@ -126,7 +127,7 @@ int main(int argc,char** argv) try {
     auto* ws=create_workspace(domain,&single);require(one&&ws,"single expert handles");
     auto* other_domain=rk_npu_iommu_domain_create(ctx,14);require(other_domain,"other domain");
     auto* foreign=create_weights(other_domain,&single.weights,av.data());require(foreign,"foreign weights");
-    for(int rows:{1,128,256}) {
+    for(int rows:wide?std::vector<int>{1,5}:std::vector<int>{1,128,256}) {
         std::vector<int8_t> x(size_t(rows)*H,1);std::vector<float> scales(rows,.03125f),routes(rows,1),out(x.size());
         std::vector<int32_t> ids(rows,0);
         require(rk_npu_moe_w8_run_quantized(ws,foreign,rows,x.data(),scales.data(),ids.data(),routes.data(),out.data(),nullptr)==RK_NPU_ERR_DOMAIN,"domain rejection");

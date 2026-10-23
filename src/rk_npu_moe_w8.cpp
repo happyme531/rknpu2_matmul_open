@@ -390,7 +390,8 @@ struct Weights {
     Mode mode;
     std::vector<std::vector<int32_t>> gcor,dcor;
     Weights(rk_npu_iommu_domain* domain,const rk_npu_moe_w8_weight_config& c,
-            const rk_npu_moe_w8_expert* experts,Mode recipe=Mode::W8):device(domain),config(c),mode(recipe) {
+            const rk_npu_moe_w8_expert* experts,Mode recipe=Mode::W8,
+            const rk_npu_moe_w8_expert* shared=nullptr):device(domain),config(c),mode(recipe) {
         const int H=c.hidden,N=c.intermediate,count=c.routed_experts+c.shared_expert;
         const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,c);
         const int gate_k_tile=gate_tile(mode,H);
@@ -430,12 +431,13 @@ struct Weights {
                 gw[e]=gate.view(offset*H*N*2,size_t(H)*N*2);
                 dw[e]=down.view(offset*N*H,size_t(N)*H);
             }
-            if(!experts) {
+            const auto* source=experts?experts+e:(e==c.routed_experts?shared:nullptr);
+            if(!source) {
                 gs[e].assign(2*N,1.f);ds[e].assign(H,1.f);gcor[e].assign(2*N,0);
                 dcor[e].assign(H,0);
                 continue;
             }
-            const auto& x=experts[e];
+            const auto& x=*source;
             if(!x.gate_up || !x.down || !x.gate_up_scales || !x.down_scales)throw Failure{RK_NPU_ERR_PARAM};
             gs[e].assign(x.gate_up_scales,x.gate_up_scales+2*N);
             ds[e].assign(x.down_scales,x.down_scales+H);
@@ -467,13 +469,11 @@ struct Weights {
                 } catch(const std::runtime_error&) {lut_scales=false;}
             }
         }
-        if(experts) {
-            if(w4) {
-                for(auto& b:gate_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
-                for(auto& b:down_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
-            }
-            if(has_w8){gate.sync(gate.mem.size,RK_NPU_SYNC_TO_DEVICE);down.sync(down.mem.size,RK_NPU_SYNC_TO_DEVICE);}
+        if(experts && w4) {
+            for(auto& b:gate_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
+            for(auto& b:down_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
         }
+        if(has_w8 && (experts || shared)){gate.sync(gate.mem.size,RK_NPU_SYNC_TO_DEVICE);down.sync(down.mem.size,RK_NPU_SYNC_TO_DEVICE);}
         if(N==512 && !w4)coeff.sync(coeff.mem.size,RK_NPU_SYNC_TO_DEVICE);
     }
     uint64_t bytes() const {
@@ -525,7 +525,7 @@ struct Workspace {
         gate_a.alloc(device,max*H);gate_c.alloc(device,gate_wave_stride*gate_waves);
         down_a.alloc(device,max*N);down_c.alloc(device,max*H*4);
         gate_a.sync(gate_a.mem.size,RK_NPU_SYNC_TO_DEVICE);
-        gather_cmd.alloc(device,max*(w4?2:1));gather_cmd.prepare_copies();
+        gather_cmd.alloc(device,max*(w4?2:ceil_div(H,I8_COPY_MAX_CHANNELS)));gather_cmd.prepare_copies();
         if(w4) {
             input4.alloc(device,size_t(c.max_rows+1)*H);
             gate4_cmd.alloc(device,(max/32+512)*gate_waves,rknpu2_matmul_open::detail::I4_COMMAND_WORDS);
@@ -667,8 +667,12 @@ struct Workspace {
                     copies[index].push_back({src+H/2,dst+16,H/2,2*j.rows});
                     ++row;continue;
                 }
-                while(!native && run<5 && row+run<j.rows && ordered[j.offset+row+run].token==token+run)++run;
-                copies[index].push_back({input.mem.dma_addr+size_t(token)*H,j.ga.dma_addr+size_t(row)*(native?16:H),run*H,native?j.rows:1});
+                while(!native && (run+1)*H<=I8_COPY_MAX_CHANNELS && row+run<j.rows && ordered[j.offset+row+run].token==token+run)++run;
+                for(int first=0;first<run*H;first+=I8_COPY_MAX_CHANNELS) {
+                    const int width=std::min(I8_COPY_MAX_CHANNELS,run*H-first);
+                    copies[index].push_back({input.mem.dma_addr+size_t(token)*H+first,
+                        j.ga.dma_addr+size_t(row)*(native?16:H)+size_t(first)*(native?j.rows:1),width,native?j.rows:1});
+                }
                 row+=run;
             }
             if(npu)for(int row=0;row<j.rows;++row) {
@@ -828,12 +832,12 @@ extern "C" int rk_npu_moe_w8_run_f32(rk_npu_moe_w8_workspace* ws,const rk_npu_mo
 
 extern "C" rk_npu_moe_w8_weights* rk_npu_moe_w4_weights_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_weight_config* c,const rk_npu_moe_w8_expert* experts) {
-    if(!domain || !c || !experts || !rknpu2_matmul_open::moe::valid(*c) || c->hidden%64 || c->intermediate%64)return nullptr;
+    if(!domain || !c || !experts || !rknpu2_matmul_open::moe::valid_w4(*c))return nullptr;
     try{return new rk_npu_moe_w8_weights(domain,*c,experts,rknpu2_matmul_open::moe::Mode::RoutedW4SharedW8);}catch(...){return nullptr;}
 }
 extern "C" rk_npu_moe_w8_workspace* rk_npu_moe_w4_workspace_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_config* c) {
-    if(!domain || !c || !rknpu2_matmul_open::moe::valid(*c) || c->weights.hidden%64 || c->weights.intermediate%64 ||
+    if(!domain || !c || !rknpu2_matmul_open::moe::valid(*c) || !rknpu2_matmul_open::moe::valid_w4(c->weights) ||
        c->middle!=RK_NPU_MOE_MIDDLE_CPU || c->native_input)return nullptr;
     try{return new rk_npu_moe_w8_workspace(domain,*c,rknpu2_matmul_open::moe::Mode::RoutedW4SharedW8);}catch(...){return nullptr;}
 }
@@ -856,15 +860,22 @@ extern "C" rk_npu_moe_w8_weights* rk_npu_moe_quant_slots_create(rk_npu_iommu_dom
     try{return new rk_npu_moe_w8_weights(domain,*c,nullptr,rknpu2_matmul_open::moe::Mode::W4);}catch(...){return nullptr;}
 }
 
+extern "C" rk_npu_moe_w8_weights* rk_npu_moe_w4_slots_create(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* c,const rk_npu_moe_w8_expert* shared) {
+    if(!domain || !c || !shared || !rknpu2_matmul_open::moe::valid_w4(*c) || c->shared_expert!=1)return nullptr;
+    try{return new rk_npu_moe_w8_weights(domain,*c,nullptr,rknpu2_matmul_open::moe::Mode::RoutedW4SharedW8,shared);}catch(...){return nullptr;}
+}
+
 extern "C" uint64_t rk_npu_moe_quant_expert_blob_bytes(const rk_npu_moe_w8_weights* w) {
-    if(!w || w->mode!=rknpu2_matmul_open::moe::Mode::W4)return 0;
+    if(!w || w->mode==rknpu2_matmul_open::moe::Mode::W8)return 0;
     return w->gw[0].size+w->dw[0].size+4*(w->gs[0].size()+w->ds[0].size()+w->gcor[0].size()+
         w->dcor[0].size());
 }
 
 extern "C" int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* w,int e,void* data,uint64_t bytes) {
     const uint64_t need=rk_npu_moe_quant_expert_blob_bytes(w);
-    if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()))return RK_NPU_ERR_PARAM;
+    if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()) ||
+        !rknpu2_matmul_open::moe::expert_is_w4(w->mode,e,w->config.routed_experts))return RK_NPU_ERR_PARAM;
     auto* p=static_cast<uint8_t*>(data);
     auto put=[&](const void* src,size_t n){std::memcpy(p,src,n);p+=n;};
     put(w->gw[e].vaddr,w->gw[e].size);put(w->dw[e].vaddr,w->dw[e].size);
@@ -876,7 +887,8 @@ extern "C" int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* w,int
 
 extern "C" int rk_npu_moe_quant_import_expert(rk_npu_moe_w8_weights* w,int e,const void* data,uint64_t bytes) {
     const uint64_t need=rk_npu_moe_quant_expert_blob_bytes(w);
-    if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()))return RK_NPU_ERR_PARAM;
+    if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()) ||
+        !rknpu2_matmul_open::moe::expert_is_w4(w->mode,e,w->config.routed_experts))return RK_NPU_ERR_PARAM;
     try {
         const auto* p=static_cast<const uint8_t*>(data);
         auto get=[&](void* dst,size_t n){std::memcpy(dst,p,n);p+=n;};

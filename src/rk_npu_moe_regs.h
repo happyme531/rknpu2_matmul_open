@@ -7,8 +7,9 @@ namespace rknpu2_matmul_open::moe {
 // Register configuration for one signed-INT8 row copy.
 // Source is contiguous; destination can be row-major or native K16/M16.
 struct I8Copy { uint64_t source, destination; int channels, destination_rows; };
+inline constexpr int I8_COPY_MAX_CHANNELS=7680;
 inline void validate_i8_copy(const I8Copy& c) {
-    if(c.channels<32 || c.channels>7680 || c.channels%32 ||
+    if(c.channels<32 || c.channels>I8_COPY_MAX_CHANNELS || c.channels%32 ||
        c.destination_rows<1 || c.destination_rows>128 ||
        ((c.source|c.destination)&15) || c.source>UINT32_MAX || c.destination>UINT32_MAX)
         throw std::runtime_error("INT8 copy outside validated geometry");
