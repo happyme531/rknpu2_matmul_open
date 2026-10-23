@@ -25,6 +25,10 @@ using tested native Softmax layout rules.
   splitting. `run` accepts logical rows and restores compact output order;
   `query` reports peak segment buffers, total output bytes and QK/PV tasks;
   LUT execution adds DPU tasks at run time.
+- Stable `NO_MASK` MHA prefers up to 128 query rows per segment. Native
+  geometry and the combined QK/PV/LUT task budget can reduce this to 64/32
+  rows. GQA, masked and fixed-shift calls keep the existing 32-row starting
+  policy. Use the returned sizes rather than assuming a 32-row scratch buffer.
 - KV capacity is aligned to 32, grows up to an explicit limit of at most 32768.
   Each internal graph must fit within 4095 NPU tasks; `query` rejects configurations
   that cannot fit even after query-row splitting.
@@ -33,6 +37,11 @@ using tested native Softmax layout rules.
   selection in `sizes.active_core_mask`. Masks 5/6 remain unsupported by the driver.
 - Compact Q/O are `[query_heads,query_rows,head_dim]`, K/V are `[kv_heads,length,head_dim]`.
   Output is FP32. No dropout or arbitrary additive attention bias is implemented.
+
+Q/K/V must contain finite values, and the scaled QK result must fit FP16.
+The execution path does not diagnose NaN/Inf or QK overflow. These numerical
+preconditions apply to both stable and fixed-shift modes; public argument,
+buffer/domain, task-budget and submission-error checks remain enabled.
 
 `mask_mode` selects:
 
@@ -66,6 +75,11 @@ does not invalidate handles that retain it.
 Cache capacity and computation are separate. A cache reserved for 8192 tokens
 with valid length 4096 computes 4096, not 8192. Causal prefill computes only
 `align32(query_start+query_rows)`; no-mask/boolean use `align32(cache.length)`.
+Stable causal LUT segments may share a PV-tile-aligned span within that public
+call's visible prefix. Preloaded future KV never enlarges the GQA sizing bound;
+geometry/task limits retain the shorter span when needed. CPU-exp numerical
+boundaries continue to use each visible prefix, and future LUT carriers are
+cleared before PV.
 Native KV is kept in DDR GEM buffers, with no programmable NPU cache assumed.
 
 Multi-token `cache_append` packs only the newly supplied rows: native K uses
@@ -91,8 +105,8 @@ physical padding. Invalid arguments/capacity limits are checked before writes.
 
 Full PV blocks read the native cache directly. A partial block uses a persistent
 per-cache tail buffer; only newly appended columns are refreshed within a fixed
-tail geometry. Workspace geometry changes at 32-token boundaries and when query
-row counts change. Graph preparation, tail staging and reserve costs are reported
+tail geometry. Workspace geometry changes when the selected computation span
+or query row count changes. Graph preparation, tail staging and reserve costs are reported
 separately and included in run/step `total_us`. `prepare_query` can explicitly warm
 a known current query without submitting it.
 
@@ -278,9 +292,15 @@ PV 仍使用配置中的 `kv_tile`，不改变默认值 512。`query()` 包含�
 ## Stable LUT exponential
 
 `RK_NPU_ATTENTION_F16_STABLE_SOFTMAX` 与 MLA 共用稳定路径：原始 QK 写回后，CPU
-排除无效 keys、以 FP32 减行最大值，NPU LUT 执行 exponential 并通过 PINGPONG
+排除无效 keys 并减行最大值。AArch64 完整的八元素组直接用 FP16 subtract/clamp，
+省去升为 FP32 再降为 FP16 的转换；边界和 boolean 路径保持标量处理。
+NPU LUT 执行 exponential 并通过 PINGPONG
 连接 PV；CPU 以 FP32 去掉正偏置并归一化。stable 无需 native mask tensor，
 `mask_bytes=0`，boolean 的逻辑 ABI 和 GQA causal 前缀规则保留。
+
+多行且物理 M>16 的 query pack 按 KV head 使用四线程；单 token 不启用并行 pack。
+causal 前缀修正使用硬件 FP16→FP32 转换，保持原有逐 token 的 FP32 累加顺序。
+LUT 表、gain/carrier、PV 与最终 FP32 归一化公式不变。
 
 启动进程前设置 `RK_NPU_ATTN_LUT_EXP=0` 恢复 CPU exponential 以及原有 KV
 更新和截断行为。大 score 在 V 幅值允许时通过 PV denominator 延后归一化，

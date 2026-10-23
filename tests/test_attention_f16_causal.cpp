@@ -232,6 +232,39 @@ void cpu() {
     require(rk_npu_attention_f16_prepare_query(nullptr, nullptr, c, 1, 0) == RK_NPU_ERR_PARAM, "null prepare workspace");
     std::puts("causal Attention CPU parameter contract PASS");
 }
+void preloaded_prefix_case(Device& dev, bool lut) {
+    // Internal 32-row segments share a graph within this request's visible
+    // prefix. Large future V must not affect dispatch, results or sizing.
+    constexpr int qh=16,kh=4,d=32,rows=128,length=512;
+    setenv("RK_NPU_ATTN_LUT_EXP",lut?"1":"0",1);
+    rk_npu_attention_f16_config c;rk_npu_attention_f16_config_init(&c);
+    c.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;c.query_heads=qh;c.kv_heads=kh;c.head_dim=d;
+    c.core_mask=7;c.initial_capacity=c.max_capacity=length;c.max_query_rows=rows;
+    auto kv=cache(dev,c);auto batch=work(dev,c),serial=work(dev,c);
+    auto k=data(size_t(kh)*length*d,67,.6f),v=data(k.size(),71,.5f);
+    for(int h=0;h<kh;++h)for(int pos=384;pos<length;++pos)
+        std::fill_n(v.data()+(size_t(h)*length+pos)*d,d,bits::float_to_half(65000.f));
+    check(rk_npu_attention_f16_cache_load(dev.ctx,kv.get(),k.data(),v.data(),length));
+    for(int start:{0,128,256}){
+        auto q=data(size_t(qh)*rows*d,73+start,.7f);mla_test::GuardOutput output(q.size());
+        check(rk_npu_attention_f16_prepare_query(dev.ctx,batch.get(),kv.get(),rows,start));
+        rk_npu_attention_f16_timings t{};
+        check(rk_npu_attention_f16_run(dev.ctx,batch.get(),kv.get(),q.data(),rows,start,output.ptr(),&t,nullptr));
+        rk_npu_attention_f16_sizes sizes{};
+        check(rk_npu_attention_f16_query(&c,length,rows,start+rows,&sizes));
+        require(t.compute_length==start+rows && t.compute_length<=sizes.compute_length,
+            "prefix graph reuse exceeded public query sizing");
+        std::vector<float> expected(q.size());
+        for(int r=0;r<rows;++r){
+            auto qr=row(q,qh,rows,d,r);mla_test::GuardOutput one(qr.size());
+            check(rk_npu_attention_f16_run(dev.ctx,serial.get(),kv.get(),qr.data(),1,start+r,one.ptr(),nullptr,nullptr));
+            const auto values=one.values();
+            for(int h=0;h<qh;++h)std::copy_n(values.data()+h*d,d,expected.data()+(size_t(h)*rows+r)*d);
+        }
+        require(output.values()==expected,"preloaded future changed batched causal output");
+        std::printf("PASS preloaded_prefix lut=%d start=%d compute_length=%d high_future_AR_exact=1\n",int(lut),start,t.compute_length);
+    }
+}
 void board() {
     // run_board.py retains this FD across exec; reuse its lowlevel lock.
     std::unique_ptr<mla_test::BoardLock> lowlevel;
@@ -240,6 +273,7 @@ void board() {
     else lowlevel.reset(new mla_test::BoardLock("/tmp/rknpu_lowlevel_submit.lock"));
     mla_test::BoardLock legacy("/tmp/rk3588_npu_submit.lock");
     Device dev;
+    for(bool lut:{true,false})preloaded_prefix_case(dev,lut);
     batch_case(dev, "C7_small", 5, 8, 256, 16, 4, true, 0);
     for (int core : {1, 3}) batch_case(dev, "C7_small_core", 5, 8, 256, 16, 4, true, 0, core);
     batch_case(dev, "empty_prefix_padding_M", 0, 3, 32, 4, 4, true, 0);

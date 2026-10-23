@@ -216,7 +216,7 @@ struct Workspace {
     bool poisoned=false;
     bool full_causal_prefill=false; // MLA query chunks reuse one valid-KV graph.
     Workspace(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,Shape s={}):lease(d),cfg(c),shape(s){}
-    void geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t);
+    void geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t,int query_end=0);
     rk_npu_attention_f16_timings run(Cache& cache,const uint16_t* q,int rows,int start,void* output,
         const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows=0,int tensor_offset=0,bool half_output=false);
     rk_npu_attention_f16_timings run_gqa(Cache& cache,const uint16_t* q,int rows,int start,void* output,
