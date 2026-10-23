@@ -1,6 +1,7 @@
 #include "rk_npu_attention_f16.h"
 #include "rk_npu_quant_matmul.h"
 #include "rk_npu_matmul_f16.h"
+#include "mla_f16_test_utils.h"
 #include "../src/rk_npu_half_bits.h"
 #include "../src/rk_npu_attention_f16_internal.h"
 #include <algorithm>
@@ -29,7 +30,7 @@ struct Device{
     Device():ctx(rk_npu_open(nullptr)),domain(ctx?rk_npu_iommu_domain_create(ctx,14):nullptr){require(ctx&&domain,"open/domain");}
     ~Device(){rk_npu_iommu_domain_free(domain);rk_npu_close(ctx);}
 };
-struct Lock{int fd;explicit Lock(const char* p):fd(open(p,O_CREAT|O_RDWR,0666)){require(fd>=0 && !flock(fd,LOCK_EX|LOCK_NB),"NPU lock busy");}~Lock(){flock(fd,LOCK_UN);close(fd);}};
+using Lock=mla_test::BoardLock;
 Cache cache(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c){rk_npu_attention_f16_cache* p=nullptr;check(rk_npu_attention_f16_cache_create(d,&c,&p));return Cache(p,rk_npu_attention_f16_cache_free);}
 Work work(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c){rk_npu_attention_f16_workspace* p=nullptr;check(rk_npu_attention_f16_prepare(d,&c,&p));return Work(p,rk_npu_attention_f16_workspace_free);}
 std::vector<uint16_t> random_data(size_t n,int seed,float sigma=.7f){std::mt19937 rng(seed);std::normal_distribution<float> dist(0,sigma);std::vector<uint16_t> v(n);for(auto& x:v)x=bits::float_to_half(dist(rng));return v;}
@@ -103,6 +104,55 @@ void dirty_policy_cpu(){
     std::puts("attention dirty sync environment/threshold CPU contract PASS");
 }
 void cpu(){
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    // Every finite FP16 score, with maxima around zero, subnormal/normal
+    // boundaries, the clamp and the finite extremes. Check the old FP32
+    // subtract/round contract independently of the production vector loop.
+    for(uint16_t maximum:{0x0000,0x8000,0x0001,0x03ff,0x0400,0x3c00,0x4c00,
+                          0x7bff,0x8001,0x83ff,0xbc00,0xcc00,0xfbff}){
+        const float mx=bits::half_to_float(maximum);
+        for(int first=0;first<65536;first+=8){
+            uint16_t input[8],expected[8],actual[8];
+            for(int lane=0;lane<8;++lane){
+                const float x=bits::half_to_float(uint16_t(first+lane));
+                input[lane]=std::isfinite(x) && x<=mx?uint16_t(first+lane):maximum;
+                expected[lane]=bits::float_to_half(std::max(-16.f,bits::half_to_float(input[lane])-mx));
+            }
+            vst1q_u16(actual,vreinterpretq_u16_f16(vmaxq_f16(vsubq_f16(
+                vreinterpretq_f16_u16(vld1q_u16(input)),vdupq_n_f16(float16_t(mx))),vdupq_n_f16(-16))));
+            require(!std::memcmp(actual,expected,sizeof(actual)),"FP16 centering changes FP32-round result");
+        }
+    }
+    std::puts("FP16 centering finite-score arithmetic contract PASS");
+#endif
+    {
+        rk_npu_attention_f16_config c;rk_npu_attention_f16_config_init(&c);
+        c.query_heads=c.kv_heads=16;c.head_dim=64;c.max_query_rows=128;
+        c.initial_capacity=256;c.max_capacity=8192;c.core_mask=7;
+        c.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;c.mask_mode=RK_NPU_ATTENTION_F16_NO_MASK;
+        rk_npu_attention_f16_sizes s{};
+        check(rk_npu_attention_f16_query(&c,1024,128,1024,&s));
+        require(s.physical_rows==128,"unmasked MHA uses full legal query tile");
+        for(int heads:{16,32}){
+            c.query_heads=c.kv_heads=heads;
+            check(rk_npu_attention_f16_query(&c,8192,128,8192,&s));
+            const int segments=(128+s.physical_rows-1)/s.physical_rows;
+            const uint64_t extra=uint64_t(heads)*((s.physical_rows*s.compute_length+4095)/4096);
+            require(s.physical_rows<=64 && uint64_t(s.tasks/segments)+extra+3<=4095,
+                "larger MHA queries preserve the native LUT task budget");
+        }
+        c.query_heads=c.kv_heads=16;
+        for(auto mode:{RK_NPU_ATTENTION_F16_CAUSAL,RK_NPU_ATTENTION_F16_BOOLEAN_MASK}){
+            c.mask_mode=mode;check(rk_npu_attention_f16_query(&c,1024,128,1024,&s));
+            require(s.physical_rows<=32,"masked query policy unchanged");
+        }
+        c.mask_mode=RK_NPU_ATTENTION_F16_NO_MASK;c.flags=RK_NPU_ATTENTION_F16_FIXED_SHIFT_EXPERIMENTAL;
+        check(rk_npu_attention_f16_query(&c,1024,128,1024,&s));
+        require(s.physical_rows<=32,"fixed-shift query policy unchanged");
+        c.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;c.query_heads=32;
+        check(rk_npu_attention_f16_query(&c,1024,128,1024,&s));
+        require(s.physical_rows<=64,"grouped-query policy unchanged");
+    }
     for(int dimension:{32,64,96,128,160,192,256})for(int ratio:{1,2,3,4,5,8,16}){
         rk_npu_attention_f16_config c;rk_npu_attention_f16_config_init(&c);
         c.head_dim=dimension;c.kv_heads=2;c.query_heads=2*ratio;c.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;c.max_query_rows=128;
@@ -298,10 +348,48 @@ void board(int core){
         auto kk=random_data(size_t(heads)*13*128,900),vv=random_data(kk.size(),901,.5f),qq=random_data(size_t(heads)*4*32*128,902);
         std::vector<float> oo(qq.size());check(rk_npu_attention_f16_cache_load(dev.ctx,c.get(),kk.data(),vv.data(),13));
         check(rk_npu_attention_f16_run(dev.ctx,w.get(),c.get(),qq.data(),32,0,oo.data(),nullptr,nullptr));
-        require(error(oo,reference(qq,kk,vv,32,13,0,RK_NPU_ATTENTION_F16_NO_MASK,nullptr,heads*4))<.15,"head counts / cross attention");
+        require(error(oo,reference(qq,kk,vv,32,13,0,RK_NPU_ATTENTION_F16_NO_MASK,nullptr,heads*4,heads))<.15,"head counts / cross attention");
     }
     std::puts("query length > KV / head count checks PASS");
     std::printf("core=%d shared-context/shared-workspace/reserve/append/INT8-interleave PASS\n",core);
+}
+void mha_prefill_board(int core){
+    Lock lowlevel("/tmp/rknpu_lowlevel_submit.lock"),legacy("/tmp/rk3588_npu_submit.lock");Device dev;
+    Linears linear(dev.domain,core);linear.run();
+    struct Case {int heads,length,rows;bool large_v;};
+    for(auto test:{Case{16,129,128,false},Case{16,513,17,false},Case{16,1024,128,false},
+                   Case{16,8192,128,false},Case{32,8192,128,false},Case{16,513,128,true}}){
+        const int heads=test.heads,d=64,rows=test.rows,length=test.length;
+        rk_npu_attention_f16_config cfg;rk_npu_attention_f16_config_init(&cfg);
+        cfg.query_heads=cfg.kv_heads=heads;cfg.head_dim=d;cfg.max_query_rows=128;cfg.core_mask=core;
+        cfg.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;cfg.mask_mode=RK_NPU_ATTENTION_F16_NO_MASK;
+        cfg.initial_capacity=cfg.max_capacity=(length+31)/32*32;
+        auto kv=cache(dev.domain,cfg);auto wide=work(dev.domain,cfg);
+        auto small_cfg=cfg;small_cfg.max_query_rows=32;auto small=work(dev.domain,small_cfg);
+        auto k=random_data(size_t(heads)*length*d,610,.5f),v=random_data(k.size(),611,.5f);
+        auto q=random_data(size_t(heads)*rows*d,612,.5f);
+        if(test.large_v)v[0]=bits::float_to_half(100.f);
+        check(rk_npu_attention_f16_cache_load(dev.ctx,kv.get(),k.data(),v.data(),length));
+        std::vector<float> actual(q.size()+16,12345),expected(q.size());
+        check(rk_npu_attention_f16_run(dev.ctx,wide.get(),kv.get(),q.data(),rows,0,actual.data()+8,nullptr,nullptr));
+        for(int first=0;first<rows;first+=32){
+            const int n=std::min(32,rows-first);std::vector<uint16_t> chunk(size_t(heads)*n*d);
+            std::vector<float> part(chunk.size());
+            for(int h=0;h<heads;++h)std::copy_n(q.data()+(size_t(h)*rows+first)*d,n*d,chunk.data()+size_t(h)*n*d);
+            check(rk_npu_attention_f16_run(dev.ctx,small.get(),kv.get(),chunk.data(),n,first,part.data(),nullptr,nullptr));
+            for(int h=0;h<heads;++h)std::copy_n(part.data()+size_t(h)*n*d,n*d,expected.data()+(size_t(h)*rows+first)*d);
+        }
+        require(!std::memcmp(actual.data()+8,expected.data(),expected.size()*4),"wide MHA differs from 32-row calls");
+        for(int i=0;i<8;++i)require(actual[i]==12345 && actual[actual.size()-1-i]==12345,"wide MHA output guard");
+        std::vector<uint16_t> half_output(q.size()+16,0x3555);
+        check(rk_npu_attention_f16_run_half(dev.ctx,wide.get(),kv.get(),q.data(),rows,0,half_output.data()+8,nullptr,nullptr));
+        for(size_t i=0;i<expected.size();++i)require(half_output[i+8]==bits::float_to_half(expected[i]),"wide MHA FP16 output");
+        for(int i=0;i<8;++i)require(half_output[i]==0x3555 && half_output[half_output.size()-1-i]==0x3555,"wide MHA FP16 guard");
+        rk_npu_attention_f16_sizes sizes{};check(rk_npu_attention_f16_query(&cfg,cfg.max_capacity,rows,length,&sizes));
+        linear.run();
+        std::printf("PASS MHA core=%d heads=%d length=%d rows=%d physical_rows=%d large_V=%d narrow_exact=1 half=1 int8=1\n",
+            core,heads,length,rows,sizes.physical_rows,int(test.large_v));std::fflush(stdout);
+    }
 }
 void long_board(int core,int tile,bool int8_canary=true){
     Lock l1("/tmp/rknpu_lowlevel_submit.lock"),l2("/tmp/rk3588_npu_submit.lock");Device dev;
@@ -488,6 +576,7 @@ void generic_board(){
     }
 }
 int main(int argc,char** argv)try{cpu();if(argc>1 && std::string(argv[1])=="--generic-gqa")generic_board();
+else if(argc>1 && std::string(argv[1])=="--mha-prefill")mha_prefill_board(argc>2?std::stoi(argv[2]):7);
 else if(argc>1 && std::string(argv[1])=="--mixed-canary")mixed_canary(argc>2?std::stoi(argv[2]):7,argc>3?std::stoi(argv[3]):4096);
 else if(argc>1 && std::string(argv[1])=="--dirty-sync-regression")dirty_sync_board(argc>2?std::stoi(argv[2]):7,argc>3?std::stoi(argv[3]):512);
 else if(argc>1 && std::string(argv[1])=="--attention-mixed")attention_mixed_canary(argc>2?std::stoi(argv[2]):7,argc>3?std::stoi(argv[3]):8191,argc>4);

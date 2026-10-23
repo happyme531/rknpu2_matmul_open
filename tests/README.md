@@ -16,6 +16,7 @@ Two executables sweep the `int8 × int8 → fp32` matmul over a wide M / N / K g
 | `test_batch` | verifies batched same-shape BMM and compares B single submits vs one batched submit |
 | `test_batch_f16` | verifies distinct-weight FP16 BMM, N/M tiling, output tails, and multicore submission |
 | `test_attention_f16_causal --cpu` / `--board` | causal batch/AR equality, CPU softmax boundaries, masked future V and high-V truncate/abort; only `--cpu` is registered with CTest |
+| `test_attention_f16 --mha-prefill MASK` | wide MHA versus 32-row calls, LUT task-budget backoff, FP16/FP32 output guards, large-V CPU fallback and following INT8 calls; masks 1/2/4/3/7 |
 | `test_mm --cpu` / `--board` | FP16/BF16 MM/BMM: transpose/strides, broadcast, split-K, typed packed B reuse, device mode, conversion/range and ownership; only `--cpu` is registered with CTest |
 | `test_mm_tf32 --cpu` / `--board` | TF32 dtype with FP32 containers/output: byte-exact packing oracle, K16 tails, multi-core/BMM/split-K, truncation boundaries, ranges and mixed-weight rejection |
 | `test_mm_header_c` | new raw MM/BMM header alongside legacy C headers |
@@ -241,6 +242,11 @@ partial commit/abort across K32 and KV-tile boundaries. They also cover preloade
 single-row queries at an aligned prefix, single/dual/triple-core submissions,
 internal GQA 32+1 row splitting, and bulk append/load checkpoints retained across
 reserve and rollback.
+Multi-segment requests into a preloaded cache check that span reuse stays within
+the public query sizing bound and remains AR-exact despite high future V.
+On AArch64, `test_attention_f16` also compares FP16 centering against the old
+FP32-subtract/FP16-store result across every finite half value and representative
+row maxima, including subnormal, zero, clamp and finite-range boundaries.
 CPU tests cover both sides of length 1024 and the exact 3+1 split for four
 queries starting at 1021. Descriptor counts also ensure uniform short/long CPU
 batches retain batching. Future V=64/65000 exercises LUT, delayed normalization

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
@@ -31,9 +32,17 @@ struct Device{
     ~Device(){rk_npu_iommu_domain_free(domain);rk_npu_close(ctx);}
 };
 struct BoardLock{
-    int fd;
-    explicit BoardLock(const char* p):fd(open(p,O_CREAT|O_RDWR,0666)){require(fd>=0 && !flock(fd,LOCK_EX|LOCK_NB),"NPU lock busy");}
-    ~BoardLock(){flock(fd,LOCK_UN);close(fd);}
+    int fd=-1;bool owned=true;
+    explicit BoardLock(const char* p){
+        if(!std::strcmp(p,"/tmp/rknpu_lowlevel_submit.lock")){
+            if(const char* inherited=std::getenv("LLM_INFER_LOCK_FD")){
+                fd=fcntl(std::stoi(inherited),F_DUPFD_CLOEXEC,0);owned=false;
+                require(fd>=0,"runner lock FD is closed");return;
+            }
+        }
+        fd=open(p,O_CREAT|O_RDWR,0666);require(fd>=0 && !flock(fd,LOCK_EX|LOCK_NB),"NPU lock busy");
+    }
+    ~BoardLock(){if(owned)flock(fd,LOCK_UN);close(fd);}
 };
 inline Weights weights(Device& d,const uint16_t* data){rk_npu_mla_f16_weights* p=nullptr;check(rk_npu_mla_f16_weights_create(d.domain,data,&p));return Weights(p,rk_npu_mla_f16_weights_free);}
 inline Cache cache(Device& d,const rk_npu_mla_f16_config& c,rk_npu_mla_f16_weights* w){rk_npu_mla_f16_cache* p=nullptr;check(rk_npu_mla_f16_cache_create(d.domain,&c,w,&p));return Cache(p,rk_npu_mla_f16_cache_free);}

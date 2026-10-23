@@ -320,6 +320,7 @@ void Graph::pack_q(const uint16_t* query,int tensor_rows,int tensor_offset){
     const auto scale=vdupq_n_f16(float16_t(shape.scale));
 #endif
     const int query_stride=tensor_rows?tensor_rows:rows;
+#pragma omp parallel for num_threads(4) if(rows>1 && m>16) schedule(static)
     for(int hi=0;hi<cfg.kv_heads;++hi){
     const int real_rows=shape.heads(cfg,hi)*rows,first=shape.first_head(cfg,hi);
     for(int kb=0;kb<shape.key_dim/8;++kb)for(int r=0;r<m;++r){
@@ -399,7 +400,8 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
         return vfmaq_f32(k,j,k);
     };
 #endif
-    std::atomic<bool> finite{true};
+    // Finite Q/K/V and representable FP16 QK scores are caller preconditions.
+    // Keep the -INFINITY sentinel for padding and fully hidden rows only.
     // Keep the original row-wise normalized algorithm for small tensors,
     // including its cache-resident per-head exponent buffer.
     if(span<=1024){
@@ -432,7 +434,6 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
 #endif
             for(;j<end;++j)if(visible(j))maximum=std::max(maximum,widen(at(j)[j%8]));
             float denominator=0;
-            if(maximum!=-INFINITY && !std::isfinite(maximum)){finite.store(false);maximum=-INFINITY;}
             j=0;
             if(maximum!=-INFINITY){
 #ifdef ATTENTION_NEON
@@ -464,13 +465,11 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
             }
         }
     }
-    if(!finite.load())throw Error{RK_NPU_ERR_PARAM};
         return;
     }
     // Compile separate scan sizes so small query batches retain their original
     // row scheduling and worker stack footprint.
-    auto scan_rows=[&](auto block_tag,int start,const rk_npu_attention_f16_boolean_mask* mask_data,
-        int length,std::atomic<bool>& finite
+    auto scan_rows=[&](auto block_tag
 #ifdef ATTENTION_NEON
         ,auto exp4
 #endif
@@ -531,12 +530,9 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
         float32x4_t totals[max_row_block];
         for(int r=0;r<count;++r){
             const float mx=vmaxvq_f16(maxima[r]);
-            if(!std::isfinite(mx) && mx!=-INFINITY)finite.store(false);
             maximum[r]=std::max(maximum[r],mx);totals[r]=vdupq_n_f32(0);
         }
 #endif
-        for(int r=0;r<count;++r)
-            if(maximum[r]!=-INFINITY && !std::isfinite(maximum[r])){finite.store(false);maximum[r]=-INFINITY;}
         for(int j=0;j<span;j+=8)for(int r=0;r<count;++r){
             auto* dst=at(r,j);
             if(j>=ends[r] || maximum[r]==-INFINITY){
@@ -586,7 +582,7 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
         };
         // Specialize the hot loops so normalized scratch/denominator work
         // and boolean-mask address calculations do not spill into exp-only.
-        const bool delayed=span>1024 && widen(value_absmax[cache_head])<=32752.f/cfg.kv_tile;
+        const bool delayed=widen(value_absmax[cache_head])<=32752.f/cfg.kv_tile;
         if(delayed){
             if(mask_data)process(std::true_type{},std::true_type{});
             else process(std::true_type{},std::false_type{});
@@ -596,18 +592,16 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
         }
     }
     };
-    auto scan=[&](auto tag){scan_rows(tag,start,mask_data,length,finite
+    auto scan=[&](auto tag){scan_rows(tag
 #ifdef ATTENTION_NEON
         ,long_exp4
 #endif
         );};
     if(m>32)scan(std::integral_constant<int,128>{});
     else scan(std::integral_constant<int,32>{});
-    if(!finite.load())throw Error{RK_NPU_ERR_PARAM};
 }
 void Graph::center_scores(int start,const rk_npu_attention_f16_boolean_mask* mask_data,int length){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.center_scores", "compute_length", span);
-    std::atomic<bool> finite{true};
     const int row_block=std::min(m,128),row_blocks=ceil_div(m,row_block);
     const int threads=size_t(cfg.query_heads)*rows*length>=4096?4:1;
 #pragma omp parallel for num_threads(threads) schedule(static)
@@ -648,7 +642,6 @@ void Graph::center_scores(int start,const rk_npu_attention_f16_boolean_mask* mas
             maxima[r]=std::max(maxima[r],float(vmaxvq_f16(mx[r])));
 #endif
             active[size_t(hi)*m+first+r]=maxima[r]!=-INFINITY;
-            if(maxima[r]!=-INFINITY && !std::isfinite(maxima[r]))finite.store(false);
         }
         for(int j=0;j<span;j+=8)for(int r=0;r<count;++r){
             auto* dst=at(r,j);
@@ -656,16 +649,16 @@ void Graph::center_scores(int start,const rk_npu_attention_f16_boolean_mask* mas
 #ifdef ATTENTION_NEON
             if(!mask_data && j+8<=ends[r]){
                 const auto x=vreinterpretq_f16_u16(vld1q_u16(dst));
-                const auto low=vmaxq_f32(vsubq_f32(vcvt_f32_f16(vget_low_f16(x)),vdupq_n_f32(maxima[r])),vdupq_n_f32(-16));
-                const auto high=vmaxq_f32(vsubq_f32(vcvt_f32_f16(vget_high_f16(x)),vdupq_n_f32(maxima[r])),vdupq_n_f32(-16));
-                vst1q_u16(dst,vreinterpretq_u16_f16(vcombine_f16(vcvt_f16_f32(low),vcvt_f16_f32(high))));continue;
+                // The maximum is an FP16 score and the result is stored as
+                // FP16. Subtract directly in that format, then clamp to -16.
+                vst1q_u16(dst,vreinterpretq_u16_f16(vmaxq_f16(
+                    vsubq_f16(x,vdupq_n_f16(float16_t(maxima[r]))),vdupq_n_f16(-16))));continue;
             }
 #endif
             for(int lane=0;lane<8;++lane)dst[lane]=half(j+lane<ends[r] && visible(r,j+lane)?
                 std::max(-16.f,widen(dst[lane])-maxima[r]):-16.f);
         }
     }
-    if(!finite.load())throw Error{RK_NPU_ERR_PARAM};
 }
 void Graph::finish(void* output,int tensor_rows,int tensor_offset,bool half_output){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.output_finish", "query_rows", rows);
@@ -692,7 +685,14 @@ void Graph::finish(void* output,int tensor_rows,int tensor_offset,bool half_outp
             auto add=[&](float* dst,int pos){
                 const int inner=pos%cfg.kv_tile;
                 const auto* v=bound->value.data()+bound->voffset(h,pos/cfg.kv_tile);
-                for(int c=0;c<d;++c)dst[c]+=widen(v[((size_t(c/16)*(cfg.kv_tile/32)+inner/32)*16+c%16)*32+inner%32]);
+                for(int c=0;c<d;++c){
+                    const uint16_t raw=v[((size_t(c/16)*(cfg.kv_tile/32)+inner/32)*16+c%16)*32+inner%32];
+#ifdef ATTENTION_NEON
+                    __fp16 value;std::memcpy(&value,&raw,sizeof(value));dst[c]+=float(value);
+#else
+                    dst[c]+=widen(raw);
+#endif
+                }
             };
             // A checkpoint leaves at most 31 old tokens. Continue the exact
             // FP32 token order used by Cache::add_value_sum; no subtract-back.
@@ -729,7 +729,7 @@ void Graph::finish(void* output,int tensor_rows,int tensor_offset,bool half_outp
         }
     }
 }
-void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t){
+void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t,int query_end){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.geometry", "query_rows", rows,
         "query_start", start, "kv_length", cache.length, "kv_tile", cfg.kv_tile);
     const auto begin=Clock::now();
@@ -745,9 +745,25 @@ void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_ti
     // to a full PV tile keeps one graph for several query chunks and avoids
     // repacking a changing partial tail whenever capacity allows it.
     int span=align_up(causal_prefill && cfg.flags==RK_NPU_ATTENTION_F16_FIXED_SHIFT_EXPERIMENTAL?cache.length:prefix,32);
-    if(causal_prefill && cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX)
-        span=std::min(align_up(span,cfg.kv_tile),align_up(cache.length,32));
-    rk_npu_attention_f16_sizes sizes{};check(query_engine(cfg,shape,cache.capacity,rows,span,sizes));
+    const bool reuse_lut_span=rows>1 && !shape.shared_kv &&
+        cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX &&
+        cfg.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL && cache.use_lut(bounds);
+    if((causal_prefill || reuse_lut_span) && cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX){
+        // GQA query() sizes scratch for this request's visible prefix, not
+        // all preloaded KV. Reuse across its internal segments within that
+        // bound; MLA's existing full-prefill path has a separate size query.
+        const int limit=causal_prefill?cache.length:(query_end?query_end:prefix);
+        span=std::min(align_up(span,cfg.kv_tile),align_up(limit,32));
+    }
+    rk_npu_attention_f16_sizes sizes{};int rc=query_engine(cfg,shape,cache.capacity,rows,span,sizes);
+    // Extending a LUT graph must not cross a geometry/descriptor boundary
+    // and silently select CPU exp. Its numerical mode is chosen per prefix
+    // by causal_rows(), independently of any preloaded future KV.
+    if(reuse_lut_span && !causal_prefill && (rc ||
+       !lut_tasks_fit(cfg,sizes.physical_rows,sizes.compute_length,sizes.tasks,true))){
+        span=align_up(prefix,32);rc=query_engine(cfg,shape,cache.capacity,rows,span,sizes);
+    }
+    check(rc);
     auto graph_cfg=cfg;
     // A final decode query sees every valid KV. Stable softmax zeroes padding
     // probabilities; fixed-shift caches retain zero V/denominator padding.
@@ -772,7 +788,7 @@ rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,i
         "stable_softmax", cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX);
     if(!query || !output)throw Error{RK_NPU_ERR_PARAM};
     validate_mask(cfg,mask,rows,cache.length);auto begin=Clock::now();rk_npu_attention_f16_timings t{};
-    geometry(cache,rows,start,t);auto prepared=Clock::now();
+    geometry(cache,rows,start,t,tensor_rows?start+tensor_rows-tensor_offset:0);auto prepared=Clock::now();
     const bool stable=cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;
     if(!stable)graph->update_mask(start,mask,cache.length);auto masked=Clock::now();
     graph->pack_q(query,tensor_rows,tensor_offset);auto packed=Clock::now();
@@ -860,9 +876,20 @@ int query_engine(const rk_npu_attention_f16_config& config,const Shape& shape,
 int query_gqa(const rk_npu_attention_f16_config& cfg,int capacity,int rows,int length,
     rk_npu_attention_f16_sizes& out,int& block_rows){
     if(rows<1 || rows>cfg.max_query_rows)return RK_NPU_ERR_PARAM;
-    const auto shape=gqa_shape(cfg);block_rows=std::min(rows,32);
+    const auto shape=gqa_shape(cfg);
+    const bool wide=cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX &&
+        cfg.mask_mode==RK_NPU_ATTENTION_F16_NO_MASK && shape.group==1;
+    // MHA has no grouped-query expansion. Keep larger native query tiles
+    // when both CBUF geometry and the LUT descriptor budget allow them.
+    block_rows=std::min(rows,wide?128:32);
     int rc=query_engine(cfg,shape,capacity,block_rows,length,out);
-    while(rc && block_rows>1){block_rows=(block_rows+1)/2;rc=query_engine(cfg,shape,capacity,block_rows,length,out);}
+    // Include optional per-core LUT setup tasks even in pingpong mode, so
+    // changing submit policy cannot turn a wider tile into CPU exp.
+    while(block_rows>1 && (rc || (wide && block_rows>32 &&
+          !lut_tasks_fit(cfg,out.physical_rows,out.compute_length,out.tasks,true)))){
+        block_rows=(block_rows+1)/2;
+        rc=query_engine(cfg,shape,capacity,block_rows,length,out);
+    }
     if(rc)return rc;
     out.output_bytes=uint64_t(cfg.query_heads)*rows*cfg.head_dim*sizeof(float);
     out.tasks*=ceil_div(rows,block_rows);
@@ -927,7 +954,7 @@ void Workspace::prepare_gqa(Cache& cache,int rows,int start){
     check(query_gqa(cfg,cache.capacity,rows,length,sizes,block_rows));
     for(int first=0;first<rows;){
         const int count=causal_rows(cache,std::min(block_rows,rows-first),start+first);
-        rk_npu_attention_f16_timings part{};geometry(cache,count,start+first,part);first+=count;
+        rk_npu_attention_f16_timings part{};geometry(cache,count,start+first,part,length);first+=count;
     }
 }
 rk_npu_attention_f16_timings Workspace::run_gqa(Cache& cache,const uint16_t* query,int rows,int start,void* output,
