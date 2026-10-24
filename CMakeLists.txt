@@ -86,6 +86,7 @@ set(RK_NPU_SRCS
   src/rk_npu_gdn_prefill.cpp  # chunked GDN and fused CPU Conv/SiLU/L2 producer
   src/rk_npu_attention_f16.cpp # experimental causal/no-mask/boolean GQA workspace
   src/rk_npu_attention_f16_cache.cpp # persistent native KV and tail staging
+  src/rk_npu_attention_f16_pipeline.cpp # two-slot query-block CPU/NPU overlap
   src/rk_npu_mla_f16.cpp      # Ling tiny gated MLA: expanded / absorbed latent cache
   src/rk_npu_mm.cpp           # additive raw MM/BMM descriptor and FP16 executor
   src/rk_npu_mm_gelu.cpp      # fused FP16 GEMM/bias/GELU
@@ -223,6 +224,11 @@ endif()
 add_executable(test_attention_f16_causal tests/test_attention_f16_causal.cpp)
 target_compile_options(test_attention_f16_causal PRIVATE ${RK_NPU_AARCH64_FP16_FLAGS})
 target_link_libraries(test_attention_f16_causal PRIVATE rk_npu_matmul_static)
+add_executable(test_attention_f16_pipeline tests/test_attention_f16_pipeline.cpp)
+target_link_libraries(test_attention_f16_pipeline PRIVATE rk_npu_matmul_static)
+if(BUILD_TESTING)
+  add_test(NAME attention_f16_pipeline_cpu COMMAND test_attention_f16_pipeline)
+endif()
 if(BUILD_TESTING)
   add_test(NAME attention_f16_causal_cpu COMMAND test_attention_f16_causal --cpu)
 endif()

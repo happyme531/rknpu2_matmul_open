@@ -132,7 +132,7 @@ void cpu(){
         c.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;c.mask_mode=RK_NPU_ATTENTION_F16_NO_MASK;
         rk_npu_attention_f16_sizes s{};
         check(rk_npu_attention_f16_query(&c,1024,128,1024,&s));
-        require(s.physical_rows==128,"unmasked MHA uses full legal query tile");
+        require(s.physical_rows==(rknpu2_matmul_open::attention::pipeline_policy()?64:128),"unmasked MHA selected query tile");
         for(int heads:{16,32}){
             c.query_heads=c.kv_heads=heads;
             check(rk_npu_attention_f16_query(&c,8192,128,8192,&s));

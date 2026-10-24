@@ -56,7 +56,8 @@ typedef struct {
 typedef struct {
     double reserve_us, kv_update_us, prepare_us, tail_stage_us, mask_update_us;
     /* Stable mode submit_us includes NPU submits and CPU score processing/sync;
-     * hardware_us sums only the driver-reported NPU intervals. */
+     * hardware_us sums only the driver-reported NPU intervals. Pipelined phase
+     * counters overlap across slots; total_us is the complete call wall time. */
     double query_pack_us, submit_us, hardware_us, output_sync_us, finish_us, total_us;
     int compute_length, tasks;
 } rk_npu_attention_f16_timings;
@@ -66,7 +67,11 @@ typedef struct rk_npu_attention_f16_workspace rk_npu_attention_f16_workspace;
 /* Defaults describe Hq/Hkv=32/8,d128. flags defaults to zero: opt in explicitly. */
 void rk_npu_attention_f16_config_init(rk_npu_attention_f16_config* cfg);
 /* Pure CPU sizing/validation. kv_length is the causal prefix to compute, not
- * allocated cache capacity. Buffer sizes describe the largest internal segment;
+ * allocated cache capacity. Query/score/mask/partial/tail sizes aggregate the
+ * active scratch slots; physical_rows is per slot. Causal tail sizing also
+ * bounds earlier numerical-mode segments. K/V remain shared. Native LUT needs
+ * additional exponent storage of up to score_bytes. Allocator headroom, retained
+ * high-water buffers, registers/descriptors and CPU scratch are not included;
  * output_bytes covers [query_heads,query_rows,head_dim], tasks estimates QK/PV
  * work for layout segments. Runtime numerical-mode splits and native LUT
  * execution can add tasks; run timings report their actual sum. */
@@ -76,7 +81,11 @@ int rk_npu_attention_f16_query(const rk_npu_attention_f16_config* cfg,
 /* Cache and workspace retain domain references; caller ctx must outlive both.
  * Multiple layer caches can share one workspace. Objects are non-reentrant:
  * concurrent use returns ERR_BUSY. Different workspaces still require caller
- * scheduling when sharing a physical core. */
+ * scheduling when sharing a physical core.
+ * Stable calls with multiple layout segments use a two-slot pipeline by default.
+ * Set RK_NPU_ATTN_PIPELINE=0 before query/prepare to use serial execution. The
+ * workspace captures this policy at creation; existing handles do not change.
+ * Single-segment calls and fixed-shift/MLA execution do not start a worker. */
 int rk_npu_attention_f16_cache_create(rk_npu_iommu_domain* domain,
     const rk_npu_attention_f16_config* cfg, rk_npu_attention_f16_cache** out);
 void rk_npu_attention_f16_cache_free(rk_npu_attention_f16_cache* cache);
@@ -100,6 +109,7 @@ int rk_npu_attention_f16_prepare(rk_npu_iommu_domain* domain,
     const rk_npu_attention_f16_config* cfg, rk_npu_attention_f16_workspace** out);
 void rk_npu_attention_f16_workspace_free(rk_npu_attention_f16_workspace* workspace);
 /* Optional warm-up: builds geometry and tail staging without a submit.
+ * A pipeline primes its first graph per slot; later buffers grow on demand.
  * Geometry changes and reserve costs are also included when run/step does them. */
 int rk_npu_attention_f16_prepare_query(rk_npu_ctx* ctx,
     rk_npu_attention_f16_workspace* workspace, rk_npu_attention_f16_cache* cache,

@@ -45,6 +45,10 @@ struct Shape {
 Shape gqa_shape(const rk_npu_attention_f16_config& cfg);
 int query_engine(const rk_npu_attention_f16_config& cfg,const Shape& shape,
     int capacity,int rows,int length,rk_npu_attention_f16_sizes& out);
+bool pipeline_policy()noexcept;
+int query_gqa(const rk_npu_attention_f16_config& cfg,int capacity,int rows,int length,
+    rk_npu_attention_f16_sizes& out,int& block_rows,bool pipeline);
+void add_timings(rk_npu_attention_f16_timings& sum,const rk_npu_attention_f16_timings& part);
 void validate_boolean_mask(const rk_npu_attention_f16_config& cfg,
     const rk_npu_attention_f16_boolean_mask* mask,int rows,int length);
 inline uint32_t core_mask(const rk_npu_attention_f16_config& c){
@@ -96,6 +100,12 @@ struct Buffer {
     }
     void zero(){std::memset(mem.vaddr,0,mem.size);}
 };
+// Tail layout and ownership are independent of the shared native K/V. A
+// workspace slot may visit several layer caches with identical epoch values.
+struct Tail : Buffer {
+    int block=-1,length=0;
+    uint64_t epoch=~uint64_t(0),generation=0,owner=0;
+};
 // Native B has N16/K32 stripes: 16 channels x 32 tokens x FP16 = 1024
 // bytes. Merge adjacent channel groups to trade cache-clean bytes for ioctls.
 // The denominator occupies only the first 64-byte line of its N16 stripe.
@@ -131,11 +141,11 @@ struct Cache {
     std::vector<uint16_t> value_absmax_prefix;
     uint64_t identity=next_identity();
     std::atomic<bool> busy{false};
-    Buffer key,value,tail;
+    Buffer key,value;
+    Tail tail;
     int length=0,capacity=0,blocks=0;
-    int tail_block=-1,tail_length=0;
-    bool poisoned=false;
-    uint64_t generation=0,epoch=0,tail_epoch=~uint64_t(0),tail_generation=0;
+    bool poisoned=false,dirty_append=false;
+    uint64_t generation=0,epoch=0;
     int dirty_first=0,dirty_count=0;
     // Magnitude bits are ordered for finite FP16. Track V on updates so a
     // stable run can bound each FP16 PV partial without rescanning the cache.
@@ -151,7 +161,7 @@ struct Cache {
     void load(const uint16_t* k,const uint16_t* v,int count);
     void append(const uint16_t* k,const uint16_t* v,int count,double* reserve_time=nullptr);
     void truncate(int count);
-    void stage_tail(int span);
+    void stage_tail(int span,Tail* scratch=nullptr);
     void write(int position,const uint16_t* k,const uint16_t* v,int source_stride,int source_position);
     void add_value_sum(const uint16_t* v,int count,int first);
     void add_value_bound(const uint16_t* v,int count,int first);
@@ -189,7 +199,7 @@ struct Graph {
     uint16_t value_absmax[32]{};
     Cache* bound=nullptr;
     uint64_t bound_generation=~uint64_t(0),bound_tail_generation=~uint64_t(0);
-    uint64_t bound_identity=0;
+    uint64_t bound_identity=0,bound_tail_address=0;
     int mask_start=-1;
     rk_npu_attention_f16_boolean_mask saved_mask{};
     bool can_lut(const Cache& cache,const uint16_t* bounds=nullptr)const{
@@ -198,31 +208,43 @@ struct Graph {
         return cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX && cache.use_lut(bounds) &&
             lut_tasks_fit(cfg,m,span,matmul_tasks,lut_split);
     }
-    explicit Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,int s,Cache& cache,Shape shape,Graph* reuse=nullptr,const uint16_t* bounds=nullptr);
-    void bind(Cache& cache,const uint16_t* bounds=nullptr);
+    explicit Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,int s,Cache& cache,Shape shape,Graph* reuse=nullptr,const uint16_t* bounds=nullptr,Tail* scratch=nullptr);
+    void bind(Cache& cache,const uint16_t* bounds=nullptr,Tail* scratch=nullptr);
     void update_mask(int start,const rk_npu_attention_f16_boolean_mask* boolean,int length);
     void pack_q(const uint16_t* query,int tensor_rows=0,int tensor_offset=0);
     double submit(int stage=0);
+    void sync_scores(rk_npu_sync_dir direction);
+    void process_scores(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
+    double submit_pv(int start);
+    void sync_output();
     void stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
     void center_scores(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
     void finish(void* output,int tensor_rows=0,int tensor_offset=0,bool half_output=false);
 };
+class Pipeline;
 struct Workspace {
     Lease lease;
     rk_npu_attention_f16_config cfg;
     Shape shape;
     std::atomic<bool> busy{false};
     std::unique_ptr<Graph> graph;
+    // Destroy/join the worker before releasing the primary graph or domain.
+    std::unique_ptr<Pipeline> pipeline;
+    const bool pipeline_enabled;
     bool poisoned=false;
     bool full_causal_prefill=false; // MLA query chunks reuse one valid-KV graph.
-    Workspace(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,Shape s={}):lease(d),cfg(c),shape(s){}
-    void geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t,int query_end=0);
+    Workspace(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,Shape s={});
+    ~Workspace();
+    void geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t,int query_end=0,Tail* scratch=nullptr);
     rk_npu_attention_f16_timings run(Cache& cache,const uint16_t* q,int rows,int start,void* output,
         const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows=0,int tensor_offset=0,bool half_output=false);
     rk_npu_attention_f16_timings run_gqa(Cache& cache,const uint16_t* q,int rows,int start,void* output,
         const rk_npu_attention_f16_boolean_mask* mask,bool half_output=false);
     void prepare_gqa(Cache& cache,int rows,int start);
     int causal_rows(const Cache& cache,int rows,int start)const;
+    void prepare_pipeline(Cache& cache,int rows,int start,int block_rows);
+    rk_npu_attention_f16_timings run_pipeline(Cache& cache,const uint16_t* query,int rows,int start,
+        void* output,const rk_npu_attention_f16_boolean_mask* mask,bool half_output,int block_rows);
 };
 inline void context(rk_npu_ctx* ctx,rk_npu_iommu_domain* d){if(!ctx || ctx!=d->ctx)throw Error{RK_NPU_ERR_PARAM};}
 inline void compatible(const Workspace& w,const Cache& c){

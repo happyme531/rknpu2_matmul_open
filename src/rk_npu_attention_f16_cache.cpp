@@ -91,7 +91,7 @@ void Cache::reserve(int requested){
     key.swap(nk);value.swap(nv);capacity=next;blocks=nb;++generation;
     if(lut_exp){value_total.resize(size_t(h())*shape.value_dim);value_prefix.resize(size_t(capacity/32+1)*h()*shape.value_dim);}
     value_absmax_prefix.resize(size_t(capacity/32+1)*h());
-    tail_epoch=~uint64_t(0);
+    tail.epoch=~uint64_t(0);
 }
 
 void Cache::write(int position,const uint16_t* k,const uint16_t* v,int stride,int src_position){
@@ -125,7 +125,7 @@ void Cache::load(const uint16_t* k,const uint16_t* v,int count){
             dst[((size_t(c/16)*(tile/32)+pos/32)*16+c%16)*32+pos%32]=v[(size_t(hi)*count+block*tile+pos)*shape.value_dim+c];
     }
     key.sync(RK_NPU_SYNC_TO_DEVICE);value.sync(RK_NPU_SYNC_TO_DEVICE);
-    length=count;poisoned=false;++epoch;dirty_first=0;dirty_count=count;tail_epoch=~uint64_t(0);
+    length=count;poisoned=false;++epoch;dirty_first=0;dirty_count=count;dirty_append=false;tail.epoch=~uint64_t(0);
 }
 
 void Cache::append(const uint16_t* k,const uint16_t* v,int count,double* reserve_time){
@@ -194,7 +194,7 @@ void Cache::append(const uint16_t* k,const uint16_t* v,int count,double* reserve
         }
         }
     }catch(...){poisoned=true;throw;}
-    length=last;++epoch;dirty_first=first;dirty_count=count;
+    length=last;++epoch;dirty_first=first;dirty_count=count;dirty_append=true;
 }
 
 void Cache::truncate(int count){
@@ -236,7 +236,7 @@ void Cache::truncate(int count){
         }
         value_absmax[hi]=maximum;
     }
-    length=count;++epoch;dirty_first=count;dirty_count=0;tail_epoch=~uint64_t(0);
+    length=count;++epoch;dirty_first=count;dirty_count=0;dirty_append=false;tail.epoch=~uint64_t(0);
     // CPU softmax masks retained native rows beyond length.
 }
 
@@ -298,18 +298,22 @@ void Cache::add_value_sum(const uint16_t* v,int count,int first){
     }
 }
 
-void Cache::stage_tail(int span){
+void Cache::stage_tail(int span,Tail* scratch){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.tail_stage", "compute_length", span,
         "kv_tile", cfg.kv_tile, "kv_length", length);
     const int size=span%cfg.kv_tile,block=span/cfg.kv_tile,tile=cfg.kv_tile;
     if(!size)return;
     if(poisoned)throw Error{RK_NPU_ERR_SUBMIT};
+    auto& tail=scratch?*scratch:this->tail;
     const uint64_t needed=size_t(h())*n()*size*2;
     const bool resize=tail.mem.size<needed;
-    if(resize){tail.ensure(lease.domain,std::max(needed,std::min(uint64_t(h())*n()*tile*2,tail.mem.size*2)));++tail_generation;}
-    const bool same=!resize && tail_block==block && tail_length==size;
-    if(same && tail_epoch==epoch)return;
-    const bool incremental=same && tail_epoch+1==epoch && dirty_first>=block*tile && dirty_first+dirty_count<=block*tile+size;
+    if(resize){tail.ensure(lease.domain,std::max(needed,std::min(uint64_t(h())*n()*tile*2,tail.mem.size*2)));++tail.generation;}
+    const bool same=!resize && tail.owner==identity && tail.block==block && tail.length==size;
+    if(same && tail.epoch==epoch)return;
+    // Load/truncate also advance epoch. A slot must repack their cleared
+    // padding instead of preserving a discarded V/denominator LUT carrier.
+    const bool incremental=dirty_append && same && tail.epoch+1==epoch &&
+        dirty_first>=block*tile && dirty_first+dirty_count<=block*tile+size;
     const int dirty_sync_groups=dirty_sync.for_length(length);
     for(int hi=0;hi<h();++hi){
         auto* dst=tail.data()+size_t(hi)*n()*size;
@@ -326,6 +330,6 @@ void Cache::stage_tail(int span){
                 [&](uint64_t offset,uint64_t bytes){tail.range(offset,bytes);},dirty_sync_groups==32);
         else tail.range(size_t(hi)*n()*size*2,size_t(incremental?shape.value_dim+16:n())*size*2);
     }
-    tail_block=block;tail_length=size;tail_epoch=epoch;
+    tail.block=block;tail.length=size;tail.epoch=epoch;tail.owner=identity;
 }
 } // namespace

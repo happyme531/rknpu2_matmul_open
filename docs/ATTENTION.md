@@ -14,6 +14,12 @@ handling remains the caller's responsibility. No RKNN runtime, compiler, model o
 needed at build or run time. The DPU-RDMA mask registers are generated from dimensions,
 using tested native Softmax layout rules.
 
+Stable GQA/MHA calls with multiple layout segments use a two-slot CPU/NPU
+pipeline by default. Set `RK_NPU_ATTN_PIPELINE=0` before sizing and creating
+workspaces to select the serial path. Only `0` disables it; a workspace captures
+the policy when created. Single-layout-segment calls, fixed-shift and MLA keep
+their serial submission path and do not start a pipeline worker.
+
 ## Supported shapes and mask semantics
 
 - One batch; compact FP16 bit-pattern tensors. Head dimension is a positive
@@ -23,11 +29,12 @@ using tested native Softmax layout rules.
   `1/sqrt(head_dim)`. Default geometry remains Hq/Hkv=32/8, D128.
 - Large head dimensions or query/KV ratios are handled by internal query-row
   splitting. `run` accepts logical rows and restores compact output order;
-  `query` reports peak segment buffers, total output bytes and QK/PV tasks;
+  `query` reports aggregate active-slot buffers, total output bytes and QK/PV tasks;
   LUT execution adds DPU tasks at run time.
-- Stable `NO_MASK` MHA prefers up to 128 query rows per segment. Native
-  geometry and the combined QK/PV/LUT task budget can reduce this to 64/32
-  rows. GQA, masked and fixed-shift calls keep the existing 32-row starting
+- Stable `NO_MASK` MHA prefers up to 64 query rows per pipeline slot; disabling
+  the pipeline restores the 128-row starting policy. Native geometry and the
+  combined QK/PV/LUT task budget can reduce the segment size further.
+  GQA, masked and fixed-shift calls keep the existing 32-row starting
   policy. Use the returned sizes rather than assuming a 32-row scratch buffer.
 - KV capacity is aligned to 32, grows up to an explicit limit of at most 32768.
   Each internal graph must fit within 4095 NPU tasks; `query` rejects configurations
@@ -103,9 +110,14 @@ denominator-validity channel are synchronized by ranges. Padding has zero V and
 zero denominator validity, so no-mask does not accidentally normalize over
 physical padding. Invalid arguments/capacity limits are checked before writes.
 
-Full PV blocks read the native cache directly. A partial block uses a persistent
-per-cache tail buffer; only newly appended columns are refreshed within a fixed
-tail geometry. Workspace geometry changes when the selected computation span
+Full PV blocks read the native cache directly. Serial execution uses a persistent
+per-cache partial tail; each pipeline slot has its own tail buffer and staging
+metadata. Tail reuse checks cache identity, epoch and geometry, so a shared
+workspace can safely switch between layers with identical epoch values.
+Only an explicitly recorded append can refresh incremental columns within a
+fixed tail geometry. Reload and truncate repack cleared padding as well, so
+discarded V/denominator rows cannot survive as LUT carriers in a slot tail.
+Workspace geometry changes when the selected computation span
 or query row count changes. Graph preparation, tail staging and reserve costs are reported
 separately and included in run/step `total_us`. `prepare_query` can explicitly warm
 a known current query without submitting it.
@@ -113,6 +125,39 @@ a known current query without submitting it.
 Sync/submit failure poisons the affected state. Reload a cache before reuse after
 a write failure; recreate a workspace after a failed submit. The library does not
 silently retry/fallback. These handles are not a framework-level model integration.
+
+### Query-block pipeline
+
+Two independent scratch slots hold Q, scores, LUT exponent output, PV partials,
+registers/descriptors, CPU scratch and partial tails. Complete native K/V and
+value-prefix checkpoints remain shared. A persistent worker performs the same
+blocking driver submits, with at most one submit in flight; no asynchronous
+fence ABI or extra NPU core is required. The worker is created lazily by a
+multi-segment `run` or `prepare_query` and joined before workspace buffers or
+domain references are released.
+`prepare_query` primes the first graph in each slot. Later geometry grows
+retained buffers on demand during `run`.
+
+QK of the next block overlaps CPU centering of the completed block; LUT/PV,
+output finish and subsequent packing also participate in the pipeline. Score
+invalidate precedes the next QK so cache maintenance does not consume all of
+that overlap. Causal numerical-mode planning, Boolean mask offsets and future
+carrier clearing retain the serial arithmetic. CPU or worker errors drain the
+in-flight submit before returning and poison the affected workspace.
+
+`query_bytes`, `score_bytes`, `mask_bytes`, `partial_bytes` and `tail_bytes`
+aggregate active scratch slots. `physical_rows` is per slot; key/value/output
+are shared and not multiplied. Causal `tail_bytes` also bounds partial tails
+of earlier CPU-exp segments, including requests ending at a complete PV tile.
+Native LUT exponent buffers require up to another `score_bytes` in total.
+These are logical buffer requirements, excluding registers/descriptors, CPU
+scratch, thread stacks, allocator headroom and retained high-water buffers.
+`cache_get_info` continues to report the cache-owned buffers, not slot tails.
+
+Phase timings overlap across slots and must not be added to reconstruct wall
+time. `total_us` is the complete public call; `hardware_us` sums driver device
+intervals and is not pure MAC time. Small single-segment verification/decode
+calls bypass the worker even after a larger call has created it.
 
 ### Optional dirty stripe synchronization
 
