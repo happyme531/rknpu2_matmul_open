@@ -331,9 +331,38 @@ void expanded_input_board(int core,uint32_t flags=1){
     require(rk_npu_mla_f16_prepare(dev.domain,&cfg,nullptr,&bad_work)==RK_NPU_ERR_PARAM && !bad_work,"absorbed workspace requires weights");
     canary(dev,core);std::printf("CHECK expanded input core=%d load/append/growth/rewind/guards PASS\n",core);
 }
+void truncate_board(int core){
+    BoardLock lock("/tmp/rknpu_lowlevel_submit.lock");
+    Device dev;Fixture f(130,5);auto w=weights(dev,f.w.data());
+    require(rk_npu_mla_f16_cache_truncate(nullptr,0)==RK_NPU_ERR_PARAM,"null truncate");
+    for(auto mode:{RK_NPU_MLA_F16_EXPANDED,RK_NPU_MLA_F16_ABSORBED}){
+        rk_npu_mla_f16_config cfg{};rk_npu_mla_f16_config_init(&cfg);
+        cfg.mode=mode;cfg.core_mask=core;cfg.flags=RK_NPU_MLA_F16_STABLE_SOFTMAX;
+        cfg.initial_capacity=32;cfg.max_capacity=256;cfg.kv_tile=256;
+        auto c=cache(dev,cfg,w.get());auto ws=work(dev,cfg,w.get());
+        for(int keep:{0,1,17,31,32,33,63,64,65,129}){
+            check(rk_npu_mla_f16_cache_load(dev.ctx,c.get(),f.latent.data(),f.rope.data(),129));
+            rk_npu_mla_f16_cache_info before{},after{};
+            check(rk_npu_mla_f16_cache_get_info(c.get(),&before));
+            require(rk_npu_mla_f16_cache_truncate(c.get(),-1)==RK_NPU_ERR_PARAM,"negative truncate");
+            require(rk_npu_mla_f16_cache_truncate(c.get(),130)==RK_NPU_ERR_PARAM,"extend truncate");
+            check(rk_npu_mla_f16_cache_truncate(c.get(),keep));
+            check(rk_npu_mla_f16_cache_get_info(c.get(),&after));
+            require(after.length==keep && before.capacity==after.capacity && before.key_bytes==after.key_bytes && before.value_bytes==after.value_bytes && before.tail_bytes==after.tail_bytes,"truncate retains allocation");
+            check(rk_npu_mla_f16_cache_append(dev.ctx,c.get(),f.latent.data()+size_t(keep)*C,f.rope.data()+size_t(keep)*R,1));
+            GuardOutput output(H*D),reference(H*D);
+            check(rk_npu_mla_f16_run(dev.ctx,ws.get(),c.get(),f.q.data(),f.gates.data(),1,keep,output.ptr(),nullptr,nullptr));
+            check(rk_npu_mla_f16_cache_load(dev.ctx,c.get(),f.latent.data(),f.rope.data(),keep+1));
+            check(rk_npu_mla_f16_run(dev.ctx,ws.get(),c.get(),f.q.data(),f.gates.data(),1,keep,reference.ptr(),nullptr,nullptr));
+            require(output.values()==reference.values(),"truncate/append equals fresh prefix bitexact");
+        }
+    }
+    canary(dev,core);std::printf("CHECK MLA truncate core=%d expanded/absorbed boundaries, allocation, append/reload bitexact PASS\n",core);
+}
 int main(int argc,char** argv){try{cpu();if(argc>1 && std::string(argv[1])=="--board"){
     const int core=argc>2?std::stoi(argv[2]):1;
-    if(argc>3 && std::string(argv[3])=="--expanded-input")expanded_input_board(core);
+    if(argc>3 && std::string(argv[3])=="--truncate")truncate_board(core);
+    else if(argc>3 && std::string(argv[3])=="--expanded-input")expanded_input_board(core);
     else if(argc>3 && std::string(argv[3])=="--expanded-stable")expanded_input_board(core,RK_NPU_MLA_F16_STABLE_SOFTMAX);
     else if(argc>3 && std::string(argv[3])=="--stable")board(core,true,RK_NPU_MLA_F16_STABLE_SOFTMAX);
     else if(argc>3 && std::string(argv[3])=="--long")long_board(core,argc>4?std::stoi(argv[4]):512);

@@ -61,6 +61,9 @@ int rk_npu_mla_f16_cache_get_info(rk_npu_mla_f16_cache* cache,
     rk_npu_mla_f16_cache_info* out);
 int rk_npu_mla_f16_cache_reserve(rk_npu_ctx* ctx,
     rk_npu_mla_f16_cache* cache,int capacity);
+/* Stable-softmax caches only. Retain rows [0,length) and their allocation;
+ * 0 <= length <= current length. Discarded rows are overwritten by append. */
+int rk_npu_mla_f16_cache_truncate(rk_npu_mla_f16_cache* cache,int length);
 /* latent [count,512] is AFTER kv_a_layernorm; rope_key [count,64] is AFTER
  * RoPE. Load replaces cache; append preserves prefix and grows geometrically.
  * Absorbed keeps one shared copy; expanded performs NPU kv_b projections.
