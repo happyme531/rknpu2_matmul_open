@@ -109,6 +109,7 @@ int rk_npu_attention_f16_prepare(rk_npu_iommu_domain* domain,
     const rk_npu_attention_f16_config* cfg, rk_npu_attention_f16_workspace** out);
 void rk_npu_attention_f16_workspace_free(rk_npu_attention_f16_workspace* workspace);
 /* Optional warm-up: builds geometry and tail staging without a submit.
+ * A pipeline primes its first graph per slot; later buffers grow on demand.
  * Geometry changes and reserve costs are also included when run/step does them. */
 int rk_npu_attention_f16_prepare_query(rk_npu_ctx* ctx,
     rk_npu_attention_f16_workspace* workspace, rk_npu_attention_f16_cache* cache,

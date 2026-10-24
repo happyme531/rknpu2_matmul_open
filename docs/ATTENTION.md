@@ -135,6 +135,8 @@ blocking driver submits, with at most one submit in flight; no asynchronous
 fence ABI or extra NPU core is required. The worker is created lazily by a
 multi-segment `run` or `prepare_query` and joined before workspace buffers or
 domain references are released.
+`prepare_query` primes the first graph in each slot. Later geometry grows
+retained buffers on demand during `run`.
 
 QK of the next block overlaps CPU centering of the completed block; LUT/PV,
 output finish and subsequent packing also participate in the pipeline. Score

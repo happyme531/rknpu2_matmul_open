@@ -99,7 +99,6 @@ class Pipeline {
 public:
     explicit Pipeline(Workspace& w):owner(w),alternate(w.lease.domain,w.cfg,w.shape){
         slots[0].work=&w;slots[1].work=&alternate;
-        alternate.full_causal_prefill=w.full_causal_prefill;
         // One persistent blocking-submit worker. There is never more than one
         // NPU submit in flight, and its buffers outlive every completed ioctl.
         try{thread=std::thread(&Pipeline::worker,this);}
@@ -111,7 +110,9 @@ public:
     }
     void prepare(Cache& cache,int rows,int start,int block_rows){
         plan(cache,rows,start,block_rows);
-        try{for(int index=0;index<block_count;++index)prepare_slot(cache,index,nullptr,rows,start);}
+        // Each slot retains one graph. Prime the first pair; later geometry
+        // grows retained buffers on demand instead of replacing these graphs.
+        try{for(int index=0;index<std::min(block_count,2);++index)prepare_slot(cache,index,nullptr,rows,start);}
         catch(...){owner.poisoned=true;throw;}
     }
     rk_npu_attention_f16_timings run(Cache& cache,const uint16_t* query,int rows,int start,
