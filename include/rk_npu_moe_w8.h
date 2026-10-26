@@ -123,6 +123,20 @@ int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* weights,
 int rk_npu_moe_quant_import_expert(rk_npu_moe_w8_weights* weights,
     int slot, const void* data, uint64_t bytes);
 
+typedef struct rk_npu_moe_import_timings {
+    double copy_us, validate_us, gate_sync_us, down_sync_us, total_us;
+} rk_npu_moe_import_timings;
+int rk_npu_moe_quant_import_expert_timed(rk_npu_moe_w8_weights* weights,
+    int slot, const void* data, uint64_t bytes, rk_npu_moe_import_timings* timings);
+
+/* Exchange W4 slot storage and metadata without copying weights or syncing.
+ * Both banks must have matching geometry and the same context/IOMMU domain.
+ * The selected slots must be idle, with all earlier imports/runs complete.
+ * Other slots in a staging bank may be imported concurrently. Storage ownership
+ * follows the slot, so either bank may be freed after outstanding work ends. */
+int rk_npu_moe_quant_swap_slots(rk_npu_moe_w8_weights* first, int first_slot,
+    rk_npu_moe_w8_weights* second, int second_slot);
+
 /* Counts requested device payload bytes (no page rounding or CPU containers). */
 uint64_t rk_npu_moe_w8_weights_device_bytes(const rk_npu_moe_w8_weights* weights);
 uint64_t rk_npu_moe_w8_workspace_device_bytes(const rk_npu_moe_w8_workspace* workspace);

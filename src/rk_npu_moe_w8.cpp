@@ -383,11 +383,13 @@ struct Weights {
     Device device;
     rk_npu_moe_w8_weight_config config;
     Buffer gate,down,coeff;
-    std::vector<std::unique_ptr<Buffer>> gate_banks,down_banks;
+    std::vector<std::shared_ptr<Buffer>> gate_banks,down_banks;
+    std::vector<std::shared_ptr<Buffer>> gate_owner,down_owner;
     std::vector<rk_npu_mem> gw,dw;
     std::vector<std::vector<float>> gs,ds;
     bool lut_scales=true;
     Mode mode;
+    uint64_t packed_blob_bytes=0; // Immutable once construction completes.
     std::vector<std::vector<int32_t>> gcor,dcor;
     Weights(rk_npu_iommu_domain* domain,const rk_npu_moe_w8_weight_config& c,
             const rk_npu_moe_w8_expert* experts,Mode recipe=Mode::W8,
@@ -404,7 +406,7 @@ struct Weights {
             // Bound individual IOVA allocations while keeping every expert resident.
             for(int first=0;first<w4_count;first+=bank_experts) {
                 const size_t entries=std::min(bank_experts,w4_count-first);
-                auto g=std::make_unique<Buffer>(),d=std::make_unique<Buffer>();
+                auto g=std::make_shared<Buffer>(),d=std::make_shared<Buffer>();
                 g->alloc(device,entries*H*N,bank_flags);
                 d->alloc(device,entries*N*H/2,bank_flags);
                 gate_banks.push_back(std::move(g));down_banks.push_back(std::move(d));
@@ -417,6 +419,7 @@ struct Weights {
         }
         gcor.resize(count);dcor.resize(count);
         gw.resize(count);dw.resize(count);gs.resize(count);ds.resize(count);
+        if(w4){gate_owner.resize(count);down_owner.resize(count);}
         if(N==512 && !w4) {
             coeff.alloc(device,size_t(count)*6144);
             std::memset(coeff.mem.vaddr,0,coeff.mem.size);
@@ -426,6 +429,7 @@ struct Weights {
             if(i4) {
                 gw[e]=gate_banks[e/bank_experts]->view(size_t(e%bank_experts)*H*N,size_t(H)*N);
                 dw[e]=down_banks[e/bank_experts]->view(size_t(e%bank_experts)*N*H/2,size_t(N)*H/2);
+                gate_owner[e]=gate_banks[e/bank_experts];down_owner[e]=down_banks[e/bank_experts];
             } else {
                 const size_t offset=mode==Mode::W8?e:0;
                 gw[e]=gate.view(offset*H*N*2,size_t(H)*N*2);
@@ -469,6 +473,8 @@ struct Weights {
                 } catch(const std::runtime_error&) {lut_scales=false;}
             }
         }
+        if(w4)packed_blob_bytes=gw[0].size+dw[0].size+
+            4*(gs[0].size()+ds[0].size()+gcor[0].size()+dcor[0].size());
         if(experts && w4) {
             for(auto& b:gate_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
             for(auto& b:down_banks)b->sync(b->mem.size,RK_NPU_SYNC_TO_DEVICE);
@@ -867,9 +873,7 @@ extern "C" rk_npu_moe_w8_weights* rk_npu_moe_w4_slots_create(rk_npu_iommu_domain
 }
 
 extern "C" uint64_t rk_npu_moe_quant_expert_blob_bytes(const rk_npu_moe_w8_weights* w) {
-    if(!w || w->mode==rknpu2_matmul_open::moe::Mode::W8)return 0;
-    return w->gw[0].size+w->dw[0].size+4*(w->gs[0].size()+w->ds[0].size()+w->gcor[0].size()+
-        w->dcor[0].size());
+    return w?w->packed_blob_bytes:0;
 }
 
 extern "C" int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* w,int e,void* data,uint64_t bytes) {
@@ -886,9 +890,16 @@ extern "C" int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* w,int
 }
 
 extern "C" int rk_npu_moe_quant_import_expert(rk_npu_moe_w8_weights* w,int e,const void* data,uint64_t bytes) {
+    return rk_npu_moe_quant_import_expert_timed(w,e,data,bytes,nullptr);
+}
+extern "C" int rk_npu_moe_quant_import_expert_timed(rk_npu_moe_w8_weights* w,int e,const void* data,uint64_t bytes,
+        rk_npu_moe_import_timings* timings) {
     const uint64_t need=rk_npu_moe_quant_expert_blob_bytes(w);
     if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()) ||
         !rknpu2_matmul_open::moe::expert_is_w4(w->mode,e,w->config.routed_experts))return RK_NPU_ERR_PARAM;
+    using namespace rknpu2_matmul_open::moe;
+    if(timings)*timings={};
+    const auto begin=timings?Clock::now():Clock::time_point{};
     try {
         const auto* p=static_cast<const uint8_t*>(data);
         auto get=[&](void* dst,size_t n){std::memcpy(dst,p,n);p+=n;};
@@ -896,10 +907,28 @@ extern "C" int rk_npu_moe_quant_import_expert(rk_npu_moe_w8_weights* w,int e,con
         get(w->gs[e].data(),w->gs[e].size()*4);get(w->ds[e].data(),w->ds[e].size()*4);
         get(w->gcor[e].data(),w->gcor[e].size()*4);
         if(!w->dcor[e].empty())get(w->dcor[e].data(),w->dcor[e].size()*4);
+        auto at=timings?Clock::now():Clock::time_point{};
+        if(timings)timings->copy_us=std::chrono::duration<double,std::micro>(at-begin).count();
         for(const auto* v:{&w->gs[e],&w->ds[e]})for(float s:*v)if(!(s>0) || !std::isfinite(s))return RK_NPU_ERR_PARAM;
+        if(timings){timings->validate_us=us(at);at=Clock::now();}
         rknpu2_matmul_open::moe::check(rk_npu_mem_sync(w->device.ctx,&w->gw[e],RK_NPU_SYNC_TO_DEVICE));
+        if(timings){timings->gate_sync_us=us(at);at=Clock::now();}
         rknpu2_matmul_open::moe::check(rk_npu_mem_sync(w->device.ctx,&w->dw[e],RK_NPU_SYNC_TO_DEVICE));
+        if(timings){timings->down_sync_us=us(at);timings->total_us=us(begin);}
         return RK_NPU_OK;
     } catch(const rknpu2_matmul_open::moe::Failure& e) {return e.code;}
     catch(...) {return RK_NPU_ERR_PARAM;}
+}
+
+extern "C" int rk_npu_moe_quant_swap_slots(rk_npu_moe_w8_weights* a,int ai,rk_npu_moe_w8_weights* b,int bi) {
+    using namespace rknpu2_matmul_open::moe;
+    if(!a || !b || a->mode!=Mode::W4 || b->mode!=Mode::W4 ||
+        a->config.hidden!=b->config.hidden || a->config.intermediate!=b->config.intermediate ||
+        a->device.ctx!=b->device.ctx || a->device.domain->id!=b->device.domain->id ||
+        ai<0 || bi<0 || ai>=int(a->gw.size()) || bi>=int(b->gw.size()))return RK_NPU_ERR_PARAM;
+    std::swap(a->gw[ai],b->gw[bi]);std::swap(a->dw[ai],b->dw[bi]);
+    std::swap(a->gs[ai],b->gs[bi]);std::swap(a->ds[ai],b->ds[bi]);
+    std::swap(a->gcor[ai],b->gcor[bi]);std::swap(a->dcor[ai],b->dcor[bi]);
+    std::swap(a->gate_owner[ai],b->gate_owner[bi]);std::swap(a->down_owner[ai],b->down_owner[bi]);
+    return RK_NPU_OK;
 }
