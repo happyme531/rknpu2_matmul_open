@@ -143,7 +143,8 @@ uint64_t rk_npu_moe_w8_workspace_device_bytes(const rk_npu_moe_w8_workspace* wor
 
 /* IDs/coefficients are row-major [rows,top_k]. IDs are in [0,routed_experts),
  * coefficients are finite and nonnegative; duplicates are allowed and summed
- * in slot order. The optional shared expert is appended with coefficient 1.
+ * in slot order. Zero coefficients omit the routed assignment before gathering
+ * or building GEMMs. The optional shared expert is appended with coefficient 1.
  * No implicit top-k normalization. Output is compact FP32 [rows,hidden].
  *
  * Quantized input: compact INT8 [rows,hidden], one positive finite FP32 scale

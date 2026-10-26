@@ -589,7 +589,9 @@ struct Workspace {
         t.input_us=us(at);at=Clock::now();
         for(auto& g:groups)g.clear();
         for(int r=0;r<rows;++r) {
-            for(int slot=0;slot<top;++slot)groups[ids[r*top+slot]].push_back({r,slot});
+            // A zero coefficient omits the route before gathering or building GEMMs.
+            for(int slot=0;slot<top;++slot)if(route_weights[r*top+slot]!=0)
+                groups[ids[r*top+slot]].push_back({r,slot});
             if(config.weights.shared_expert)groups[R].push_back({r,top});
         }
         jobs.clear();ordered.clear();const int tile=w4?64:(native?84:128);
@@ -750,6 +752,7 @@ struct Workspace {
 #if defined(__aarch64__)
                 auto sum=vdupq_n_f32(0);
                 for(int slot=0;slot<slots;++slot) {
+                    if(slot<top && route_weights[token*top+slot]==0)continue;
                     const auto& r=output_rows[size_t(token)*slots+slot];
                     auto value=vmulq_f32(vmulq_n_f32(vcvtq_f32_s32(integer4(r.data,r.rows,r.row,n,r.correction)),r.scale),vld1q_f32(r.scales+n));
                     sum=vfmaq_n_f32(sum,value,slot<top?route_weights[token*top+slot]:1.f);
@@ -759,6 +762,7 @@ struct Workspace {
                 for(int lane=0;lane<4;++lane) {
                     float sum=0;
                     for(int slot=0;slot<slots;++slot) {
+                        if(slot<top && route_weights[token*top+slot]==0)continue;
                         const auto& r=output_rows[size_t(token)*slots+slot];
                         const float value=(float(integer_at(r.data,r.rows,r.row,n+lane,r.correction))*r.scale)*r.scales[n+lane];
                         sum+=value*(slot<top?route_weights[token*top+slot]:1.f);
