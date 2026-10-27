@@ -414,5 +414,6 @@ add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
   test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c test_mm_tune test_mm_gelu
   test_w4a4_linear_header_c test_moe_w8_header_c test_moe_cpu test_mm test_mm_header_c test_mm_tf32
-  test_attention_f16 test_attention_f16_header_c test_mla_f16 test_mla_f16_header_c
+  test_attention_f16 test_attention_f16_causal test_attention_f16_pipeline
+  test_attention_f16_header_c test_mla_f16 test_mla_f16_header_c
   test_gdn test_gdn_static test_gdn_header_c)
