@@ -210,6 +210,14 @@ partition. Multiple used N partitions retain multiple copies. No duplicate
 raw matrix is retained. Changing N partitions can change actual BPW, and the
 existing shape-only memory query/autotuner still describes raw weights.
 
+`rk_npu_f32i8f32_weights_compressed_layout_generation(weights)` returns a
+thread-safe generation for successful compressed-layout creation. It starts at
+1 for the full-N seed, increments only on an actual new layout, and stays
+unchanged on cache hits. Retiring an unused seed does not decrement it; rebuilding
+that partition increments it again. Raw weights and NULL return 0. Callers can
+use generation changes to reclaim freed preparation scratch without treating
+every new M as a layout change.
+
 See correctness, timing, quality and startup costs (historical note: `dcomp_cpp_library_2026-09-13.md`).
 Tests: `test_dcomp_codec` (host or board), `test_compress` (RK3588).
 

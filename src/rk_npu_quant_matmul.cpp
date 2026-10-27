@@ -2017,6 +2017,10 @@ extern "C" rk_npu_f32i8f32_weights* rk_npu_f32i8f32_weights_create_compress(
     const int8_t* B, const float* scale) {
     return create_scaled_compress<rk_npu_f32i8f32_weights>(domain, config, B, scale);
 }
+extern "C" uint64_t rk_npu_f32i8f32_weights_compressed_layout_generation(
+    const rk_npu_f32i8f32_weights* weights) {
+    return weights ? weights->impl.compressed_layout_generation() : 0;
+}
 extern "C" rk_npu_f32i8f32_weights* rk_npu_f32i8f32_weights_create_from_f32_compress(
     rk_npu_iommu_domain* domain, const rk_npu_matmul_weight_config* config,
     const float* B, float target_bpw) {

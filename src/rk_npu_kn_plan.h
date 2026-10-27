@@ -5,6 +5,7 @@
 #include "rk_npu_matmul.h"
 #include "rk_npu_i8_dpu_chain.h"
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 #include <map>
@@ -156,6 +157,9 @@ public:
     int prepare_compress(rk_npu_iommu_domain* domain, const I8KnWeightConfig& config,
                          const int8_t* B_rowmajor);
     bool compressed() const { return compressed_; }
+    uint64_t compressed_layout_generation() const {
+        return compressed_layout_generation_.load(std::memory_order_acquire);
+    }
     int run_compressed(int wave, int n_tile, rk_npu_matmul_i8_plan* plan,
                         uint32_t timeout_ms) const;
     uint64_t stored_bytes() const;
@@ -181,6 +185,7 @@ private:
     bool compressed_ = false;
     mutable std::mutex compressed_mutex_;
     mutable std::map<int, std::shared_ptr<CompressedLayout>> compressed_layouts_;
+    mutable std::atomic<uint64_t> compressed_layout_generation_{0};
     rk_npu_ctx* ctx_ = nullptr;
     rk_npu_iommu_domain* domain_ = nullptr;
     I8KnWeightConfig config_{};

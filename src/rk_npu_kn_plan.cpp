@@ -697,6 +697,7 @@ int I8KnWeights::prepare(rk_npu_iommu_domain* domain,
 int I8KnWeights::release() {
     if (!ctx_) return RK_NPU_OK;
     compressed_layouts_.clear();
+    compressed_layout_generation_.store(0, std::memory_order_relaxed);
     compressed_ = false;
     const int rc = arena_.release(ctx_);
     waves_.clear();
@@ -833,8 +834,10 @@ int I8KnWeights::prepare_compress(rk_npu_iommu_domain* domain,
     std::shared_ptr<CompressedLayout> layout;
     const int nt = align_up(config.N, 32);
     int rc = build_compressed_layout(nt, B, nullptr, layout);
-    if (rc == RK_NPU_OK) compressed_layouts_.emplace(nt, std::move(layout));
-    else release();
+    if (rc == RK_NPU_OK) {
+        compressed_layouts_.emplace(nt, std::move(layout));
+        compressed_layout_generation_.store(1, std::memory_order_release);
+    } else release();
     return rc;
 }
 
@@ -857,6 +860,7 @@ int I8KnWeights::run_compressed(int wi, int nt, rk_npu_matmul_i8_plan* plan,
             if (rc == RK_NPU_OK) rc = end_rc;
             if (rc != RK_NPU_OK) return rc;
             compressed_layouts_.emplace(nt, layout);
+            compressed_layout_generation_.fetch_add(1, std::memory_order_release);
             // The creation-time full-N stream is only a seed. Drop unused seeds
             // after first binding, avoiding a permanent second full weight copy.
             for (auto p = compressed_layouts_.begin(); p != compressed_layouts_.end();)

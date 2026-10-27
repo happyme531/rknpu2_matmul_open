@@ -392,6 +392,11 @@ rk_npu_f32i8f32_weights* rk_npu_f32i8f32_weights_create(
 rk_npu_f32i8f32_weights* rk_npu_f32i8f32_weights_create_compress(
     rk_npu_iommu_domain* domain, const rk_npu_matmul_weight_config* config,
     const int8_t* B_rowmajor, const float* w_scale);
+/* Thread-safe generation of successfully created compressed layouts, including
+ * the creation-time seed. Cache hits do not change it; retired layouts do not
+ * decrement it. Raw weights and NULL return zero. */
+uint64_t rk_npu_f32i8f32_weights_compressed_layout_generation(
+    const rk_npu_f32i8f32_weights* weights);
 rk_npu_f32i8f32_weights* rk_npu_f32i8f32_weights_create_from_f32_compress(
     rk_npu_iommu_domain* domain, const rk_npu_matmul_weight_config* config,
     const float* B_rowmajor, float target_bpw);
