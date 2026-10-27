@@ -51,6 +51,9 @@ typedef struct rk_npu_w4a8_tuning_profile rk_npu_w4a8_tuning_profile;
 rk_npu_w4a8_tuning_profile* rk_npu_w4a8_tuning_profile_from_weights(
     const rk_npu_w4a8_weights*);
 void rk_npu_w4a8_tuning_profile_free(rk_npu_w4a8_tuning_profile*);
+/* Captured weight identity, independent of IOMMU domain. No weight rescan.
+ * Returns 0 for NULL. */
+uint64_t rk_npu_w4a8_tuning_profile_fingerprint(const rk_npu_w4a8_tuning_profile*);
 int rk_npu_w4a8_autotune_cache_load_profile_ex(rk_npu_ctx*,
     const rk_npu_w4a8_autotune_config*, const rk_npu_w4a8_tuning_profile*,
     const char* cache_path, rk_npu_w4a8_strategy_ex* fastest,

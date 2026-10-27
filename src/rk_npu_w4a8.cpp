@@ -290,6 +290,9 @@ extern "C" rk_npu_w4a8_tuning_profile* rk_npu_w4a8_tuning_profile_from_weights(
     try { return new rk_npu_w4a8_tuning_profile{w->profile}; } catch(...) { return nullptr; }
 }
 extern "C" void rk_npu_w4a8_tuning_profile_free(rk_npu_w4a8_tuning_profile* p) { delete p; }
+extern "C" uint64_t rk_npu_w4a8_tuning_profile_fingerprint(const rk_npu_w4a8_tuning_profile* p) {
+    return p?p->value.fingerprint:0;
+}
 extern "C" int rk_npu_w4a8_weights_query(const rk_npu_w4a8_weights *w,
                                          rk_npu_w4a8_weight_info *out) {
     if (!w || !out)
