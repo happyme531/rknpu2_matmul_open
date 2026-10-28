@@ -264,7 +264,7 @@ cmake --build build-host --target rknpu2_matmul_open_cpu_tests -j4
 OMP_NUM_THREADS=4 ctest --test-dir build-host --output-on-failure
 ```
 
-This target builds all 18 registered CPU tests and the public C header checks.
+This target builds all registered CPU tests and the public C header checks.
 It does not require an NPU. Use this target on x86: several hardware-only FP16
 programs in the default full build use the AArch64 `__fp16` type.
 NPU tests are explicit executables, not part of CTest; see the

@@ -1,8 +1,12 @@
 #include "rk_npu_moe_w8.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <exception>
+#include <memory>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 static void require(bool ok,const char* msg) {if(!ok)throw std::runtime_error(msg);}
@@ -12,6 +16,129 @@ static float quantize(const std::vector<float>& x,std::vector<int8_t>& q) {
     q.resize(x.size());for(size_t i=0;i<x.size();++i)q[i]=int8_t(std::clamp(std::lrint(x[i]/scale),-127L,127L));
     return scale;
 }
+
+static void check_zero_routes(rk_npu_iommu_domain* domain,
+        const rk_npu_moe_w8_config& config,rk_npu_moe_w8_weights* weights,
+        rk_npu_moe_w8_workspace* work) {
+    const int H=config.weights.hidden,K=config.top_k,E=config.weights.routed_experts;
+    const int rows=5;
+    auto single=config;single.top_k=1;
+    auto* reference=rk_npu_moe_quant_workspace_create(domain,&single);
+    require(reference,"create zero-route reference workspace");
+    std::vector<float> input(rows*H),output(rows*H),expected(rows*H),part(rows*H);
+    std::vector<int32_t> ids(rows*K),one_id(rows);
+    std::vector<float> routes(rows*K),one_weight(rows,1);
+    for(size_t i=0;i<input.size();++i)input[i]=std::sin(float(i%97)*.13f)*.3f;
+    for(int r=0;r<rows;++r)for(int k=0;k<K;++k)ids[r*K+k]=(r+k)%E;
+    // Reuse the same workspace through dense, partial, empty, then dense calls.
+    // This catches stale/null output rows, as well as compute-and-multiply-zero.
+    for(int mode:{0,1,2,0}) {
+        for(int r=0;r<rows;++r)for(int k=0;k<K;++k)
+            routes[r*K+k]=mode==2 || (mode==1 && (r+k)%2) ? 0.f : .25f;
+        rk_npu_moe_w8_timings timing{};
+        require(!rk_npu_moe_w8_run_f32(work,weights,rows,input.data(),ids.data(),routes.data(),output.data(),&timing),"run zero routes");
+        if(mode==2)require(timing.gemm_tasks==0 && timing.gather_tasks==0,"zero routes submitted NPU tasks");
+        std::fill(expected.begin(),expected.end(),0.f);
+        for(int k=0;k<K;++k) {
+            for(int r=0;r<rows;++r)one_id[r]=ids[r*K+k];
+            require(!rk_npu_moe_w8_run_f32(reference,weights,rows,input.data(),one_id.data(),one_weight.data(),part.data(),nullptr),"run independent route");
+            for(int r=0;r<rows;++r)if(routes[r*K+k]!=0)for(int n=0;n<H;++n)
+                expected[r*H+n]=std::fma(part[r*H+n],routes[r*K+k],expected[r*H+n]);
+        }
+        require(output==expected,"zero-route omission changed retained arithmetic");
+        std::printf("Zero-route mode=%d gather=%u gemm=%u passed\n",mode,timing.gather_tasks,timing.gemm_tasks);
+    }
+    rk_npu_moe_w8_workspace_free(reference);
+}
+
+static void check_staged_slots(rk_npu_iommu_domain* domain,
+        const rk_npu_moe_w8_config& config,rk_npu_moe_w8_weights* reference,
+        rk_npu_moe_w8_workspace* reference_work) {
+    using Weights=std::unique_ptr<rk_npu_moe_w8_weights,decltype(&rk_npu_moe_w8_weights_free)>;
+    using Work=std::unique_ptr<rk_npu_moe_w8_workspace,decltype(&rk_npu_moe_w8_workspace_free)>;
+    const int H=config.weights.hidden,E=config.weights.routed_experts,K=config.top_k;
+    const int rows=5;
+    auto one=config;one.top_k=1;
+    Weights hot(rk_npu_moe_quant_slots_create(domain,&one.weights),rk_npu_moe_w8_weights_free);
+    Weights stage(rk_npu_moe_quant_slots_create(domain,&one.weights),rk_npu_moe_w8_weights_free);
+    Work work(rk_npu_moe_quant_workspace_create(domain,&one),rk_npu_moe_w8_workspace_free);
+    require(hot&&stage&&work,"create staging test banks");
+    const size_t bytes=rk_npu_moe_quant_expert_blob_bytes(reference);
+    std::vector<std::vector<uint8_t>> records(E,std::vector<uint8_t>(bytes));
+    for(int e=0;e<E;++e) {
+        require(!rk_npu_moe_quant_export_expert(reference,e,records[e].data(),bytes),"export staging test record");
+        require(!rk_npu_moe_quant_import_expert(hot.get(),e,records[e].data(),bytes),"initialize hot slot");
+    }
+    std::vector<float> input(rows*H),actual(rows*H),expected(rows*H);
+    std::vector<float> routes(rows,1),reference_routes(rows*K,0);
+    std::vector<int32_t> physical(rows),source(rows*K);
+    for(size_t i=0;i<input.size();++i)input[i]=std::sin(float(i%97)*.13f)*.3f;
+    for(int r=0;r<rows;++r){physical[r]=r%E;reference_routes[r*K]=1;}
+    auto run_hot=[&] {
+        require(!rk_npu_moe_w8_run_f32(work.get(),hot.get(),rows,input.data(),
+            physical.data(),routes.data(),actual.data(),nullptr),"run hot slots");
+    };
+    // An odd number of exchanges leaves hot owning the original staging storage.
+    for(int iteration=0;iteration<9;++iteration) {
+        std::exception_ptr error;
+        std::thread importer([&] {
+            try {
+                for(int slot=0;slot<E;++slot) {
+                    rk_npu_moe_import_timings timing{};
+                    const auto& record=records[(iteration+slot)%E];
+                    require(!rk_npu_moe_quant_import_expert_timed(stage.get(),slot,
+                        record.data(),bytes,&timing),"import while hot computes");
+                    require(timing.copy_us>=0 && timing.validate_us>=0 &&
+                        timing.gate_sync_us>=0 && timing.down_sync_us>=0 &&
+                        timing.total_us>=timing.copy_us,"import timing fields");
+                }
+            } catch(...) {error=std::current_exception();}
+        });
+        try {run_hot();} catch(...) {importer.join();throw;}
+        importer.join();
+        if(error)std::rethrow_exception(error);
+        for(int slot=0;slot<E;++slot)
+            require(!rk_npu_moe_quant_swap_slots(hot.get(),slot,stage.get(),slot),"promote imported slot");
+        for(int r=0;r<rows;++r)for(int k=0;k<K;++k)source[r*K+k]=(iteration+r%E)%E;
+        require(!rk_npu_moe_w8_run_f32(reference_work,reference,rows,input.data(),
+            source.data(),reference_routes.data(),expected.data(),nullptr),"run staging reference");
+        run_hot();
+        require(actual==expected,"staged promotion changed expert output");
+    }
+
+    std::atomic<bool> started{false},finished{false};
+    std::exception_ptr error;
+    std::thread importer([&] {
+        started=true;
+        try {
+            for(int i=0;i<2048;++i) {
+                require(rk_npu_moe_quant_expert_blob_bytes(stage.get())==bytes,"stable packed record length");
+                require(!rk_npu_moe_quant_import_expert(stage.get(),1,records[0].data(),bytes),"import beside slot-zero exchange");
+            }
+        } catch(...) {error=std::current_exception();}
+        finished=true;
+    });
+    while(!started)std::this_thread::yield();
+    size_t swaps=0;
+    try {
+        while(!finished) {
+            require(!rk_npu_moe_quant_swap_slots(hot.get(),0,stage.get(),0),"exchange beside another import");
+            ++swaps;
+        }
+    } catch(...) {importer.join();throw;}
+    importer.join();
+    if(error)std::rethrow_exception(error);
+    require(swaps>0,"concurrent slot exchanges exercised");
+    if(swaps%2)require(!rk_npu_moe_quant_swap_slots(hot.get(),0,stage.get(),0),"restore hot slot");
+    std::vector<uint8_t> exported(bytes);
+    require(!rk_npu_moe_quant_export_expert(stage.get(),1,exported.data(),bytes),"export concurrent import");
+    require(exported==records[0],"concurrent import changed packed bytes");
+    stage.reset();
+    run_hot();
+    require(actual==expected,"hot storage did not survive staging-bank destruction");
+    std::printf("Staged slot checks passed: 2048 imports, %zu concurrent exchanges\n",swaps);
+}
+
 int main() try {
     constexpr int H=2048,F=512,E=3,K=2;
     auto* ctx=rk_npu_open(nullptr);require(ctx,"open NPU");
@@ -31,6 +158,7 @@ int main() try {
     auto* weights=rk_npu_moe_quant_weights_create(domain,&cfg.weights,experts.data());
     auto* work=rk_npu_moe_quant_workspace_create(domain,&cfg);
     require(weights&&work,"create quantized FFN");
+    check_zero_routes(domain,cfg,weights,work);
     for(int rows:{1,5,128,1}) {
         std::vector<float> input(rows*H),output(rows*H),routes(rows*K);
         std::vector<int32_t> ids(rows*K);
@@ -96,6 +224,7 @@ int main() try {
         std::printf("W4 slot permutation checks passed\n");
     }
     require(rk_npu_moe_quant_import_expert(slots,0,blob.data(),bytes-1)==RK_NPU_ERR_PARAM,"reject short packed record");
+    check_staged_slots(domain,cfg,weights,work);
     // Existing W4 cache records must remain usable when a resident shared W8
     // expert is attached. Compare imports/permutations with independently
     // packed mixed weights; the shared expert is never a replaceable slot.
@@ -135,13 +264,15 @@ int main() try {
                 // Include duplicate routes and non-unit sums; shared stays coefficient 1.
                 ids[r*K+k]=(r+(r%2?k:0))%E;
                 physical[r*K+k]=(ids[r*K+k]+rotation)%E;
-                routes[r*K+k]=k?.375f:.875f;
+                routes[r*K+k]=(r%3==2 || (r%3==1 && k))?0.f:k?.375f:.875f;
             }
             const int rc=rk_npu_moe_w8_run_f32(mixed_work,mixed,rows,input.data(),ids.data(),routes.data(),expected.data(),nullptr);
             if(rc)std::fprintf(stderr,"mixed resident cores=%d rows=%d rc=%d\n",cores,rows,rc);
             require(!rc,"run independently packed mixed weights");
             require(!rk_npu_moe_w8_run_f32(mixed_work,mixed_slots,rows,input.data(),physical.data(),routes.data(),actual.data(),nullptr),"run mixed slots");
             require(actual==expected,"mixed slot replacement changed routed/shared output");
+            require(std::all_of(actual.begin(),actual.end(),[](float v){return std::isfinite(v);}),"nonfinite mixed zero-route output");
+            if(rows>2)require(std::any_of(actual.begin()+2*H,actual.begin()+3*H,[](float v){return v!=0.f;}),"zero routed weights incorrectly skipped shared expert");
             for(int row:{0,rows/2,rows-1}) {
                 std::vector<float> serial(H);
                 require(!rk_npu_moe_w8_run_f32(mixed_work,mixed,1,input.data()+row*H,ids.data()+row*K,routes.data()+row*K,serial.data(),nullptr),"run mixed single-row control");
