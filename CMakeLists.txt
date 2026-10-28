@@ -291,6 +291,8 @@ if(BUILD_TESTING)
 endif()
 add_executable(test_moe_quant tests/test_moe_quant.cpp)
 target_link_libraries(test_moe_quant PRIVATE rk_npu_matmul_static)
+target_link_options(test_moe_quant PRIVATE
+  -Wl,--wrap=rk_npu_mem_alloc -Wl,--wrap=rk_npu_mem_free -Wl,--wrap=rk_npu_mem_sync)
 add_library(test_moe_w8_header_c OBJECT tests/test_moe_w8_header.c)
 target_include_directories(test_moe_w8_header_c PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

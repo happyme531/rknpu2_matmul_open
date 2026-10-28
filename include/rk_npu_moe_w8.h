@@ -137,7 +137,9 @@ int rk_npu_moe_quant_import_expert_timed(rk_npu_moe_w8_weights* weights,
 int rk_npu_moe_quant_swap_slots(rk_npu_moe_w8_weights* first, int first_slot,
     rk_npu_moe_w8_weights* second, int second_slot);
 
-/* Counts requested device payload bytes (no page rounding or CPU containers). */
+/* Counts requested device payload bytes (no page rounding or CPU containers).
+ * Weights count each retained allocation once, including an allocation shared
+ * with another bank after slot exchange. */
 uint64_t rk_npu_moe_w8_weights_device_bytes(const rk_npu_moe_w8_weights* weights);
 uint64_t rk_npu_moe_w8_workspace_device_bytes(const rk_npu_moe_w8_workspace* workspace);
 

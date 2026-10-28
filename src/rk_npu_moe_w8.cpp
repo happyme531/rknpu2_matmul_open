@@ -383,7 +383,6 @@ struct Weights {
     Device device;
     rk_npu_moe_w8_weight_config config;
     Buffer gate,down,coeff;
-    std::vector<std::shared_ptr<Buffer>> gate_banks,down_banks;
     std::vector<std::shared_ptr<Buffer>> gate_owner,down_owner;
     std::vector<rk_npu_mem> gw,dw;
     std::vector<std::vector<float>> gs,ds;
@@ -395,6 +394,7 @@ struct Weights {
             const rk_npu_moe_w8_expert* experts,Mode recipe=Mode::W8,
             const rk_npu_moe_w8_expert* shared=nullptr):device(domain),config(c),mode(recipe) {
         const int H=c.hidden,N=c.intermediate,count=c.routed_experts+c.shared_expert;
+        std::vector<std::shared_ptr<Buffer>> gate_banks,down_banks;
         const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,c);
         const int gate_k_tile=gate_tile(mode,H);
         const int w4_count=w4?c.routed_experts+(mode==Mode::W4?c.shared_expert:0):0;
@@ -484,8 +484,9 @@ struct Weights {
     }
     uint64_t bytes() const {
         uint64_t sum=gate.mem.size+down.mem.size+coeff.mem.size;
-        for(const auto& b:gate_banks)sum+=b->mem.size;
-        for(const auto& b:down_banks)sum+=b->mem.size;
+        for(const auto* owners:{&gate_owner,&down_owner})
+            for(auto it=owners->begin();it!=owners->end();++it)
+                if(*it && std::find(owners->begin(),it,*it)==it)sum+=(*it)->mem.size;
         return sum;
     }
 };
@@ -599,6 +600,13 @@ struct Workspace {
             Job j{};j.expert=e;j.rows=int(std::min<size_t>(tile,groups[e].size()-first));j.offset=int(ordered.size());
             ordered.insert(ordered.end(),groups[e].begin()+first,groups[e].begin()+first+j.rows);jobs.push_back(j);
         }
+        const size_t assignments=ordered.size();
+        if(!assignments) {
+            t.schedule_us=us(at);at=Clock::now();
+            std::fill_n(output,size_t(rows)*H,0.f);
+            t.combine_us=us(at);t.total_us=us(begin);
+            return;
+        }
         std::stable_sort(jobs.begin(),jobs.end(),[](const Job& a,const Job& b){return a.rows>b.rows;});
         std::array<size_t,3> cost{};
         for(auto& j:jobs) {
@@ -704,12 +712,12 @@ struct Workspace {
         if(npu) {
             lut_cmd.run(device,cores,config.timeout_ms);t.lut_load_us=us(at);at=Clock::now();
             middle_cmd.run(device,cores,config.timeout_ms);t.middle_npu_us=us(at);at=Clock::now();
-            middle_gate.sync(size_t(rows)*slots*N*4,RK_NPU_SYNC_FROM_DEVICE);middle_up.sync(size_t(rows)*slots*N*4,RK_NPU_SYNC_FROM_DEVICE);
+            middle_gate.sync(assignments*N*4,RK_NPU_SYNC_FROM_DEVICE);middle_up.sync(assignments*N*4,RK_NPU_SYNC_FROM_DEVICE);
         } else if(w4)for(int wave=0;wave<gate_waves;++wave) {
-            auto active=gate_c.view(size_t(wave)*gate_wave_stride,size_t(rows)*slots*2*N*4);
+            auto active=gate_c.view(size_t(wave)*gate_wave_stride,assignments*2*N*4);
             check(rk_npu_mem_sync(device.ctx,&active,RK_NPU_SYNC_FROM_DEVICE));
         }
-        else gate_c.sync(size_t(rows)*slots*2*N*4,RK_NPU_SYNC_FROM_DEVICE);
+        else gate_c.sync(assignments*2*N*4,RK_NPU_SYNC_FROM_DEVICE);
         t.sync_us+=us(at);at=Clock::now();
         workers(threads,[&](int worker){
             alignas(64) float hidden[512];alignas(64) int8_t hidden_q[512];
@@ -740,10 +748,10 @@ struct Workspace {
                 }
             }
         });
-        t.middle_cpu_us=us(at);at=Clock::now();down_a.sync(size_t(rows)*slots*N,RK_NPU_SYNC_TO_DEVICE);
+        t.middle_cpu_us=us(at);at=Clock::now();down_a.sync(assignments*N,RK_NPU_SYNC_TO_DEVICE);
         t.sync_us+=us(at);at=Clock::now();if(has_w8 && !mixed_chain)t.gemm_tasks+=uint32_t(down_cmd.run(device,cores,config.timeout_ms));
         if(w4)t.gemm_tasks+=uint32_t(down4_cmd.run(device,cores,config.timeout_ms));
-        t.down_us=us(at);at=Clock::now();down_c.sync(size_t(rows)*slots*H*4,RK_NPU_SYNC_FROM_DEVICE);
+        t.down_us=us(at);at=Clock::now();down_c.sync(assignments*H*4,RK_NPU_SYNC_FROM_DEVICE);
         t.sync_us+=us(at);at=Clock::now();
         workers(threads,[&](int worker){
             const int first=rows*worker/threads,last=rows*(worker+1)/threads;

@@ -9,6 +9,26 @@
 #include <thread>
 #include <vector>
 
+static std::atomic<uint64_t> live_device_bytes{0},sync_calls{0},sync_bytes{0};
+extern "C" int __real_rk_npu_mem_alloc(rk_npu_iommu_domain*,uint64_t,uint32_t,rk_npu_mem*);
+extern "C" int __real_rk_npu_mem_free(rk_npu_ctx*,rk_npu_mem*);
+extern "C" int __real_rk_npu_mem_sync(rk_npu_ctx*,const rk_npu_mem*,rk_npu_sync_dir);
+extern "C" int __wrap_rk_npu_mem_alloc(rk_npu_iommu_domain* domain,uint64_t size,uint32_t flags,rk_npu_mem* out) {
+    const int rc=__real_rk_npu_mem_alloc(domain,size,flags,out);
+    if(!rc)live_device_bytes+=out->size;
+    return rc;
+}
+extern "C" int __wrap_rk_npu_mem_free(rk_npu_ctx* ctx,rk_npu_mem* mem) {
+    const uint64_t size=mem->size;
+    const int rc=__real_rk_npu_mem_free(ctx,mem);
+    if(!rc)live_device_bytes-=size;
+    return rc;
+}
+extern "C" int __wrap_rk_npu_mem_sync(rk_npu_ctx* ctx,const rk_npu_mem* mem,rk_npu_sync_dir dir) {
+    ++sync_calls;sync_bytes+=mem->size;
+    return __real_rk_npu_mem_sync(ctx,mem,dir);
+}
+
 static void require(bool ok,const char* msg) {if(!ok)throw std::runtime_error(msg);}
 static float quantize(const std::vector<float>& x,std::vector<int8_t>& q) {
     float max=0;for(float v:x)max=std::max(max,std::abs(v));
@@ -32,12 +52,20 @@ static void check_zero_routes(rk_npu_iommu_domain* domain,
     for(int r=0;r<rows;++r)for(int k=0;k<K;++k)ids[r*K+k]=(r+k)%E;
     // Reuse the same workspace through dense, partial, empty, then dense calls.
     // This catches stale/null output rows, as well as compute-and-multiply-zero.
+    uint64_t dense_sync_bytes=0;
     for(int mode:{0,1,2,0}) {
         for(int r=0;r<rows;++r)for(int k=0;k<K;++k)
             routes[r*K+k]=mode==2 || (mode==1 && (r+k)%2) ? 0.f : .25f;
         rk_npu_moe_w8_timings timing{};
+        const uint64_t calls_before=sync_calls,bytes_before=sync_bytes;
         require(!rk_npu_moe_w8_run_f32(work,weights,rows,input.data(),ids.data(),routes.data(),output.data(),&timing),"run zero routes");
-        if(mode==2)require(timing.gemm_tasks==0 && timing.gather_tasks==0,"zero routes submitted NPU tasks");
+        const uint64_t synced=sync_bytes-bytes_before;
+        if(mode==0)dense_sync_bytes=synced;
+        if(mode==1)require(synced<dense_sync_bytes,"partial routes synced inactive assignments");
+        if(mode==2) {
+            require(timing.gemm_tasks==0 && timing.gather_tasks==0,"zero routes submitted NPU tasks");
+            require(sync_calls==calls_before && timing.sync_us==0,"zero routes synced device buffers");
+        }
         std::fill(expected.begin(),expected.end(),0.f);
         for(int k=0;k<K;++k) {
             for(int r=0;r<rows;++r)one_id[r]=ids[r*K+k];
@@ -46,7 +74,8 @@ static void check_zero_routes(rk_npu_iommu_domain* domain,
                 expected[r*H+n]=std::fma(part[r*H+n],routes[r*K+k],expected[r*H+n]);
         }
         require(output==expected,"zero-route omission changed retained arithmetic");
-        std::printf("Zero-route mode=%d gather=%u gemm=%u passed\n",mode,timing.gather_tasks,timing.gemm_tasks);
+        std::printf("Zero-route mode=%d gather=%u gemm=%u sync_bytes=%llu passed\n",mode,timing.gather_tasks,timing.gemm_tasks,
+            static_cast<unsigned long long>(synced));
     }
     rk_npu_moe_w8_workspace_free(reference);
 }
@@ -63,6 +92,8 @@ static void check_staged_slots(rk_npu_iommu_domain* domain,
     Weights stage(rk_npu_moe_quant_slots_create(domain,&one.weights),rk_npu_moe_w8_weights_free);
     Work work(rk_npu_moe_quant_workspace_create(domain,&one),rk_npu_moe_w8_workspace_free);
     require(hot&&stage&&work,"create staging test banks");
+    const uint64_t bank_bytes=rk_npu_moe_w8_weights_device_bytes(hot.get());
+    require(bank_bytes && rk_npu_moe_w8_weights_device_bytes(stage.get())==bank_bytes,"initial bank accounting");
     const size_t bytes=rk_npu_moe_quant_expert_blob_bytes(reference);
     std::vector<std::vector<uint8_t>> records(E,std::vector<uint8_t>(bytes));
     for(int e=0;e<E;++e) {
@@ -97,8 +128,13 @@ static void check_staged_slots(rk_npu_iommu_domain* domain,
         try {run_hot();} catch(...) {importer.join();throw;}
         importer.join();
         if(error)std::rethrow_exception(error);
-        for(int slot=0;slot<E;++slot)
+        for(int slot=0;slot<E;++slot) {
             require(!rk_npu_moe_quant_swap_slots(hot.get(),slot,stage.get(),slot),"promote imported slot");
+            // These small banks each fit in one gate/down allocation pair.
+            const uint64_t retained=bank_bytes*(slot+1<E?2:1);
+            require(rk_npu_moe_w8_weights_device_bytes(hot.get())==retained,"hot retained allocation accounting");
+            require(rk_npu_moe_w8_weights_device_bytes(stage.get())==retained,"staging retained allocation accounting");
+        }
         for(int r=0;r<rows;++r)for(int k=0;k<K;++k)source[r*K+k]=(iteration+r%E)%E;
         require(!rk_npu_moe_w8_run_f32(reference_work,reference,rows,input.data(),
             source.data(),reference_routes.data(),expected.data(),nullptr),"run staging reference");
@@ -133,7 +169,10 @@ static void check_staged_slots(rk_npu_iommu_domain* domain,
     std::vector<uint8_t> exported(bytes);
     require(!rk_npu_moe_quant_export_expert(stage.get(),1,exported.data(),bytes),"export concurrent import");
     require(exported==records[0],"concurrent import changed packed bytes");
+    const uint64_t before_free=live_device_bytes;
     stage.reset();
+    require(live_device_bytes==before_free-bank_bytes,"unused bank allocations were retained");
+    require(rk_npu_moe_w8_weights_device_bytes(hot.get())==bank_bytes,"surviving bank accounting");
     run_hot();
     require(actual==expected,"hot storage did not survive staging-bank destruction");
     std::printf("Staged slot checks passed: 2048 imports, %zu concurrent exchanges\n",swaps);

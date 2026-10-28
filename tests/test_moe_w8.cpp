@@ -134,6 +134,13 @@ int main(int argc,char** argv) try {
         check(rk_npu_moe_w8_run_quantized(ws,one,rows,x.data(),scales.data(),ids.data(),routes.data(),out.data(),nullptr));
         auto reference=oracle(rows,H,N,1,0,{a[0]},x,scales,ids,routes);
         require(relative(out,reference)<(npu?.02:1e-6),"single expert oracle");
+        std::fill(routes.begin(),routes.end(),0.f);
+        rk_npu_moe_w8_timings timing{};
+        check(rk_npu_moe_w8_run_quantized(ws,one,rows,x.data(),scales.data(),ids.data(),routes.data(),out.data(),&timing));
+        require(std::all_of(out.begin(),out.end(),[](float v){return v==0.f;}),"empty routes must clear previous output");
+        require(!timing.gemm_tasks && !timing.gather_tasks && !timing.middle_tasks && timing.sync_us==0,"empty routes did device work");
+        scales[0]=0;
+        require(rk_npu_moe_w8_run_quantized(ws,one,rows,x.data(),scales.data(),ids.data(),routes.data(),out.data(),nullptr)==RK_NPU_ERR_PARAM,"empty routes must validate input scales");
     }
     rk_npu_moe_w8_weights_free(foreign);rk_npu_iommu_domain_free(other_domain);
     rk_npu_moe_w8_workspace_free(ws);rk_npu_moe_w8_weights_free(one);
