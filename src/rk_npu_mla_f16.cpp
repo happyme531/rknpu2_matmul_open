@@ -298,6 +298,9 @@ int rk_npu_mla_f16_cache_get_info(rk_npu_mla_f16_cache* c,rk_npu_mla_f16_cache_i
 int rk_npu_mla_f16_cache_reserve(rk_npu_ctx* ctx,rk_npu_mla_f16_cache* c,int capacity){
     if(!c)return RK_NPU_ERR_PARAM;return api([&]{context(ctx,c->native.lease.domain);Lock l(c->busy);c->native.reserve(capacity);});
 }
+int rk_npu_mla_f16_cache_truncate(rk_npu_mla_f16_cache* c,int length){
+    if(!c)return RK_NPU_ERR_PARAM;return api([&]{Lock l(c->busy);c->native.truncate(length);});
+}
 int rk_npu_mla_f16_cache_load(rk_npu_ctx* ctx,rk_npu_mla_f16_cache* c,const uint16_t* latent,const uint16_t* rope,int count){
     if(!c)return RK_NPU_ERR_PARAM;return api([&]{context(ctx,c->native.lease.domain);Lock l(c->busy);c->load(latent,rope,count);});
 }
