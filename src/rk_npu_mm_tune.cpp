@@ -20,6 +20,7 @@
 #include <omp.h>
 #include <ostream>
 #include <pthread.h>
+#include <unistd.h>
 #include <vector>
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -38,6 +39,47 @@ int environment_k_mode() {
     return -1;
 }
 using Clock = std::chrono::steady_clock;
+class SearchProgress {
+    const rk_npu_mm_autotune_config& config;
+    const bool terminal;
+    const Clock::time_point started = Clock::now();
+    Clock::time_point phase_started{}, last{};
+    const char* phase = "search";
+    size_t done = 0, total = 0;
+    bool line_open = false;
+
+    void render(bool force = false) {
+        const auto now = Clock::now();
+        const double interval = terminal ? 0.25 : 5.0;
+        if (!force && done != 3 && done != total &&
+            std::chrono::duration<double>(now - last).count() < interval) return;
+        const double seconds = std::chrono::duration<double>(now - started).count();
+        const double phase_seconds = std::chrono::duration<double>(now - phase_started).count();
+        char eta[32] = "--";
+        if (done == total) std::snprintf(eta, sizeof(eta), "0.0s");
+        else if (done >= 3)
+            std::snprintf(eta, sizeof(eta), "%.1fs", phase_seconds * double(total - done) / double(done));
+        const int fill = total ? int(done * 20 / total) : 0;
+        const bool newline = !terminal || done == total;
+        std::fprintf(stderr, "%sMM %s M=%d K=%d N=%d %s [%.*s%.*s] %zu/%zu (%zu%%) elapsed=%.1fs ETA=%s%s",
+            terminal ? "\r" : "", config.dtype == RK_NPU_MM_F16 ? "F16" : "BF16",
+            config.M, config.K, config.N, phase, fill, "####################", 20 - fill, "....................",
+            done, total, total ? done * 100 / total : 0, seconds, eta, newline ? "\n" : "");
+        std::fflush(stderr);
+        last = now;
+        line_open = !newline;
+    }
+public:
+    explicit SearchProgress(const rk_npu_mm_autotune_config& c)
+        : config(c), terminal(::isatty(STDERR_FILENO) && c.verbose == 0) {}
+    ~SearchProgress() { if (line_open) std::fputc('\n', stderr); }
+    void begin(const char* name, size_t count) {
+        phase = name; total = count; done = 0;
+        phase_started = Clock::now();
+        render(true);
+    }
+    void advance() { ++done; render(); }
+};
 using Plan = std::unique_ptr<rk_npu_mm_plan, decltype(&rk_npu_mm_plan_free)>;
 using Work = std::unique_ptr<rk_npu_mm_workspace, decltype(&rk_npu_mm_workspace_free)>;
 using Weight = std::unique_ptr<rk_npu_mm_packed_b, decltype(&rk_npu_mm_packed_b_free)>;
@@ -515,6 +557,8 @@ static int autotune_impl(rk_npu_iommu_domain* domain,
         std::map<std::pair<int,int>,SharedWeight> common_weights;
         auto search = candidates(c);
         const size_t layout_count = search.size();
+        SearchProgress progress(c);
+        progress.begin(c.dtype == RK_NPU_MM_F16 ? "coarse" : "search", layout_count);
         std::vector<rk_npu_mm_strategy> per_layout;
         for (size_t candidate = 0; candidate < search.size() || (candidate == layout_count && c.dtype == RK_NPU_MM_F16); ++candidate) {
             if (candidate == layout_count && c.dtype == RK_NPU_MM_F16) {
@@ -532,6 +576,7 @@ static int autotune_impl(rk_npu_iommu_domain* domain,
                         }
                     }
                 }
+                progress.begin("refine", search.size() - layout_count);
             }
             if (candidate >= search.size()) break;
             auto s = search[candidate];
@@ -591,6 +636,7 @@ static int autotune_impl(rk_npu_iommu_domain* domain,
             if (!valid) {
                 if (c.verbose) std::fprintf(stderr, "MM rejected tile=%d Ntile=%d A=%d C=%d split=%d max_abs=%.6g\n",
                     s.m_tile, s.options.n_tile, int(s.options.a_layout), int(s.options.c_layout), s.options.split_k, max_error);
+                progress.advance();
                 continue;
             }
             s.total_us = score.total_us; s.robust_us = score.robust_us;
@@ -606,10 +652,11 @@ static int autotune_impl(rk_npu_iommu_domain* domain,
                 if (it == per_layout.end()) per_layout.push_back(s);
                 else if (s.total_us < it->total_us) *it = s;
             }
-            if (!final) continue;
+            if (!final) { progress.advance(); continue; }
             if (!found || s.total_us < best.total_us) best = s;
             if (!found || s.robust_us < robust.robust_us) robust = s;
             found = true;
+            progress.advance();
         }
         if (!found) return RK_NPU_ERR_PARAM;
         if (fastest) *fastest = best;

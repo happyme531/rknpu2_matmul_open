@@ -24,7 +24,8 @@ typedef struct rk_npu_mm_autotune_config {
     int allow_k_tiling; /* 0: full K; 1: FP16 partials + NPU FP16 Add tree.
                           Init reads RK_NPU_MM_K_TILING (off/0 or fp16/on/1),
                           enabled by default. Ignored for BF16. */
-    int verbose; /* 1: candidates and scores; 2: repeat samples as well */
+    int verbose; /* Progress/phase ETA on stderr; 1 adds candidates/scores,
+                    2 adds repeat samples. Cache hits do not print progress. */
 } rk_npu_mm_autotune_config;
 
 typedef struct rk_npu_mm_strategy {
