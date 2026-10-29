@@ -202,6 +202,16 @@ add_executable(test_batch_f16 tests/test_batch_f16.cpp)
 target_link_libraries(test_batch_f16 PRIVATE rk_npu_matmul)
 
 add_executable(test_attention_f16 tests/test_attention_f16.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(test_attention_command_memory tests/test_attention_command_memory.cpp)
+  target_link_libraries(test_attention_command_memory PRIVATE rk_npu_matmul_static)
+  target_link_options(test_attention_command_memory PRIVATE
+    -Wl,--wrap=rk_npu_mem_alloc -Wl,--wrap=rk_npu_mem_free
+    -Wl,--wrap=rk_npu_mem_sync -Wl,--wrap=ioctl)
+  if(BUILD_TESTING)
+    add_test(NAME attention_command_memory_cpu COMMAND test_attention_command_memory)
+  endif()
+endif()
 add_executable(test_gdn tests/test_gdn.cpp)
 target_link_libraries(test_gdn PRIVATE rk_npu_matmul)
 target_compile_options(test_gdn PRIVATE -ffp-contract=off)
@@ -417,3 +427,7 @@ add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
   test_attention_f16 test_attention_f16_causal test_attention_f16_pipeline
   test_attention_f16_header_c test_mla_f16 test_mla_f16_header_c
   test_gdn test_gdn_static test_gdn_header_c)
+
+if(TARGET test_attention_command_memory)
+  add_dependencies(rknpu2_matmul_open_cpu_tests test_attention_command_memory)
+endif()
