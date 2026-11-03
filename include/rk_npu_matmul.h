@@ -1,7 +1,7 @@
 /*
  * rk_npu_matmul - int8 x int8 matmul on the RK3588 NPU
  * ====================================================
- * Direct register programming through the rknpu DRM driver (/dev/dri/cardN).
+ * Direct register programming through the rknpu DRM driver (/dev/dri/renderDN).
  * No librknnrt.so, no RKNN runtime, no compiler.
  *
  * This header temporarily preserves the distinct-weight BMM API.  New

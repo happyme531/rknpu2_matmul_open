@@ -5,12 +5,14 @@
 #include "rk_npu_internal.h"
 
 #include <fcntl.h>
+#include <glob.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <cerrno>
 #include <new>
 
 namespace {
@@ -21,6 +23,53 @@ uint64_t ctx_id(const rk_npu_ctx* ctx) {
 
 bool same_ctx(const rk_npu_ctx* ctx, const rk_npu_mem* mem) {
     return ctx && mem && (mem->ctx_id == 0 || mem->ctx_id == ctx_id(ctx));
+}
+
+/* DRM_IOCTL_VERSION uses native pointer/size_t alignment, unlike the packed
+ * RKNPU ioctl structures in rk_npu_internal.h. */
+struct DrmVersion {
+    int major, minor, patchlevel;
+    size_t name_len;
+    char* name;
+    size_t date_len;
+    char* date;
+    size_t desc_len;
+    char* desc;
+};
+
+rk_npu_ctx* open_rknpu_device(const char* dev) {
+    const int fd = ::open(dev, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+    const auto fail = [fd](int error) -> rk_npu_ctx* {
+        ::close(fd);
+        errno = error;
+        return nullptr;
+    };
+
+    char name[16]{};
+    DrmVersion version{};
+    version.name_len = sizeof(name);
+    version.name = name;
+    if (::ioctl(fd, rk_iowr<DrmVersion>(0x00), &version) < 0)
+        return fail(errno);
+    if (version.name_len != 5 || std::memcmp(name, "rknpu", 5) != 0)
+        return fail(ENODEV);
+
+    rknpu_action action{};
+    action.flags = RKNPU_GET_DRV_VERSION;
+    if (::ioctl(fd, IOCTL_ACTION, &action) < 0) return fail(errno);
+    const uint32_t driver_version = action.value;
+    action = {};
+    action.flags = RKNPU_GET_IOMMU_EN;
+    if (::ioctl(fd, IOCTL_ACTION, &action) < 0) return fail(errno);
+
+    rk_npu_ctx* ctx = (rk_npu_ctx*)std::calloc(1, sizeof(rk_npu_ctx));
+    if (!ctx) return fail(ENOMEM);
+    ctx->fd = fd;
+    ctx->id = ctx_id(ctx);
+    ctx->driver_version = driver_version;
+    ctx->iommu_enabled = action.value != 0;
+    return ctx;
 }
 
 int map_mem(rk_npu_ctx* ctx, rk_npu_mem* out) {
@@ -47,21 +96,24 @@ void close_gem_handle(int fd, uint32_t handle) {
 /* ------------------------------------------------------------ device ---- */
 
 extern "C" rk_npu_ctx* rk_npu_open(const char* dev) {
-    if (!dev) dev = "/dev/dri/card1";
-    int fd = ::open(dev, O_RDWR);
-    if (fd < 0) return nullptr;
-    rk_npu_ctx* ctx = (rk_npu_ctx*)std::calloc(1, sizeof(rk_npu_ctx));
-    if (!ctx) { ::close(fd); return nullptr; }
-    ctx->fd = fd;
-    ctx->id = ctx_id(ctx);
-    rknpu_action action{};
-    action.flags = RKNPU_GET_DRV_VERSION;
-    if (::ioctl(fd, IOCTL_ACTION, &action) == 0)
-        ctx->driver_version = action.value;
-    action = {};
-    action.flags = RKNPU_GET_IOMMU_EN;
-    if (::ioctl(fd, IOCTL_ACTION, &action) == 0)
-        ctx->iommu_enabled = action.value != 0;
+    if (dev) return open_rknpu_device(dev);
+
+    glob_t nodes{};
+    const int rc = ::glob("/dev/dri/renderD*", 0, nullptr, &nodes);
+    if (rc != 0) {
+        ::globfree(&nodes);
+        errno = rc == GLOB_NOSPACE ? ENOMEM : ENODEV;
+        return nullptr;
+    }
+    int error = ENODEV;
+    rk_npu_ctx* ctx = nullptr;
+    for (size_t i = 0; i < nodes.gl_pathc; ++i) {
+        ctx = open_rknpu_device(nodes.gl_pathv[i]);
+        if (ctx) break;
+        if (errno != ENODEV) error = errno;
+    }
+    ::globfree(&nodes);
+    if (!ctx) errno = error;
     return ctx;
 }
 

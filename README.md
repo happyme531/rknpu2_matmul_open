@@ -195,8 +195,11 @@ suffix. Active length and allocated capacity are available through the cache que
 
 Requirements: Linux with a compatible Rockchip `rknpu` DRM driver, CMake 3.16+,
 a C compiler, a C++17 compiler, and OpenMP. NPU execution requires access to
-the NPU DRM device (the API defaults to `/dev/dri/card1`; device numbering can
-vary). Nonzero IOMMU domains require IOMMU support and driver version 0.9.8+.
+the NPU DRM device. `rk_npu_open(NULL)` discovers a render node by its `rknpu`
+DRM driver name, without relying on a fixed device number. Pass a path to select
+a particular node; RKNPU primary/card nodes are also accepted explicitly. Open
+fails if device identity or driver version/IOMMU queries fail, with the reason
+in `errno`. Nonzero IOMMU domains require IOMMU support and driver version 0.9.8+.
 
 Run these commands from the library root. In the parent research workspace
 this directory remains `rk_npu_matmul/`; a standalone GitHub checkout may be

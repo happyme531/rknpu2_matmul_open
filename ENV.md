@@ -1,6 +1,6 @@
 # rk_npu_matmul 环境变量
 
-库在 `src/` 里用 `std::getenv` 读取的变量都列在这里。扫描范围是 `rk_npu_matmul/src`、公开头文件和对应测试。设备节点不是环境变量：`rk_npu_open(NULL)` 打开 `/dev/dri/card1`，其它节点把路径传给 `rk_npu_open`。
+库在 `src/` 里用 `std::getenv` 读取的变量都列在这里。扫描范围是 `rk_npu_matmul/src`、公开头文件和对应测试。设备节点不是环境变量：`rk_npu_open(NULL)` 在 `/dev/dri/renderD*` 中按 `rknpu` 驱动名自动发现 NPU；需要指定节点时，把路径传给 `rk_npu_open`，也支持显式指定 RKNPU 的 card 节点。两种方式都会验证设备身份并查询驱动版本和 IOMMU 状态，失败返回 NULL 并设置 `errno`。
 
 `RK_NPU_W4A8_REDUCE_NPU` 也不是环境变量。它是 `rk_npu_w4a8_options.reduce_backend` 的枚举，由 `rk_npu_w4a8_workspace_create_ex` 的 options 选择。
 

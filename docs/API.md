@@ -529,7 +529,13 @@ LD_LIBRARY_PATH=build ./build/test_quant_matmul
 LD_LIBRARY_PATH=build ./build/test_batch
 ```
 
-The process needs access to the NPU DRM node, normally `/dev/dri/card1`.
+The process needs access to an RKNPU DRM node. `rk_npu_open(NULL)` automatically
+discovers a `/dev/dri/renderD*` node whose DRM driver name is `rknpu`; it does
+not assume a device number. Pass a non-NULL path to open only that node, including
+an RKNPU primary/card node. Device identity, driver version and IOMMU queries must
+succeed before a context is returned. On failure, `errno` reports the cause;
+`ENODEV` indicates no matching DRM device (or an explicit node with another DRM
+driver), while permission and ioctl errors retain their system error codes.
 
 ## Legacy distinct-weight BMM
 

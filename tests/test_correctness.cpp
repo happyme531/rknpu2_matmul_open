@@ -8,7 +8,7 @@
  * the guard from the CLI to push the envelope further.
  *
  *   ./test_correctness [options]
- *     --dev PATH           DRM device (default /dev/dri/card1)
+ *     --dev PATH           DRM device (default: discover RKNPU render node)
  *     --m LO:HI            restrict M sweep to [LO,HI]   (default full)
  *     --n LO:HI            restrict N sweep to [LO,HI]
  *     --k LO:HI            restrict K sweep to [LO,HI]
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
     const size_t total = Ms.size() * Ns.size() * Ks.size();
 
     rk_npu_ctx* ctx = rk_npu_open(a.dev);
-    if (!ctx) { fprintf(stderr, "rk_npu_open failed (need access to /dev/dri/card1)\n"); return 1; }
+    if (!ctx) { std::perror("rk_npu_open"); return 1; }
     rk_npu_iommu_domain* domain = rk_npu_iommu_domain_create(ctx, 0);
     if (!domain) { rk_npu_close(ctx); return 1; }
 

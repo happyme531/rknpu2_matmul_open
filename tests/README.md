@@ -12,6 +12,7 @@ Two executables sweep the `int8 × int8 → fp32` matmul over a wide M / N / K g
 | `test_correctness` | runs every shape, verifies vs an exact CPU reference, prints a PASS/FAIL map + a "largest passing N" capability envelope |
 | `test_perf` | times the fixed-shape plan path per shape, reports avg us + GOPS, verifies once. `--official`/`--i32`/`--ac-native` also bench the vendor `rknn_matmul` (see below) |
 | `test_mem_api` | runs native-GEM subrange views in domains 0/1/2 and a cross-context dmabuf import |
+| `test_device` | CPU-only syscall emulation: render-node discovery, explicit paths, driver identity, query failures and fd cleanup; registered with CTest |
 | `test_cpu_kernels` | host-only correctness/perf check for the OpenMP A/B pack and C/D unpack kernels; use `--perf` for microbench output |
 | `test_batch` | verifies batched same-shape BMM and compares B single submits vs one batched submit |
 | `test_batch_f16` | verifies distinct-weight FP16 BMM, N/M tiling, output tails, and multicore submission |
@@ -191,7 +192,7 @@ positions (plus a full NaN/Inf scan) so verification never dominates the sweep.
 ## Useful flags (both binaries)
 
 ```
---dev PATH            DRM device (default /dev/dri/card1)
+--dev PATH            DRM device (default: discover RKNPU render node)
 --m LO:HI  --n LO:HI  --k LO:HI    restrict each axis to a sub-range
 --exp                 use the smaller exponential grid
 --csv PATH            write per-shape results as CSV

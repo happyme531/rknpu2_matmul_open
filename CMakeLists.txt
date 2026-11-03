@@ -195,6 +195,15 @@ endif()
 add_executable(test_mem_api tests/test_mem_api.cpp)
 target_link_libraries(test_mem_api PRIVATE rk_npu_matmul)
 
+add_executable(test_device tests/test_device.cpp src/rk_npu_core.cpp)
+target_include_directories(test_device PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_options(test_device PRIVATE
+  -Wl,--wrap=open -Wl,--wrap=close -Wl,--wrap=ioctl
+  -Wl,--wrap=glob -Wl,--wrap=globfree)
+if(BUILD_TESTING)
+  add_test(NAME device COMMAND test_device)
+endif()
+
 add_executable(test_batch tests/test_batch.cpp)
 target_link_libraries(test_batch PRIVATE rk_npu_matmul)
 
@@ -411,7 +420,7 @@ target_link_libraries(test_w4a8_tune_layout PRIVATE rk_npu_matmul)
 # CPU-only validation, including public C headers. Some hardware-only FP16
 # programs use __fp16 and therefore cannot be built by an x86 compiler.
 add_custom_target(rknpu2_matmul_open_cpu_tests DEPENDS
-  test_cpu_kernels test_i4_cpu test_w4a4_linear_cpu test_w4a8_cpu
+  test_device test_cpu_kernels test_i4_cpu test_w4a4_linear_cpu test_w4a8_cpu
   test_w4a8_reduction test_w4a8_swiglu test_w4a8_ffn test_i4_bounds test_autotune_cpu test_panel_layout
   test_dcomp_codec test_w4a8_low_cpu test_w4a8_tune_layout_cpu
   test_quant_header_c test_f16_header_c test_i4_header_c test_w4a8_header_c test_mm_tune test_mm_gelu

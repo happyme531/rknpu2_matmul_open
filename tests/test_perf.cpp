@@ -10,7 +10,7 @@
  * timed).  GOPS counts 2*M*N*K flops over the prepared-path average.
  *
  *   ./test_perf [options]
- *     --dev PATH        DRM device (default /dev/dri/card1)
+ *     --dev PATH        DRM device (default: discover RKNPU render node)
  *     --full            sweep the full M/N/K lists (default: coarse subset)
  *     --exp             sweep smaller exponential M/N/K lists
  *     --m LO:HI         restrict M sweep        --n / --k likewise
@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
 
     /* ---- phase 1: our library (raw register path) ---- */
     rk_npu_ctx* ctx = rk_npu_open(a.dev);
-    if (!ctx) { fprintf(stderr, "rk_npu_open failed (need access to /dev/dri/card1)\n"); return 1; }
+    if (!ctx) { std::perror("rk_npu_open"); return 1; }
     rk_npu_iommu_domain* domain = rk_npu_iommu_domain_create(ctx, 0);
     if (!domain) { rk_npu_close(ctx); return 1; }
     Buffers b;

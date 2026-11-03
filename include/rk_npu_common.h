@@ -5,7 +5,7 @@
  * that are common to every datapath (int8 matmul, fp16 fused matmul, ...).
  *
  * The library talks to the RK3588 NPU directly through the rknpu DRM driver
- * (/dev/dri/cardN) -- no librknnrt.so, no RKNN runtime, no compiler.  Each
+ * (/dev/dri/renderDN) -- no librknnrt.so, no RKNN runtime, no compiler.  Each
  * datapath lives in its own header/translation unit:
  *
  *     rk_npu_matmul.h      int8 x int8 -> fp32 matmul
@@ -111,8 +111,11 @@ typedef struct {
 
 /* ---------------------------------------------------------------- device */
 
-/* Open the NPU. dev may be NULL to use the default ("/dev/dri/card1").
- * Returns NULL on failure. */
+/* Open the NPU. NULL discovers an RKNPU device among /dev/dri/renderD*.
+ * A non-NULL path opens only that node; RKNPU primary/card nodes also work.
+ * Both modes verify the DRM driver name and query driver version/IOMMU state.
+ * Returns NULL on failure and sets errno (ENODEV if no RKNPU node is found
+ * or the explicit node belongs to another DRM driver). */
 rk_npu_ctx* rk_npu_open(const char* dev);
 void        rk_npu_close(rk_npu_ctx* ctx);
 
