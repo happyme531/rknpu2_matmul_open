@@ -513,7 +513,7 @@ void Graph::stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* ma
     }
     // Compile separate scan sizes so small query batches retain their original
     // row scheduling and worker stack footprint.
-    auto scan_rows=[&](auto block_tag
+    auto scan_rows=[&,start](auto block_tag
 #ifdef ATTENTION_NEON
         ,auto exp4
 #endif
