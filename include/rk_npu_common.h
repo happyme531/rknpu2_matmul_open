@@ -50,6 +50,12 @@ extern "C" {
 #define RK_NPU_MEM_DATA_DEFAULT \
     (RK_NPU_MEM_NON_CONTIGUOUS | RK_NPU_MEM_CACHEABLE | RK_NPU_MEM_IOMMU)
 #define RK_NPU_MEM_DEFAULT RK_NPU_MEM_DATA_DEFAULT
+/* Growing attention commands and task descriptors must not require large
+ * physically contiguous allocations. Cacheable Normal memory also permits
+ * ordinary ARM64 CPU writes; flush before device/driver consumption. */
+#define RK_NPU_MEM_REGCMD_PAGED RK_NPU_MEM_DATA_DEFAULT
+#define RK_NPU_MEM_TASK_PAGED \
+    (RK_NPU_MEM_KERNEL_MAPPING | RK_NPU_MEM_DATA_DEFAULT)
 
 #define RK_NPU_IOMMU_DOMAIN_COUNT 16u
 

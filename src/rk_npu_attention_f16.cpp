@@ -212,8 +212,8 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
     }
     std::vector<size_t> offsets;size_t words=0;
     for(auto& t:all){offsets.push_back(words);words+=align_up(int(t.body.size())+4,2);}
-    if(regs.mem.size<words*8)ensure(regs,words*8,RK_NPU_MEM_NON_CACHEABLE);
-    if(descriptors.mem.size<size_t(tasks)*sizeof(rknpu_task))ensure(descriptors,size_t(tasks)*sizeof(rknpu_task),RK_NPU_MEM_KERNEL_MAPPING);
+    if(regs.mem.size<words*8)ensure(regs,words*8,RK_NPU_MEM_REGCMD_PAGED);
+    if(descriptors.mem.size<size_t(tasks)*sizeof(rknpu_task))ensure(descriptors,size_t(tasks)*sizeof(rknpu_task),RK_NPU_MEM_TASK_PAGED);
     auto* cmd=static_cast<uint64_t*>(regs.mem.vaddr);auto* desc=static_cast<rknpu_task*>(descriptors.mem.vaddr);
     std::memset(desc,0,size_t(tasks)*sizeof(*desc));
     for(int i=0;i<tasks;++i){
@@ -233,6 +233,7 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
     }
     for(auto [task,kind,hi,block]:relocs)if(kind<3)
         bindings.push_back({offsets[task]+index(all[task],T_CNA,0x1110),kind,hi,block});
+    descriptors.sync(RK_NPU_SYNC_TO_DEVICE);
     bind(cache,bounds,scratch);
 }
 void Graph::bind(Cache& c,const uint16_t* bounds,Tail* scratch){
@@ -248,6 +249,7 @@ void Graph::bind(Cache& c,const uint16_t* bounds,Tail* scratch){
                       tail.mem.dma_addr+size_t(head)*(shape.value_dim+32)*tail_length*2;
         if(addr>UINT32_MAX)throw Error{RK_NPU_ERR_DOMAIN};cmd[b.word]=E(T_CNA,0x1110,uint32_t(addr));
     }
+    regs.sync(RK_NPU_SYNC_TO_DEVICE);
     bound=&c;bound_identity=c.identity;bound_generation=c.generation;
     bound_tail_generation=tail.generation;bound_tail_address=tail.mem.dma_addr;
 }
