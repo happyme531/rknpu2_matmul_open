@@ -29,13 +29,16 @@ inline std::vector<uint64_t> lut_exp_regs(int count, uint64_t input, uint64_t ou
         }();
         v.insert(v.end(),table.begin(),table.end());
     }
-    const unsigned width = unsigned(count / 8 - 1);
+    // Large M128 tiles have a whole number of 128-pixel rows, with eight
+    // FP16 channels per pixel. Encode the same cube in DPU, WDMA and RDMA.
+    const unsigned width = count > 4096 ? 127 : unsigned(count / 8 - 1);
+    const unsigned height = count > 4096 ? unsigned(count / 1024 - 1) : 0;
     d(0x4004, 14); r(0x5004, 14);
     d(0x400c, 0x1e5); d(0x4010, 0x48000002); d(0x4014, 0);
     d(0x4020, unsigned(output)); d(0x4024, count * 2);
-    d(0x4030, width); d(0x4034, 0); d(0x4038, 0); d(0x403c, 0x70007);
+    d(0x4030, width); d(0x4034, height); d(0x4038, 0); d(0x403c, 0x70007);
     d(0x4040, 0x53); d(0x4044, 0); d(0x4048, 0); d(0x404c, 0);
-    d(0x4050, 2); d(0x4054, 0); d(0x4058, 7); d(0x405c, width);
+    d(0x4050, 2); d(0x4054, 0); d(0x4058, 7); d(0x405c, (height << 16) | width);
     d(0x4060, 0x20040); d(0x4064, 0x80000000);
     d(0x4068, unsigned(half(2040.f)) << 16); d(0x406c, 0);
     d(0x4070, 0x302); d(0x4074, 0); d(0x4078, 1); d(0x407c, 0);
@@ -46,7 +49,7 @@ inline std::vector<uint64_t> lut_exp_regs(int count, uint64_t input, uint64_t ou
     d(0x4110, unsigned(-32640)); d(0x4114, unsigned(-16320));
     d(0x4118, unsigned(-16320)); d(0x411c, 64);
     d(0x4120, 0); d(0x4124, 0); d(0x4128, 0); d(0x412c, 0);
-    r(0x500c, width); r(0x5010, 0); r(0x5014, 7); r(0x5018, unsigned(input));
+    r(0x500c, width); r(0x5010, height); r(0x5014, 7); r(0x5018, unsigned(input));
     r(0x501c, 0); r(0x5020, 0); r(0x5028, 0); r(0x502c, 0);
     r(0x5034, 1); r(0x5038, 0); r(0x5040, 0); r(0x5044, 0x17849);
     r(0x5048, 0); r(0x504c, 0); r(0x5064, 0); r(0x5068, 0x01010101); r(0x506c, 0);

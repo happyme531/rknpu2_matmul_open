@@ -160,6 +160,9 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
     };
     if(lut){
         const int cores=__builtin_popcount(core_mask(c));
+        // M128 native score spans are multiples of 4096 values. Larger 2D
+        // LUT cubes reduce task and graph preparation overhead for prefill.
+        const int lut_chunk=m==128?65536:4096;
         for(int core=0,first=0;core<cores;++core){
             const int heads=c.kv_heads/cores+(core<c.kv_heads%cores);
             if(lut_split){
@@ -168,10 +171,10 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
                 t.op_idx=4;t.enable_mask=0x18;
                 relocs.emplace_back(all.size(),4,first,0);all.push_back(std::move(t));
             }
-            for(int hi=first;hi<first+heads;++hi)for(int at=0;at<m*span;at+=4096){
+            for(int hi=first;hi<first+heads;++hi)for(int at=0;at<m*span;at+=lut_chunk){
                 Task t;
                 const size_t offset=(size_t(hi)*m*span+at)*2;
-                t.body=lut_exp_regs(std::min(4096,m*span-at),score.mem.dma_addr+offset,
+                t.body=lut_exp_regs(std::min(lut_chunk,m*span-at),score.mem.dma_addr+offset,
                     exponent.mem.dma_addr+offset,!lut_split && hi==first && at==0);
                 t.op_idx=4;t.enable_mask=0x18;
                 relocs.emplace_back(all.size(),3,hi,0);all.push_back(std::move(t));
