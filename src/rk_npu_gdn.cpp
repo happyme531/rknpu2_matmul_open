@@ -1,4 +1,5 @@
 #include "rk_npu_gdn_internal.h"
+#include "rk_npu_trace.h"
 #include <cmath>
 #include <new>
 #include <system_error>
@@ -120,18 +121,25 @@ int execute(rk_npu_gdn_workspace* w,const Inputs& x,const Projected* producer,
     try {
         Busy lock(w->busy);
         if(w->poisoned) return RK_NPU_ERR_SUBMIT;
+#if RK_NPU_ENABLE_TRACE
+        const bool trace=TRACE_EVENT_CATEGORY_ENABLED("rknpu");
+#else
+        constexpr bool trace=false;
+#endif
+        const bool timed=timings || trace;
         rusage cpu_begin{},cpu_end{};
-        getrusage(RUSAGE_SELF,&cpu_begin);
-        const auto begin=Clock::now();
+        if(timed) getrusage(RUSAGE_SELF,&cpu_begin);
+        const auto begin=timed?Clock::now():Clock::time_point{};
         for(int i=0;i<w->cfg.tokens*HV;++i)
             if(!(x.g[i]<=0.f) || !(x.beta[i]>=0.f && x.beta[i]<=1.f)) return RK_NPU_ERR_PARAM;
         Times t;
-        try { t=w->engine->run(x,producer,output,final_state); }
+        try { t=w->engine->run(x,producer,output,final_state,timed,trace); }
         catch(const Error& e) {
             if(e.code==RK_NPU_ERR_SUBMIT || e.code==RK_NPU_ERR_IOCTL) w->poisoned=true;
             throw;
         }
         if(producer) std::copy(w->history.begin(),w->history.end(),final_history);
+        if(!timed) return RK_NPU_OK;
         t.total=micros(begin,Clock::now());
         getrusage(RUSAGE_SELF,&cpu_end);
         auto elapsed=[](const timeval& a,const timeval& b) {
@@ -139,6 +147,18 @@ int execute(rk_npu_gdn_workspace* w,const Inputs& x,const Projected* producer,
         };
         t.cpu_user=elapsed(cpu_begin.ru_utime,cpu_end.ru_utime);
         t.cpu_system=elapsed(cpu_begin.ru_stime,cpu_end.ru_stime);
+        if(trace) { RK_NPU_TRACE_EVENT("rknpu", "gdn.timings", "M", w->cfg.tokens,
+            "total_us", t.total, "state_import_us", t.state_import, "state_upload_us", t.state_upload,
+            "prepare_us", t.pack_compute, "input_sync_us", t.input_sync,
+            "gram_submit_us", t.gram_submit, "gram_sync_us", t.gram_sync,
+            "coefficients_us", t.coefficients_compute, "coefficient_sync_us", t.coefficient_sync,
+            "predict_submit_us", t.predict_submit, "predict_sync_us", t.predict_sync,
+            "solve_us", t.solve_compute, "delta_sync_us", t.delta_sync,
+            "update_submit_us", t.update_submit, "collect_us", t.collect_compute,
+            "update_sync_us", t.update_sync,
+            "state_download_us", t.state_download, "state_export_us", t.state_export,
+            "gram_hw_us", t.gram_driver, "predict_hw_us", t.predict_driver, "update_hw_us", t.update_driver,
+            "process_cpu_us", t.cpu_user + t.cpu_system); }
         if(timings) *timings={t.total,t.pack_compute,t.coefficients_compute,t.solve_compute,t.collect_compute,
             t.driver,t.gram_driver,t.predict_driver,t.update_driver,t.cpu_user,t.cpu_system};
         return RK_NPU_OK;

@@ -369,70 +369,102 @@ public:
         update_single.build(domain, us, use,cfg.core_mask,cfg.timeout_ms);
         grouped_update.build(domain, grouped, grouped_enables, front_count, tail_groups,cfg.core_mask,cfg.timeout_ms);
     }
-    Times run(const Inputs& x,const Projected* producer,float* output,float* final_state) override {
-        if(producer) return run_with_producer<true>(x,output,final_state,
+    Times run(const Inputs& x,const Projected* producer,float* output,float* final_state,
+              bool timed,bool trace) override {
+        if(producer) return run_with_producer<true>(x,output,final_state,timed,trace,
             [&](float* a,float* al,float* b,float* bl) {
                 produce_native<split,C>(workers,T,*producer,a,al,b,bl);
             });
-        return run_with_producer<false>(x,output,final_state,[](float*,float*,float*,float*){});
+        return run_with_producer<false>(x,output,final_state,timed,trace,[](float*,float*,float*,float*){});
     }
     // A native producer writes K native A and [K^T,Q^T] native B, including
     // the split-TF32 residuals. Coefficients then consume K from native A.
     template<bool native_keys, class Producer>
     Times run_with_producer(const Inputs & x, float* output,
-                            float* final_state, Producer && produce) {
+                            float* final_state, bool timed, bool trace, Producer && produce) {
         Times times;
-        const auto begin = Clock::now();
+        const auto now = [timed] { return timed ? Clock::now() : Clock::time_point{}; };
+        const auto trace_now = [trace] { return trace ? Clock::now() : Clock::time_point{}; };
+        const auto begin = trace_now();
         std::fill(state_scale.begin(), state_scale.end(), 1.f);
         workers.run([&](int w) {
             for (int h = w; h < HV; h += workers.count()) for (int v0 = 0; v0 < D; v0 += 16) for (int k0 = 0; k0 < D; k0 += 16)
                 for (int v = v0; v < v0 + 16; ++v) for (int k = k0; k < k0 + 16; k += 4)
                     vst1q_f32(state.ptr() + h * SS + si(v, k), vld1q_f32(x.state + h * SS + v * D + k));
         });
+        const auto imported = trace_now();
         state.sync(RK_NPU_SYNC_TO_DEVICE);
-        auto mark = Clock::now();
-        times.handoff += micros(begin, mark);
+        const auto pack_begin = now();
+        if (trace) {
+            times.state_import = micros(begin, imported);
+            times.state_upload = micros(imported, pack_begin);
+        }
         produce(ga.ptr(), gal.ptr(), b1.ptr(), b1l.ptr());
         if constexpr (!native_keys) pack_grams(x);
-        times.pack_compute = micros(mark, Clock::now());
+        const auto packed = now();
+        if (timed) times.pack_compute = micros(pack_begin, packed);
         ga.sync(RK_NPU_SYNC_TO_DEVICE); b1.sync(RK_NPU_SYNC_TO_DEVICE);
         if (split) { gal.sync(RK_NPU_SYNC_TO_DEVICE); b1l.sync(RK_NPU_SYNC_TO_DEVICE); }
-        auto next = Clock::now(); times.gram_pack = micros(mark, next); mark = next;
-        times.gram_driver += grams.run(); times.driver += times.gram_driver;
+        const auto gram_begin = trace_now();
+        times.gram_driver = grams.run(); times.driver = times.gram_driver;
+        const auto gram_submitted = trace_now();
         gc.sync(RK_NPU_SYNC_FROM_DEVICE);
-        next = Clock::now(); times.gram = micros(mark, next);
+        if (trace) {
+            times.input_sync = micros(packed, gram_begin);
+            times.gram_submit = micros(gram_begin, gram_submitted);
+            times.gram_sync = micros(gram_submitted, Clock::now());
+        }
         for (int block = 0; block < blocks; ++block) {
-            mark = Clock::now(); coefficients<native_keys>(x, block);
-            times.coefficients_compute += micros(mark, Clock::now());
+            const auto coefficient_begin = now();
+            coefficients<native_keys>(x, block);
+            const auto coefficient_end = now();
             b2.sync(RK_NPU_SYNC_TO_DEVICE);
             gate_hi.sync(RK_NPU_SYNC_TO_DEVICE); gate_lo.sync(RK_NPU_SYNC_TO_DEVICE);
             if (split) b2l.sync(RK_NPU_SYNC_TO_DEVICE);
-            next = Clock::now(); times.coefficients += micros(mark, next); mark = next;
+            const auto predict_begin = trace_now();
             const double prediction_hw = predictions[block]->run();
             times.predict_driver += prediction_hw; times.driver += prediction_hw;
+            const auto predict_submitted = trace_now();
             p1.sync(RK_NPU_SYNC_FROM_DEVICE);
-            next = Clock::now(); times.predict += micros(mark, next); mark = next;
+            const auto solve_begin = now();
             solve(x, block);
-            times.solve_compute += micros(mark, Clock::now());
+            const auto solved = now();
             a2.sync(RK_NPU_SYNC_TO_DEVICE);
             if (split) a2l.sync(RK_NPU_SYNC_TO_DEVICE);
-            next = Clock::now(); times.solve += micros(mark, next); mark = next;
+            const auto update_begin = trace_now();
             const double update_hw = add_only ? update_add.run() : single_pass ? update_single.run() : all_scale ? update.run() : grouped_update.run(scale_update);
             times.update_driver += update_hw; times.driver += update_hw;
+            const auto update_submitted = trace_now();
             p2.sync(RK_NPU_SYNC_FROM_DEVICE);
-            const auto collect_begin = Clock::now();
+            const auto collect_begin = now();
             collect(block, output);
-            times.collect_compute += micros(collect_begin, Clock::now());
-            times.update += micros(mark, Clock::now());
+            if (timed) {
+                times.collect_compute += micros(collect_begin, Clock::now());
+                times.coefficients_compute += micros(coefficient_begin, coefficient_end);
+                times.solve_compute += micros(solve_begin, solved);
+            }
+            if (trace) {
+                times.coefficient_sync += micros(coefficient_end, predict_begin);
+                times.predict_submit += micros(predict_begin, predict_submitted);
+                times.predict_sync += micros(predict_submitted, solve_begin);
+                times.delta_sync += micros(solved, update_begin);
+                times.update_submit += micros(update_begin, update_submitted);
+                times.update_sync += micros(update_submitted, collect_begin);
+            }
         }
-        mark = Clock::now(); state.sync(RK_NPU_SYNC_FROM_DEVICE);
+        const auto download_begin = trace_now();
+        state.sync(RK_NPU_SYNC_FROM_DEVICE);
+        const auto downloaded = trace_now();
         workers.run([&](int w) {
             for (int h = w; h < HV; h += workers.count()) for (int v0 = 0; v0 < D; v0 += 16) for (int k0 = 0; k0 < D; k0 += 16)
                 for (int v = v0; v < v0 + 16; ++v) for (int k = k0; k < k0 + 16; k += 4)
                     vst1q_f32(final_state + h * SS + v * D + k,
                         vmulq_n_f32(vld1q_f32(state.ptr() + h * SS + si(v, k)), state_scale[h]));
         });
-        const auto end = Clock::now(); times.handoff += micros(mark, end); times.total = micros(begin, end);
+        if (trace) {
+            times.state_download = micros(download_begin, downloaded);
+            times.state_export = micros(downloaded, Clock::now());
+        }
         return times;
     }
 };

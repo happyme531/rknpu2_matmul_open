@@ -105,7 +105,8 @@ void recurrent(rk_npu_iommu_domain* domain,int tokens,int chunk,uint32_t mask,in
         tokens,chunk,mask,threads,precision,int(interleaved));
 }
 void fused(rk_npu_iommu_domain* domain,int precision) {
-    constexpr int T=7;
+    // Cover the initial history, subsequent four-token windows and a three-token tail.
+    constexpr int T=15;
     rk_npu_gdn_config c; rk_npu_gdn_config_init(&c,T);
     c.precision=static_cast<rk_npu_gdn_precision>(precision);
     auto w=prepare(domain,c);

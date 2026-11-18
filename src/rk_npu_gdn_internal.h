@@ -88,14 +88,18 @@ struct Projected {
     size_t stride;
 };
 struct Times {
-    double total=0,gram_pack=0,gram=0,coefficients=0,predict=0,solve=0,update=0,handoff=0,driver=0;
+    double total=0,driver=0;
     double pack_compute=0,coefficients_compute=0,solve_compute=0,collect_compute=0;
     double cpu_user=0,cpu_system=0,gram_driver=0,predict_driver=0,update_driver=0;
+    double state_import=0,state_upload=0,state_download=0,state_export=0;
+    double input_sync=0,coefficient_sync=0,delta_sync=0;
+    double gram_submit=0,predict_submit=0,update_submit=0;
+    double gram_sync=0,predict_sync=0,update_sync=0;
 };
 class Engine {
 public:
     virtual ~Engine()=default;
-    virtual Times run(const Inputs&,const Projected*,float*,float*)=0;
+    virtual Times run(const Inputs&,const Projected*,float*,float*,bool timed,bool trace)=0;
 };
 std::unique_ptr<Engine> prepare_engine(rk_npu_iommu_domain*,const rk_npu_gdn_config&,Workers&);
 } // namespace rknpu2_matmul_open::gdn
