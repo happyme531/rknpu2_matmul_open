@@ -8,7 +8,7 @@ Existing matmul APIs and default execution choices are unchanged.
 
 Set `config.flags` to `RK_NPU_ATTENTION_F16_FIXED_SHIFT_EXPERIMENTAL` for the
 fixed-shift approximation, or `RK_NPU_ATTENTION_F16_STABLE_SOFTMAX` for stable
-row-max Attention. Stable mode defaults to NPU LUT exponential with a CPU
+row-max Attention. Stable mode defaults to the DPU exponential curve with a CPU
 softmax fallback for PV magnitude and task limits. Fixed-shift numerical range
 handling remains the caller's responsibility. No RKNN runtime, compiler, model or `.tasks` file is
 needed at build or run time. The DPU-RDMA mask registers are generated from dimensions,
@@ -339,8 +339,14 @@ PV 仍使用配置中的 `kv_tile`，不改变默认值 512。`query()` 包含�
 `RK_NPU_ATTENTION_F16_STABLE_SOFTMAX` 与 MLA 共用稳定路径：原始 QK 写回后，CPU
 排除无效 keys 并减行最大值。AArch64 完整的八元素组直接用 FP16 subtract/clamp，
 省去升为 FP32 再降为 FP16 的转换；边界和 boolean 路径保持标量处理。
-NPU LUT 执行 exponential 并通过 PINGPONG
-连接 PV；CPU 以 FP32 去掉正偏置并归一化。stable 无需 native mask tensor，
+在支持 FP16 NEON 的 AArch64 上，causal GQA 每个 KV head 对应四个 query heads、
+每段 32 个 query 行时，四个 CPU 线程按 head 计算真实行最大值，按原生布局将相同
+DPU 曲线的 FP16 查表结果写入 write-combine 缓冲。此优化随默认 `pingpong` 模式启用；
+显式选用 `pc` 或 `split` 时由 DPU 执行指数。每个线程在交给 PV 前完成写屏障。
+遇到非有限行最大值时，按需生成该图的 DPU 指数命令供回退。WC 分配失败时沿用可缓存
+缓冲和 DPU 指数。每个 slot 分别保留用过的两种概率缓冲，供完整块和短尾块切换时复用。
+其他 LUT 几何也由 DPU 执行。
+CPU 按原有 tile 顺序合并 PV 输出，以 FP32 去除偏置并归一化。stable 无需 native mask tensor，
 `mask_bytes=0`，boolean 的逻辑 ABI 和 GQA causal 前缀规则保留。
 
 多行且物理 M>16 的 query pack 按 KV head 使用四线程；单 token 不启用并行 pack。

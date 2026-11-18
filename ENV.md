@@ -15,7 +15,7 @@
 | `RK_NPU_MOE_W4_MIXED` | 开 | 仅 `rk_npu_moe_w4_workspace_create` | 混合 W4/W8 MoE 是否把 INT4 和 INT8 GEMM 拼进同一条 PC chain |
 | `RK_NPU_MM_SPLIT_K` | 开 | 新 `rk_npu_mm_plan_create`，options.split_k=-1 时 | 允许 FP16/BF16/TF32 MM/BMM 自动 split-K；`0` 关闭，`1` 开启，其它值报错；不影响旧接口 |
 | `RK_NPU_MM_K_TILING` | 开 | `rk_npu_mm_autotune_config_init` | FP16 调优允许 K 分块和 NPU FP16 Add 归约；`off`/`0` 关闭 |
-| `RK_NPU_ATTN_LUT_EXP` | 开 | stable Attention cache 创建 | 使用 NPU LUT exponential；`0` 恢复 CPU softmax |
+| `RK_NPU_ATTN_LUT_EXP` | 开 | stable Attention cache 创建 | 使用 DPU 指数曲线；`0` 恢复 CPU softmax |
 | `RK_NPU_ATTN_LUT_SUBMIT` | `pingpong` | Attention graph 创建 | LUT 提交方式：`pingpong`、`pc`、`split` |
 | `XDG_CACHE_HOME`、`HOME` | 见下文 | cache path 参数为 NULL 时 | autotune 结果目录 |
 
@@ -25,8 +25,9 @@
 
 ## Attention：`RK_NPU_ATTN_LUT_EXP` 和 `RK_NPU_ATTN_LUT_SUBMIT`
 
-stable Attention 默认在 NPU 上执行 LUT exponential，以 PINGPONG 将 exponential
-与 PV 串联。`RK_NPU_ATTN_LUT_EXP` 未设置或精确为 `1` 时开启，其余值关闭。
+stable Attention 默认采用 DPU 指数曲线。AArch64 causal GQA 的四头分组、32 行
+prefill 块在默认 `pingpong` 模式下由 CPU 按同一曲线查表，PV 在 NPU 上执行。
+显式选择 `pc` 或 `split` 时由 DPU 计算指数；其他 LUT 几何也由 DPU 执行。`RK_NPU_ATTN_LUT_EXP` 未设置或精确为 `1` 时开启，其余值关闭。
 在进程启动前设置 `RK_NPU_ATTN_LUT_EXP=0` 恢复 CPU softmax 及原有 KV 更新、
 截断行为。开关在 cache 创建时固定；fixed-shift 模式不读取此开关的执行选择。
 

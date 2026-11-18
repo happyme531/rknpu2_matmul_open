@@ -36,6 +36,54 @@ struct Matmul {
     }
 };
 
+void grow_buffer(rk_npu_iommu_domain* domain,Buffer& buffer,uint64_t bytes,uint32_t flags=RK_NPU_MEM_DATA_DEFAULT){
+    if(buffer.mem.size<bytes)buffer.ensure(domain,std::max(bytes,buffer.mem.size*2),flags);
+}
+
+template<class AddTask>
+void emit_lut_tasks(const Graph& graph,int first,int heads,AddTask add){
+    // A 2D LUT cube reduces task and graph preparation overhead for M128.
+    const int chunk=graph.m==128?65536:4096;
+    auto emit=[&](int hi,int at,int count,bool load,int kind){
+        const size_t offset=(size_t(hi)*graph.m*graph.span+at)*2;
+        Task task;
+        task.body=lut_exp_regs(count,graph.score.mem.dma_addr+offset,graph.exponent->mem.dma_addr+offset,load);
+        task.op_idx=4;task.enable_mask=0x18;
+        add(std::move(task),kind,hi);
+    };
+    if(graph.lut_split)emit(first,0,8,true,4);
+    for(int hi=first;hi<first+heads;++hi)for(int at=0;at<graph.m*graph.span;at+=chunk)
+        emit(hi,at,std::min(chunk,graph.m*graph.span-at),!graph.lut_split && hi==first && at==0,3);
+}
+
+// At most three stages, each with one chain per NPU core.
+using ChainEnds=std::array<uint32_t,9>;
+std::vector<size_t> write_commands(rk_npu_iommu_domain* domain,const std::vector<Task>& tasks,
+    const ChainEnds& chain_ends,Buffer& regs,Buffer& descriptors){
+    std::vector<size_t> offsets;offsets.reserve(tasks.size());
+    size_t words=0;
+    for(const auto& task:tasks){offsets.push_back(words);words+=align_up(int(task.body.size())+4,2);}
+    grow_buffer(domain,regs,words*8,RK_NPU_MEM_REGCMD_PAGED);
+    grow_buffer(domain,descriptors,tasks.size()*sizeof(rknpu_task),RK_NPU_MEM_TASK_PAGED);
+    auto* cmd=static_cast<uint64_t*>(regs.mem.vaddr);
+    auto* desc=static_cast<rknpu_task*>(descriptors.mem.vaddr);
+    std::memset(desc,0,tasks.size()*sizeof(*desc));
+    for(size_t i=0;i<tasks.size();++i){
+        const auto& task=tasks[i];
+        std::copy(task.body.begin(),task.body.end(),cmd+offsets[i]);
+        auto* end=cmd+offsets[i]+task.body.size();
+        const bool next=i+1<tasks.size() && std::find(chain_ends.begin(),chain_ends.end(),i+1)==chain_ends.end();
+        end[0]=next?E(T_PC_REG,R_PC_BASE_ADDRESS,regs.mem.dma_addr+offsets[i+1]*8):E(T_NOP,0,0);
+        end[1]=E(T_PC_REG,R_PC_REGISTER_AMOUNTS,next?ceil_div(int(tasks[i+1].body.size()),2)+1:0);
+        end[2]=E(T_VERSION,0,0);end[3]=E(T_PC,R_OPERATION_ENABLE,task.enable_mask);
+        if(task.body.size()%2)end[4]=E(T_NOP,0,0);
+        desc[i].op_idx=task.op_idx;desc[i].enable_mask=task.enable_mask;desc[i].int_mask=0x300;desc[i].int_clear=0x1ffff;
+        desc[i].regcfg_amount=task.body.size();desc[i].regcmd_addr=regs.mem.dma_addr+offsets[i]*8;
+    }
+    descriptors.sync(RK_NPU_SYNC_TO_DEVICE);
+    return offsets;
+}
+
 // Built-in DPU-RDMA programming rule, verified against a13 native Softmax
 // captures for M4/8/16/32/128 and S128/512/4096/4128/4160/4608.
 // The register sequence is generated from dimensions; no external tasks/model.
@@ -92,27 +140,43 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
     if(!mode || lut_split || !std::strcmp(mode,"pingpong"))lut_flags|=RKNPU_JOB_PINGPONG;
     rk_npu_attention_f16_sizes sizes{};check(query_engine(c,shape,cache.capacity,qr,s,sizes));
     matmul_tasks=sizes.tasks;lut=can_lut(cache,bounds);
+#ifdef ATTENTION_NEON
+    stream_scores=lut && !lut_split && (lut_flags & RKNPU_JOB_PINGPONG) &&
+        c.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL && rows==32 && m==128 &&
+        shape.group==4 && !shape.shared_kv && !shape.balanced_heads;
+#endif
     if(reuse){q.swap(reuse->q);score.swap(reuse->score);mask.swap(reuse->mask);partial.swap(reuse->partial);
         regs.swap(reuse->regs);descriptors.swap(reuse->descriptors);sum.swap(reuse->sum);
-        softmax_scratch.swap(reuse->softmax_scratch);exponent.swap(reuse->exponent);}
-    auto ensure=[&](Buffer& buffer,uint64_t bytes,uint32_t flags=RK_NPU_MEM_DATA_DEFAULT){
-        buffer.ensure(d,std::max(bytes,buffer.mem.size*2),flags);
-    };
+        softmax_scratch.swap(reuse->softmax_scratch);
+        cached_exponent.swap(reuse->cached_exponent);wc_exponent.swap(reuse->wc_exponent);}
     // All physical QK/PV rows and aligned output channels are overwritten by
     // each submit. Keep untouched output pages device-owned, rather than
     // touching/cleaning them from the CPU before every geometry change.
-    if(q.mem.size<sizes.query_bytes)ensure(q,sizes.query_bytes);
-    if(score.mem.size<sizes.score_bytes)ensure(score,sizes.score_bytes);
-    if(lut && exponent.mem.size<sizes.score_bytes)ensure(exponent,sizes.score_bytes);
+    grow_buffer(d,q,sizes.query_bytes);
+    grow_buffer(d,score,sizes.score_bytes);
+    if(lut){
+        if(stream_scores){
+            try{
+                grow_buffer(d,wc_exponent,sizes.score_bytes,
+                    RK_NPU_MEM_NON_CONTIGUOUS | RK_NPU_MEM_IOMMU | RK_NPU_MEM_WRITE_COMBINE);
+            }catch(const Error&){
+                // The optional WC mapping can fail while the ordinary LUT path remains usable.
+                stream_scores=false;
+            }
+        }
+        exponent=stream_scores?&wc_exponent:&cached_exponent;
+        if(!stream_scores)grow_buffer(d,*exponent,sizes.score_bytes);
+    }
     if(lut)active.resize(size_t(c.kv_heads)*m);
-    if(partial.mem.size<sizes.partial_bytes)ensure(partial,sizes.partial_bytes);
-    if(sizes.mask_bytes && mask.mem.size<sizes.mask_bytes)ensure(mask,sizes.mask_bytes);
-    sum.resize(size_t(m)*(shape.value_dim+8));
+    grow_buffer(d,partial,sizes.partial_bytes);
+    if(sizes.mask_bytes)grow_buffer(d,mask,sizes.mask_bytes);
+    const int workers=stream_scores ? 4 : 1;
+    sum.resize(size_t(workers)*m*(shape.value_dim+8));
     // CPU exp and causal LUT prefix sums share scratch. Retain its size across
     // graph changes so switching paths does not reinitialize unused elements.
     size_t scratch_size=0;
     if(lut && c.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL)
-        scratch_size=size_t(rows)*shape.value_dim;
+        scratch_size=size_t(workers)*rows*shape.value_dim;
     else if(!lut && c.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX && span>1024)
         scratch_size=size_t(4)*4*span;
     if(softmax_scratch.size()<scratch_size)softmax_scratch.resize(scratch_size);
@@ -138,7 +202,7 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
     }
     auto pv=[&](int per_head,int length,bool is_tail){
         Matmul mm;Buffer& weights=is_tail?static_cast<Buffer&>(scratch?*scratch:cache.tail):cache.value;
-        Buffer& probabilities=lut?exponent:score;
+        Buffer& probabilities=lut?*exponent:score;
         auto pt=mm.build(d,c,per_head,m,shape.value_dim+1,length,probabilities,weights,partial);
         const size_t astride=size_t(m)*length*2,ostride=size_t(shape.value_dim+32)*m*2;
         for(int hi=0;hi<c.kv_heads;++hi)for(const auto& body:pt){
@@ -158,27 +222,13 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
             relocs.emplace_back(all.size(),is_tail?2:1,hi,block);all.push_back(std::move(t));
         }
     };
-    if(lut){
+    if(lut && !stream_scores){
         const int cores=__builtin_popcount(core_mask(c));
-        // M128 native score spans are multiples of 4096 values. Larger 2D
-        // LUT cubes reduce task and graph preparation overhead for prefill.
-        const int lut_chunk=m==128?65536:4096;
         for(int core=0,first=0;core<cores;++core){
             const int heads=c.kv_heads/cores+(core<c.kv_heads%cores);
-            if(lut_split){
-                Task t;t.body=lut_exp_regs(8,score.mem.dma_addr+size_t(first)*m*span*2,
-                    exponent.mem.dma_addr+size_t(first)*m*span*2,true);
-                t.op_idx=4;t.enable_mask=0x18;
-                relocs.emplace_back(all.size(),4,first,0);all.push_back(std::move(t));
-            }
-            for(int hi=first;hi<first+heads;++hi)for(int at=0;at<m*span;at+=lut_chunk){
-                Task t;
-                const size_t offset=(size_t(hi)*m*span+at)*2;
-                t.body=lut_exp_regs(std::min(lut_chunk,m*span-at),score.mem.dma_addr+offset,
-                    exponent.mem.dma_addr+offset,!lut_split && hi==first && at==0);
-                t.op_idx=4;t.enable_mask=0x18;
-                relocs.emplace_back(all.size(),3,hi,0);all.push_back(std::move(t));
-            }
+            emit_lut_tasks(*this,first,heads,[&](Task t,int kind,int hi){
+                relocs.emplace_back(all.size(),kind,hi,0);all.push_back(std::move(t));
+            });
             first+=heads;
         }
     }
@@ -213,30 +263,15 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
         if(ordered.size()!=all.size())throw Error{RK_NPU_ERR_PARAM};
         all.swap(ordered);relocs.swap(bindings_in_order);
     }
-    std::vector<size_t> offsets;size_t words=0;
-    for(auto& t:all){offsets.push_back(words);words+=align_up(int(t.body.size())+4,2);}
-    if(regs.mem.size<words*8)ensure(regs,words*8,RK_NPU_MEM_REGCMD_PAGED);
-    if(descriptors.mem.size<size_t(tasks)*sizeof(rknpu_task))ensure(descriptors,size_t(tasks)*sizeof(rknpu_task),RK_NPU_MEM_TASK_PAGED);
-    auto* cmd=static_cast<uint64_t*>(regs.mem.vaddr);auto* desc=static_cast<rknpu_task*>(descriptors.mem.vaddr);
-    std::memset(desc,0,size_t(tasks)*sizeof(*desc));
-    for(int i=0;i<tasks;++i){
-        auto& t=all[i];std::copy(t.body.begin(),t.body.end(),cmd+offsets[i]);auto* end=cmd+offsets[i]+t.body.size();
-        bool next=i+1<tasks;
-        for(int core=0;core<cores;++core){
-            if(!stable && uint32_t(i+1)==task_start[core]+task_count[core])next=false;
-            if(stable)for(int stage=0;stage<stages;++stage)
-                if(uint32_t(i+1)==stage_start[stage][core]+stage_count[stage][core])next=false;
-        }
-        end[0]=next?E(T_PC_REG,R_PC_BASE_ADDRESS,regs.mem.dma_addr+offsets[i+1]*8):E(T_NOP,0,0);
-        end[1]=E(T_PC_REG,R_PC_REGISTER_AMOUNTS,next?ceil_div(int(all[i+1].body.size()),2)+1:0);
-        end[2]=E(T_VERSION,0,0);end[3]=E(T_PC,R_OPERATION_ENABLE,t.enable_mask);
-        if(t.body.size()%2)end[4]=E(T_NOP,0,0);
-        desc[i].op_idx=t.op_idx;desc[i].enable_mask=t.enable_mask;desc[i].int_mask=0x300;desc[i].int_clear=0x1ffff;
-        desc[i].regcfg_amount=t.body.size();desc[i].regcmd_addr=regs.mem.dma_addr+offsets[i]*8;
+    ChainEnds chain_ends{};
+    for(int core=0;core<cores;++core){
+        if(!stable)chain_ends[core]=task_start[core]+task_count[core];
+        else for(int stage=0;stage<stages;++stage)
+            chain_ends[stage*cores+core]=stage_start[stage][core]+stage_count[stage][core];
     }
+    const auto offsets=write_commands(d,all,chain_ends,regs,descriptors);
     for(auto [task,kind,hi,block]:relocs)if(kind<3)
         bindings.push_back({offsets[task]+index(all[task],T_CNA,0x1110),kind,hi,block});
-    descriptors.sync(RK_NPU_SYNC_TO_DEVICE);
     bind(cache,bounds,scratch);
 }
 void Graph::bind(Cache& c,const uint16_t* bounds,Tail* scratch){
@@ -344,21 +379,46 @@ void Graph::pack_q(const uint16_t* query,int tensor_rows,int tensor_offset){
     }
     q.range(0,size_t(cfg.kv_heads)*m*shape.key_dim*2);
 }
+void Graph::prepare_lut_fallback(){
+    if(fallback_tasks)return;
+    // QK and PV stay bound to the main descriptor buffer. The fallback
+    // addresses only the scratch buffers owned by this graph.
+    std::vector<Task> exponent_commands;
+    ChainEnds chain_ends{};
+    const int cores=__builtin_popcount(core_mask(cfg));
+    for(int core=0,first=0;core<cores;++core){
+        const int heads=cfg.kv_heads/cores+(core<cfg.kv_heads%cores);
+        const auto begin=exponent_commands.size();
+        emit_lut_tasks(*this,first,heads,[&](Task t,int,int){exponent_commands.push_back(std::move(t));});
+        stage_start[1][core]=begin;
+        stage_count[1][core]=exponent_commands.size()-begin;
+        chain_ends[core]=exponent_commands.size();
+        first+=heads;
+    }
+    write_commands(domain,exponent_commands,chain_ends,fallback_regs,fallback_descriptors);
+    fallback_regs.sync(RK_NPU_SYNC_TO_DEVICE);
+    fallback_tasks=exponent_commands.size();
+}
 double Graph::submit(int stage){
-    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.graph_submit", "stage", stage,
-        "query_rows", rows, "physical_M", m, "compute_length", span, "tasks", tasks,
-        "npu_mask", core_mask(cfg));
+    const bool fallback=stream_scores && stage==1;
     rknpu_submit s{};s.flags=lut && stage!=0?(stage==2?RKNPU_JOB_PC:lut_flags):RKNPU_JOB_PC|RKNPU_JOB_PINGPONG;s.timeout=cfg.timeout_ms?cfg.timeout_ms:2000;
-    s.task_number=tasks;s.task_obj_addr=descriptors.mem.obj_addr;s.iommu_domain_id=domain->id;s.core_mask=core_mask(cfg);s.fence_fd=-1;
+    s.task_number=fallback?fallback_tasks:tasks;
+    s.task_obj_addr=(fallback?fallback_descriptors:descriptors).mem.obj_addr;
+    s.iommu_domain_id=domain->id;s.core_mask=core_mask(cfg);s.fence_fd=-1;
     // Match the existing board-validated driver ABI: dual uses slots 0/1,
     // triple uses 2/3/4, single uses the physical core's slot.
     const int cores=__builtin_popcount(s.core_mask);int logical=0;
+    [[maybe_unused]] uint32_t submitted_tasks=0;
     for(int physical=0;physical<3;++physical)if(s.core_mask&(1u<<physical)){
         const int slot=cores==3?physical+2:cores==2?logical:physical;
         s.subcore_task[slot]=cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX?
             rknpu_subcore_task{stage_start[stage][logical],stage_count[stage][logical]}:
             rknpu_subcore_task{task_start[logical],task_count[logical]};++logical;
+        submitted_tasks+=s.subcore_task[slot].task_number;
     }
+    RK_NPU_TRACE_EVENT("rknpu.detail", "attention.graph_submit", "stage", stage,
+        "query_rows", rows, "physical_M", m, "compute_length", span, "tasks", submitted_tasks,
+        "npu_mask", s.core_mask);
     if(ioctl(domain->ctx->fd,IOCTL_SUBMIT,&s)<0)throw Error{RK_NPU_ERR_SUBMIT};
     return s.hw_elapse_time/1000.;
 }
@@ -371,27 +431,120 @@ void Graph::sync_scores(rk_npu_sync_dir direction){
         score.range(0,size_t(cfg.kv_heads)*m*span*2,direction);
     }
 }
-void Graph::process_scores(int start,const rk_npu_attention_f16_boolean_mask* mask,int length){
+#ifdef ATTENTION_NEON
+// A full M128 group has four sets of 32 query rows. Every key through
+// 'start' is visible to all of them. Only the last diagonal needs lane masks.
+static bool center_causal_m128(Graph& g, int start) {
+    constexpr int group_rows = 128;
+    const int common = (start + 1) / 8;
+    const int visible = (start + g.rows + 7) / 8;
+    const int groups = g.span / 8;
+    const auto key_lanes = (int16x8_t){0,1,2,3,4,5,6,7};
+    const auto lower = vdupq_n_f16(-16);
+    const auto magnitude = vdupq_n_u16(0x7fff);
+    const auto& table = cpu_exp_curve();
+    auto lookup = [&](float16x8_t score, float16x8_t maximum) {
+        uint16x8_t idx = vandq_u16(vreinterpretq_u16_f16(vmaxq_f16(vsubq_f16(score, maximum), lower)), magnitude);
+        uint16_t offsets[8], probabilities[8];
+        vst1q_u16(offsets, idx);
+        for (int lane = 0; lane < 8; ++lane) probabilities[lane] = table[offsets[lane]];
+        return vld1q_u16(probabilities);
+    };
+    int fallback = 0;
+#pragma omp parallel for num_threads(4) schedule(static) reduction(|:fallback)
+    for (int hi = 0; hi < g.cfg.kv_heads; ++hi) {
+        const uint16_t* head = g.score.data() + size_t(hi) * group_rows * g.span;
+        uint16_t* dest = g.exponent->data() + size_t(hi)*group_rows*g.span;
+        std::fill_n(g.active.data() + size_t(hi) * group_rows, group_rows, uint8_t(1));
+        float16x8_t maxima[group_rows];
+        for (auto& mx : maxima) mx = vdupq_n_f16(-INFINITY);
+        for (int k = 0; k < common; ++k) {
+            const uint16_t* p = head + size_t(k) * group_rows * 8;
+            for (int r = 0; r < group_rows; ++r)
+                maxima[r] = vmaxq_f16(maxima[r], vreinterpretq_f16_u16(vld1q_u16(p + r * 8)));
+        }
+        for (int k = common; k < visible; ++k) {
+            const uint16_t* p = head + size_t(k) * group_rows * 8;
+            for (int r = 0; r < group_rows; ++r) {
+                int delta = start + r % 32 + 1 - k*8;
+                auto valid = vcltq_s16(key_lanes, vdupq_n_s16(delta));
+                auto x = vreinterpretq_f16_u16(vld1q_u16(p+r*8));
+                maxima[r] = vmaxq_f16(maxima[r], vbslq_f16(valid, x, vdupq_n_f16(-INFINITY)));
+            }
+        }
+        float16x8_t max_abs = vdupq_n_f16(0);
+        for (auto& mx : maxima) {
+            mx = vdupq_n_f16(vmaxvq_f16(mx));
+            max_abs = vmaxq_f16(max_abs, vabsq_f16(mx));
+        }
+        // QK may overflow FP16 even when the operands are finite. Leave the
+        // scores intact so the existing DPU path can process the whole block.
+        if (!(vgetq_lane_f16(max_abs, 0) <= 65504.f)) {
+            fallback = 1;
+            continue;
+        }
+        for (int k = 0; k < common; ++k) {
+            const uint16_t* p = head + size_t(k)*group_rows*8;
+            for (int r = 0; r < group_rows; ++r) {
+                auto x = vreinterpretq_f16_u16(vld1q_u16(p+r*8));
+                vst1q_u16(dest+(size_t(k)*group_rows+r)*8, lookup(x,maxima[r]));
+            }
+        }
+        for (int k = common; k < visible; ++k) {
+            const uint16_t* p = head + size_t(k)*group_rows*8;
+            for (int r = 0; r < group_rows; ++r) {
+                int delta = start + r % 32 + 1 - k*8;
+                auto valid = vcltq_s16(key_lanes, vdupq_n_s16(delta));
+                auto x = vreinterpretq_f16_u16(vld1q_u16(p+r*8));
+                // Hidden scores may exceed the true max by more than 16.
+                x = vbslq_f16(valid, x, maxima[r]);
+                vst1q_u16(dest+(size_t(k)*group_rows+r)*8, vandq_u16(valid, lookup(x,maxima[r])));
+            }
+        }
+        for (int k = visible; k < groups; ++k)
+            std::fill_n(dest+size_t(k)*group_rows*8, group_rows*8, uint16_t(0));
+        // Each producing CPU must drain its WC stores before PV can start.
+        asm volatile("dsb sy" ::: "memory");
+    }
+    return fallback == 0;
+}
+#endif
+int Graph::process_scores(int start,const rk_npu_attention_f16_boolean_mask* mask,int length){
+#ifdef ATTENTION_NEON
+    cpu_probabilities_ready=false;
+    if(stream_scores && !mask && start+rows<=length && start+rows<=span){
+        RK_NPU_TRACE_EVENT("rknpu.detail", "attention.center_scores", "compute_length", span);
+        cpu_probabilities_ready=center_causal_m128(*this,start);
+        if(cpu_probabilities_ready)return tasks;
+    }
+#endif
+    if(stream_scores)prepare_lut_fallback();
     stable_softmax(start,mask,length);sync_scores(RK_NPU_SYNC_TO_DEVICE);
+    return tasks+fallback_tasks;
 }
 double Graph::submit_pv(int start){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.pv_submit");
     if(lut && cfg.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL){
-        double hardware=submit(1);mask_start=start;
+        mask_start=start;
+        if(cpu_probabilities_ready)return submit(2);
+        const double hardware=submit(1);
         // Masked LUT scores still emit a positive carrier. Remove future
         // carriers before FP16 PV so they cannot change its rounding.
         const int first=(start+1)/8*8;
         const size_t bytes=size_t(span-first)*m*2;
         for(int hi=0;hi<cfg.kv_heads;++hi){
             const size_t offset=(size_t(hi)*span+first)*m*2;
-            exponent.range(offset,bytes,RK_NPU_SYNC_FROM_DEVICE);
+            if(!stream_scores)exponent->range(offset,bytes,RK_NPU_SYNC_FROM_DEVICE);
             for(int r=0;r<shape.heads(cfg,hi)*rows;++r){
                 const int end=start+r%rows+1;
                 for(int j=end;j<span;++j)
-                    exponent.data()[size_t(hi)*span*m+(size_t(j/8)*m+r)*8+j%8]=0;
+                    exponent->data()[size_t(hi)*span*m+(size_t(j/8)*m+r)*8+j%8]=0;
             }
-            exponent.range(offset,bytes);
+            if(!stream_scores)exponent->range(offset,bytes);
         }
+#ifdef ATTENTION_NEON
+        if(stream_scores)asm volatile("dsb sy" ::: "memory");
+#endif
         return hardware+submit(2);
     }
     double hardware=lut && lut_split?submit(2):0;
@@ -709,26 +862,28 @@ void Graph::center_scores(int start,const rk_npu_attention_f16_boolean_mask* mas
 }
 void Graph::finish(void* output,int tensor_rows,int tensor_offset,bool half_output){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.output_finish", "query_rows", rows);
-    const size_t stride=size_t(shape.value_dim+32)*m,count=sum.size();
+    const size_t stride=size_t(shape.value_dim+32)*m,count=size_t(m)*(shape.value_dim+8);
     const int output_stride=tensor_rows?tensor_rows:rows;
     const bool causal_lut=lut && cfg.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL;
-    for(int hi=0;hi<cfg.kv_heads;++hi){
+    auto finish_head=[&](int hi,int worker){
+        float* sums=sum.data()+size_t(worker)*count;
+        float* prefix_scratch=causal_lut?softmax_scratch.data()+size_t(worker)*rows*shape.value_dim:nullptr;
         for(int block=0;block<blocks;++block){
             const auto* src=partial.data()+size_t(hi*blocks+block)*stride;
 #ifdef ATTENTION_NEON
             for(size_t i=0;i<count;i+=8){
                 auto x=vreinterpretq_f16_u16(vld1q_u16(src+i));auto lo=vcvt_f32_f16(vget_low_f16(x)),high=vcvt_f32_f16(vget_high_f16(x));
-                if(block){lo=vaddq_f32(lo,vld1q_f32(sum.data()+i));high=vaddq_f32(high,vld1q_f32(sum.data()+i+4));}
-                vst1q_f32(sum.data()+i,lo);vst1q_f32(sum.data()+i+4,high);
+                if(block){lo=vaddq_f32(lo,vld1q_f32(sums+i));high=vaddq_f32(high,vld1q_f32(sums+i+4));}
+                vst1q_f32(sums+i,lo);vst1q_f32(sums+i+4,high);
             }
 #else
-            for(size_t i=0;i<count;++i)sum[i]=(block?sum[i]:0)+widen(src[i]);
+            for(size_t i=0;i<count;++i)sums[i]=(block?sums[i]:0)+widen(src[i]);
 #endif
         }
         if(causal_lut){
             const int h=shape.shared_kv?0:hi,d=shape.value_dim,first=mask_start/32*32;
             const auto* prefix=bound->value_prefix.data()+(size_t(mask_start/32)*bound->h()+h)*d;
-            std::copy_n(prefix,d,softmax_scratch.data());
+            std::copy_n(prefix,d,prefix_scratch);
             auto add=[&](float* dst,int pos){
                 const int inner=pos%cfg.kv_tile;
                 const auto* v=bound->value.data()+bound->voffset(h,pos/cfg.kv_tile);
@@ -743,21 +898,21 @@ void Graph::finish(void* output,int tensor_rows,int tensor_offset,bool half_outp
             };
             // A checkpoint leaves at most 31 old tokens. Continue the exact
             // FP32 token order used by Cache::add_value_sum; no subtract-back.
-            for(int pos=first;pos<=mask_start;++pos)add(softmax_scratch.data(),pos);
+            for(int pos=first;pos<=mask_start;++pos)add(prefix_scratch,pos);
             for(int row=1;row<rows;++row){
-                auto* dst=softmax_scratch.data()+size_t(row)*d;
+                auto* dst=prefix_scratch+size_t(row)*d;
                 std::copy_n(dst-d,d,dst);add(dst,mask_start+row);
             }
         }
         for(int r=0;r<shape.heads(cfg,hi)*rows;++r){
             constexpr float delta=1.f/2048;
             const int length=causal_lut?mask_start+r%rows+1:std::min(span,bound->length);
-            const float z=sum[size_t(shape.value_dim/8)*m*8+r*8]-(lut?delta*length:0);
+            const float z=sums[size_t(shape.value_dim/8)*m*8+r*8]-(lut?delta*length:0);
             const float inverse=z==0 || (lut && !active[size_t(hi)*m+r])?0:1.f/z;
-            const float* correction=causal_lut?softmax_scratch.data()+size_t(r%rows)*shape.value_dim:
+            const float* correction=causal_lut?prefix_scratch+size_t(r%rows)*shape.value_dim:
                 lut?bound->value_sum(shape.shared_kv?0:hi,span):nullptr;
             for(int cb=0;cb<shape.value_dim/8;++cb){
-                const auto* src=sum.data()+size_t(cb)*m*8+r*8;
+                const auto* src=sums+size_t(cb)*m*8+r*8;
                 const size_t target=((size_t(shape.first_head(cfg,hi))+r/rows)*output_stride+tensor_offset+r%rows)*shape.value_dim+cb*8;
 #ifdef ATTENTION_NEON
                 auto lo=vld1q_f32(src),high=vld1q_f32(src+4);
@@ -774,6 +929,12 @@ void Graph::finish(void* output,int tensor_rows,int tensor_offset,bool half_outp
 #endif
             }
         }
+    };
+    if(stream_scores){
+#pragma omp parallel for num_threads(4) schedule(static)
+        for(int hi=0;hi<cfg.kv_heads;++hi)finish_head(hi,omp_get_thread_num());
+    }else{
+        for(int hi=0;hi<cfg.kv_heads;++hi)finish_head(hi,0);
     }
 }
 void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t,int query_end,Tail* scratch){
@@ -849,7 +1010,7 @@ rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,i
         }
         if(stable){
             graph->sync_scores(RK_NPU_SYNC_FROM_DEVICE);
-            graph->process_scores(start,mask,cache.length);
+            t.tasks=graph->process_scores(start,mask,cache.length);
             t.hardware_us+=graph->submit_pv(start);
         }
     }catch(...){poisoned=true;throw;}

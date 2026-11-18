@@ -87,7 +87,7 @@ class Pipeline {
         auto view=mask?*mask:rk_npu_attention_f16_boolean_mask{};
         if(mask && view.query_rows!=1)view.query_offset+=slot.first;
         const auto begin=Clock::now();
-        slot.work->graph->process_scores(slot.start,mask?&view:nullptr,cache.length);
+        slot.timings.tasks=slot.work->graph->process_scores(slot.start,mask?&view:nullptr,cache.length);
         slot.timings.submit_us+=elapsed(begin,Clock::now());
     }
     void finish(Slot& slot,void* output,int rows,bool half,rk_npu_attention_f16_timings& total){

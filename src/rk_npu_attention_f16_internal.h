@@ -188,9 +188,13 @@ struct Graph {
     int rows,m,span,blocks,full,tail_length,tasks=0,matmul_tasks=0;
     uint32_t task_start[3]{},task_count[3]{}; // Logical selected-core order.
     uint32_t stage_start[3][3]{},stage_count[3][3]{};
-    Buffer q,score,mask,partial,regs,descriptors,exponent;
+    Buffer q,score,mask,partial,regs,descriptors;
+    Buffer cached_exponent,wc_exponent,fallback_regs,fallback_descriptors;
+    Buffer* exponent=nullptr;
+    int fallback_tasks=0;
     bool lut=false;
     bool lut_split=false;
+    bool stream_scores=false, cpu_probabilities_ready=false;
     uint32_t lut_flags=RKNPU_JOB_PC;
     std::vector<uint8_t> active;
     std::vector<float> sum;
@@ -213,8 +217,10 @@ struct Graph {
     void update_mask(int start,const rk_npu_attention_f16_boolean_mask* boolean,int length);
     void pack_q(const uint16_t* query,int tensor_rows=0,int tensor_offset=0);
     double submit(int stage=0);
+    void prepare_lut_fallback();
     void sync_scores(rk_npu_sync_dir direction);
-    void process_scores(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
+    // Returns the actual QK + exponent + PV task count for this block.
+    int process_scores(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);
     double submit_pv(int start);
     void sync_output();
     void stable_softmax(int start,const rk_npu_attention_f16_boolean_mask* mask,int length);

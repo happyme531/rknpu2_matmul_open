@@ -179,9 +179,11 @@ middle values fail before Down submits.
 ## Attention and KV cache
 
 GQA and MLA offer an explicit fixed-shift experimental softmax path and a
-stable row-max path. Stable mode defaults to NPU LUT exponential and PINGPONG
-execution between QK and PV. CPU FP32 code applies the row maximum and mask,
-then corrects the LUT bias and normalizes the output. PV magnitude and task
+stable row-max path. Stable mode uses the DPU exponential curve. AArch64 causal GQA prefill
+with four query heads per KV head and 32 query rows per segment evaluates that
+curve on the CPU and streams probabilities to PV. Other LUT segments use the
+NPU. The CPU applies the row maximum and mask, corrects the LUT bias and
+normalizes the output. PV magnitude and task
 limits select the CPU softmax fallback. Set `RK_NPU_ATTN_LUT_EXP=0` before cache
 creation to restore CPU softmax. See [Attention](docs/ATTENTION.md),
 [MLA](docs/MLA.md) and [environment settings](ENV.md) for numerical scope.

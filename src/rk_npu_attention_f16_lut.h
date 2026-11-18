@@ -3,6 +3,33 @@
 #include <cmath>
 namespace rknpu2_matmul_open::attention {
 using namespace detail;
+// The two DPU tables share the endpoint at -8 and use a positive carrier.
+inline int lut_exp_code(int bank, int entry) {
+    const double x=-16.+bank*8.+std::min(entry,510)*(8./510.);
+    return int(std::nearbyint(std::exp(x)*32640.))+16;
+}
+
+inline const std::array<uint16_t,0x4c01>& cpu_exp_curve() {
+    // Indices are FP16 magnitudes from zero through 16 (0x4c00).
+    static const auto curve=[]{
+        std::array<int,1022> codes{};
+        for(int i=0;i<=1020;++i){
+            const int bank=i>=510;
+            codes[i]=lut_exp_code(bank,i-510*bank);
+        }
+        codes.back()=codes[1020];
+        std::array<uint16_t,0x4c01> result{};
+        for(size_t bits=0;bits<result.size();++bits){
+            const int pos=32640-int(std::nearbyint(widen(uint16_t(bits))*2040.f));
+            const int i=pos/32, fraction=pos%32;
+            const int code=((32-fraction)*codes[i]+fraction*codes[i+1])/32;
+            result[bits]=half(float(code)/32768.f);
+        }
+        return result;
+    }();
+    return curve;
+}
+
 inline std::vector<uint64_t> lut_exp_regs(int count, uint64_t input, uint64_t output, bool load) {
     std::vector<uint64_t> v;
     v.reserve(load ? 1095 : 67);
@@ -14,14 +41,10 @@ inline std::vector<uint64_t> lut_exp_regs(int count, uint64_t input, uint64_t ou
     if (load) {
         static const std::vector<uint64_t> table = []{
             std::vector<uint64_t> words;words.reserve(1028);
-            constexpr int bias=16;
-            // Leave headroom for the carrier; the common gain cancels in finish().
-            constexpr double gain=255./256.;
             for(int table=0;table<2;++table){
                 words.push_back(E(T_DPU,0x4100,unsigned(2 | table) << 16));
                 for(int i=0;i<513;++i){
-                    const double x=-16.+table*8.+std::min(i,510)*(8./510.);
-                    const int value=std::clamp(int(std::nearbyint(std::exp(x)*(32768.*gain)))+bias,bias,32767);
+                    const int value=lut_exp_code(table,i);
                     words.push_back(E(T_DPU,0x4104,unsigned(value)));
                 }
             }

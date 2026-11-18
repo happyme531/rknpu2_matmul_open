@@ -40,6 +40,7 @@ extern "C" {
 #define RK_NPU_MEM_NON_CONTIGUOUS  0x1   /* page-backed allocation mapped by the IOMMU */
 #define RK_NPU_MEM_NON_CACHEABLE   0x0   /* uncached CPU mapping; no cache maintenance needed */
 #define RK_NPU_MEM_CACHEABLE       0x2   /* cached CPU mapping; call rk_npu_mem_sync around NPU use */
+#define RK_NPU_MEM_WRITE_COMBINE   0x4   /* streaming CPU writes to device-visible memory */
 #define RK_NPU_MEM_KERNEL_MAPPING  0x8   /* required for the task buffer                        */
 #define RK_NPU_MEM_IOMMU           0x10  /* explicitly request IOMMU-visible storage           */
 #define RK_NPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT 0x400 /* page-align IOVA instead of allocation-size alignment */

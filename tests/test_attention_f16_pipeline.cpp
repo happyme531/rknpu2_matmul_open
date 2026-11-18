@@ -16,12 +16,17 @@ namespace {
 // driver, or pause a submit before issuing it. No failing NPU task is created.
 std::atomic<unsigned long> failure_request{0};
 std::atomic<int> failure_at{0},request_count{0};
+std::atomic<bool> reject_wc{false};
 std::mutex pause_mutex;
 std::condition_variable pause_cv;
 bool pause_submit=false,submit_entered=false,release_submit=false;
 }
 extern "C" int ioctl(int fd,unsigned long request,...)noexcept{
     va_list args;va_start(args,request);void* argument=va_arg(args,void*);va_end(args);
+    if(request==IOCTL_MEM_CREATE && reject_wc.load() &&
+        (static_cast<const rknpu_mem_create*>(argument)->flags & RK_NPU_MEM_WRITE_COMBINE)){
+        errno=EINVAL;return -1;
+    }
     if(request==failure_request.load() && request_count.fetch_add(1)+1==failure_at.load()){
         errno=EIO;return -1;
     }
@@ -130,11 +135,87 @@ void compare_case(mla_test::Device& dev,Fixture& f,bool expect_pipeline=true){
     check(rk_npu_attention_f16_cache_reserve(dev.ctx,c.get(),f.cfg.max_capacity));
     same(f.run(dev,serial.get(),c.get()),f.run(dev,pipeline.get(),c.get()));
 }
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+// Feed native QK output directly so the exceptional encodings reach the CPU
+// independently of how a particular MAC revision saturates its FP16 output.
+void streamed_scores(mla_test::Device& dev,int kv_heads,uint32_t core_mask){
+    Fixture f(256,32,3,4*kv_heads,kv_heads,64);
+    f.cfg.kv_tile=256;f.cfg.core_mask=core_mask;
+    Env lut("RK_NPU_ATTN_LUT_EXP");setenv(lut.key,"1",1);
+    auto c=cache(dev,f.cfg);f.load(dev,c.get(),f.v);
+    Env mode("RK_NPU_ATTN_LUT_SUBMIT");setenv(mode.key,"pingpong",1);
+    const auto shape=att::gqa_shape(f.cfg);
+    att::Graph fast(dev.domain,f.cfg,32,f.length,*c,shape);
+    require(fast.stream_scores && fast.tasks==fast.matmul_tasks,"streaming geometry must use only QK and PV");
+    require(!fast.fallback_descriptors.mem.handle,"fallback commands should be unallocated");
+    // Explicit PC mode runs the device exponent on the same geometry.
+    setenv(mode.key,"pc",1);
+    att::Graph reference(dev.domain,f.cfg,32,f.length,*c,shape);
+    require(reference.lut && !reference.stream_scores,"DPU reference geometry");
+    const size_t n=size_t(f.cfg.kv_heads)*fast.m*fast.span;
+    auto scores=mla_test::random_data(n,53,7.f);
+    scores[7]=0x7e00; // hidden in row zero
+    uint32_t fallback_handle=0;
+    for(uint16_t first : {0x4100,0x7c00,0x7e00,0x4100}){
+        scores[0]=first;
+        for(auto* g:{&reference,&fast}){
+            std::copy(scores.begin(),scores.end(),g->score.data());
+            const int executed=g->process_scores(f.start,nullptr,f.length);
+            require(executed==(first==0x4100 && g==&fast?fast.matmul_tasks:reference.tasks),
+                "executed task count");
+            g->submit_pv(f.start);
+        }
+        require(fast.cpu_probabilities_ready==(first==0x4100),"exceptional row must use DPU");
+        const auto handle=fast.fallback_descriptors.mem.handle;
+        if(first==0x7c00){require(handle!=0,"fallback must create commands");fallback_handle=handle;}
+        require(handle==fallback_handle,"fallback commands must be allocated only on first use");
+        reference.exponent->range(0,n*2,RK_NPU_SYNC_FROM_DEVICE);
+        require(!std::memcmp(reference.exponent->data(),fast.exponent->data(),n*2),"CPU/DPU exponent mismatch");
+        require(reference.active==fast.active,"CPU/DPU active row mismatch");
+    }
+    std::printf("PASS native causal probabilities, nonfinite fallback and graph reuse core_mask=%u\n",core_mask);
+}
+void streamed_buffers(mla_test::Device& dev){
+    Env lut("RK_NPU_ATTN_LUT_EXP");setenv(lut.key,"1",1);
+    Env mode("RK_NPU_ATTN_LUT_SUBMIT");setenv(mode.key,"pingpong",1);
+    Fixture f(512,65,0);
+    auto c=cache(dev,f.cfg);f.load(dev,c.get(),f.v);
+    auto pipeline=work(dev,f.cfg,true);
+    const auto expected=f.run(dev,pipeline.get(),c.get());
+    require(pipeline->graph->cached_exponent.mem.handle && pipeline->graph->wc_exponent.mem.handle,
+        "full and tail segments must retain both mappings");
+    request_count=0;failure_at=0;failure_request=IOCTL_MEM_CREATE;
+    const auto repeated=f.run(dev,pipeline.get(),c.get());
+    failure_request=0;
+    require(request_count.load()==0,"warm mixed geometry must reuse allocations");
+    same(expected,repeated);
+
+    auto fallback=work(dev,f.cfg,true);
+    reject_wc=true;
+    const auto actual=f.run(dev,fallback.get(),c.get());
+    reject_wc=false;
+    require(!fallback->graph->wc_exponent.mem.handle && !fallback->poisoned,
+        "WC refusal must preserve the cached DPU path");
+    same(expected,actual);
+    same(expected,f.run(dev,fallback.get(),c.get()));
+    std::puts("PASS streaming exponent buffer reuse and WC allocation fallback");
+}
+#endif
 void failures(mla_test::Device& dev){
     Fixture f(4096,128,3968);auto c=cache(dev,f.cfg);f.load(dev,c.get(),f.v);
     auto serial=work(dev,f.cfg,false);const auto expected=f.run(dev,serial.get(),c.get());
-    for(auto spec:{std::make_pair(IOCTL_SUBMIT,1),{IOCTL_SUBMIT,3},{IOCTL_SUBMIT,6},
-                   {IOCTL_SUBMIT,10},{IOCTL_MEM_SYNC,2},{IOCTL_MEM_SYNC,4}}){
+    std::vector<std::pair<unsigned long,int>> cases;
+    for(auto operation : {IOCTL_SUBMIT, IOCTL_MEM_SYNC}) {
+        auto probe=work(dev,f.cfg,true);
+        check(rk_npu_attention_f16_prepare_query(dev.ctx,probe.get(),c.get(),f.rows,f.start));
+        request_count=0;failure_at=0;failure_request=operation;
+        auto got=f.run(dev,probe.get(),c.get());
+        failure_request=0;const int observed=request_count.load();
+        require(observed>0,"operation missing");same(expected,got);
+        if(operation==IOCTL_SUBMIT)for(int i=1;i<=observed;++i)cases.emplace_back(operation,i);
+        else for(int i : {2,4,observed})cases.emplace_back(operation,i);
+    }
+    for(auto spec:cases){
         auto w=work(dev,f.cfg,true);
         check(rk_npu_attention_f16_prepare_query(dev.ctx,w.get(),c.get(),f.rows,f.start));
         request_count=0;failure_at=spec.second;failure_request=spec.first;
@@ -237,6 +318,12 @@ void board(){
     {Fixture f(1024,128,0,16,16,64);f.cfg.mask_mode=RK_NPU_ATTENTION_F16_NO_MASK;compare_case(dev,f);}
     {Fixture f(4096,1,4095);compare_case(dev,f,false);}
     {Fixture f(4096,4,4092);compare_case(dev,f,false);}
+#if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    streamed_scores(dev,1,1);streamed_scores(dev,2,3);streamed_scores(dev,4,7);
+    streamed_buffers(dev);
+#else
+    std::puts("SKIP streaming probabilities and buffer reuse: FP16 NEON unavailable");
+#endif
     mutations(dev);boolean(dev);failures(dev);busy(dev);
     std::puts("Attention pipeline board contract PASS");
 }

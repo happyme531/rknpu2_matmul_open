@@ -26,7 +26,8 @@ uint32_t reg(const Graph& graph,const rknpu_task& task,uint16_t target,uint16_t 
         if(uint16_t(words[i]>>48)==target && uint16_t(words[i])==address)return uint32_t(words[i]>>16);
     throw std::runtime_error("missing LUT register");
 }
-void lut_geometry(rk_npu_iommu_domain& domain){
+void lut_geometry(rk_npu_iommu_domain& domain,const char* mode){
+    setenv("RK_NPU_ATTN_LUT_SUBMIT",mode,1);
     rk_npu_attention_f16_config cfg;rk_npu_attention_f16_config_init(&cfg);
     cfg.initial_capacity=cfg.max_capacity=4096;cfg.query_heads=4;cfg.kv_heads=1;
     cfg.flags=RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;
@@ -103,7 +104,7 @@ int main(){
             Graph grown(&domain,cfg,8,64,cache,gqa_shape(cfg),&graph);
             active=&grown;grown.submit();active=nullptr;
         }
-        lut_geometry(domain);
+        for(const char* mode:{"pc","split"})lut_geometry(domain,mode);
         require(memory.empty() && submits==4,"mock memory leaked or missing submits");
         std::puts("PASS: page-backed CPU-safe commands, initial flush, rebind flush, graph reuse");
         std::puts("PASS: flat/2D LUT command geometry, task counts and score coverage");
