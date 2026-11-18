@@ -10,9 +10,11 @@ struct I4WeightBound {
     uint64_t safe_tiles = 0; // bit (kt/32-1): this exact fixed partition is certified
 };
 /* requested=0 selects the largest safe fixed 32-aligned partition <=2048.
- * Positive requested checks that partition. All codes are validated. Bounds
+ * Positive requested checks that partition and an optional smaller fallback,
+ * selecting the largest certified candidate. All codes are validated. Bounds
  * hold for every possible signed INT4 A, not just sampled activations.
  * Fixed-partition safety is not monotonic in k_tile; search all candidates. */
-int bound_i4_weights(int K, int N, const int8_t *B, int requested, I4WeightBound &out);
+int bound_i4_weights(int K, int N, const int8_t *B, int requested, I4WeightBound &out,
+                     int fallback = 0);
 } // namespace rknpu2_matmul_open::detail
 #endif

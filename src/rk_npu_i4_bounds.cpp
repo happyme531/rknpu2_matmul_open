@@ -6,16 +6,18 @@
 #include <vector>
 
 namespace rknpu2_matmul_open::detail {
-int bound_i4_weights(int K, int N, const int8_t *B, int requested, I4WeightBound &out) {
+int bound_i4_weights(int K, int N, const int8_t *B, int requested, I4WeightBound &out,
+                     int fallback) {
     if (!B || K < 1 || K > INT32_MAX / 64 || N < 1 || N > INT_MAX - 63 || requested < 0 ||
-        requested > I4_K_TILE_MAX || requested % 32)
+        requested > I4_K_TILE_MAX || requested % 32 ||
+        fallback < 0 || fallback % 32 || (fallback && fallback >= requested))
         return RK_NPU_ERR_PARAM;
     const int blocks = (K + 31) / 32;
     const int limit = requested ? requested / 32 : std::min(I4_K_TILE_MAX / 32, blocks);
     std::array<bool, I4_K_TILE_MAX / 32 + 1> safe{};
     std::array<int64_t, I4_K_TILE_MAX / 32 + 1> max_pos{}, max_neg{};
     for (int t = 1; t <= limit; ++t)
-        safe[t] = !requested || t == limit;
+        safe[t] = !requested || t == limit || t * 32 == fallback;
     // Use column slabs to avoid retaining a full K*N prefix tensor.
     constexpr int slab = 128;
     for (int n0 = 0; n0 < N;) {

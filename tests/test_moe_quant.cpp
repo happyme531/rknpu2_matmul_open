@@ -188,6 +188,8 @@ int main() try {
     for(int e=0;e<E;++e) {
         gate[e].resize(H*2*F);down[e].resize(F*H);gs[e].resize(2*F);ds[e].resize(H);
         for(size_t i=0;i<gate[e].size();++i)gate[e][i]=int8_t(int((i*7+i/23+e*5)%15)-7);
+        // Expert zero also fits full K in the resident mixed bank.
+        if(e==0)for(auto& code:gate[e])code/=4;
         for(size_t i=0;i<down[e].size();++i)down[e][i]=int8_t(int((i*3+i/11+e*7)%15)-7);
         for(int i=0;i<2*F;++i)gs[e][i]=.001f*float(i%13+1);
         for(int i=0;i<H;++i)ds[e][i]=.001f*float(i%7+1);
@@ -292,24 +294,42 @@ int main() try {
             for(int e=0;e<E;++e) {
                 const int slot=(e+rotation)%E;
                 require(!rk_npu_moe_quant_export_expert(weights,e,blob.data(),blob.size()),"export all-W4 routed record");
+                require(!rk_npu_moe_quant_export_expert(mixed,e,roundtrip.data(),roundtrip.size()),"export resident mixed record");
+                require(blob==roundtrip,"resident gate packing changed the K512 record");
                 require(!rk_npu_moe_quant_import_expert(mixed_slots,slot,blob.data(),blob.size()),"import mixed routed record");
                 require(!rk_npu_moe_quant_export_expert(mixed_slots,slot,roundtrip.data(),roundtrip.size()),"export mixed routed record");
                 require(blob==roundtrip,"mixed routed byte roundtrip");
             }
             std::vector<float> input(rows*H),actual(rows*H),expected(rows*H),routes(rows*K);
             std::vector<int32_t> ids(rows*K),physical(rows*K);
+            uint64_t routed=0,sliced=0;
             for(size_t i=0;i<input.size();++i)input[i]=std::sin(float(i%97)*.13f)*.3f;
             for(int r=0;r<rows;++r)for(int k=0;k<K;++k) {
                 // Include duplicate routes and non-unit sums; shared stays coefficient 1.
                 ids[r*K+k]=(r+(r%2?k:0))%E;
                 physical[r*K+k]=(ids[r*K+k]+rotation)%E;
                 routes[r*K+k]=(r%3==2 || (r%3==1 && k))?0.f:k?.375f:.875f;
+                if(routes[r*K+k]!=0.f) {
+                    ++routed;
+                    if(ids[r*K+k]!=0)++sliced;
+                }
             }
-            const int rc=rk_npu_moe_w8_run_f32(mixed_work,mixed,rows,input.data(),ids.data(),routes.data(),expected.data(),nullptr);
+            const uint64_t assignments=rows+routed; // Shared contributes one assignment per row.
+            const uint64_t io_bytes=uint64_t(2*rows+(rows==1))*H+assignments*(F+H*4);
+            const auto expected_sync=[&](uint64_t split) {
+                return io_bytes+(assignments+(H/512-1)*split)*2*F*4;
+            };
+            rk_npu_moe_w8_timings resident_timing{},slot_timing{};
+            auto bytes_before=sync_bytes.load();
+            const int rc=rk_npu_moe_w8_run_f32(mixed_work,mixed,rows,input.data(),ids.data(),routes.data(),expected.data(),&resident_timing);
             if(rc)std::fprintf(stderr,"mixed resident cores=%d rows=%d rc=%d\n",cores,rows,rc);
             require(!rc,"run independently packed mixed weights");
-            require(!rk_npu_moe_w8_run_f32(mixed_work,mixed_slots,rows,input.data(),physical.data(),routes.data(),actual.data(),nullptr),"run mixed slots");
+            require(sync_bytes-bytes_before==expected_sync(sliced),"resident mixed gate synced inactive partials");
+            bytes_before=sync_bytes.load();
+            require(!rk_npu_moe_w8_run_f32(mixed_work,mixed_slots,rows,input.data(),physical.data(),routes.data(),actual.data(),&slot_timing),"run mixed slots");
+            require(sync_bytes-bytes_before==expected_sync(routed),"mixed slot gate synced inactive partials");
             require(actual==expected,"mixed slot replacement changed routed/shared output");
+            if(rows==1)require(slot_timing.gemm_tasks==resident_timing.gemm_tasks+3,"expert zero needs one resident gate task or four K512 slot tasks");
             require(std::all_of(actual.begin(),actual.end(),[](float v){return std::isfinite(v);}),"nonfinite mixed zero-route output");
             if(rows>2)require(std::any_of(actual.begin()+2*H,actual.begin()+3*H,[](float v){return v!=0.f;}),"zero routed weights incorrectly skipped shared expert");
             for(int row:{0,rows/2,rows-1}) {

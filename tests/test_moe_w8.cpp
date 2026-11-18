@@ -65,6 +65,8 @@ int main(int argc,char** argv) try {
         auto& x=(variant?b:a)[e];x.g.resize(size_t(H)*2*N);x.d.resize(size_t(N)*H);
         x.gs.assign(2*N,.0625f);x.ds.assign(H,.015625f);
         for(size_t i=0;i<x.g.size();++i)x.g[i]=int8_t(int((i*17+i/19+e*11+variant*3)%7)-3);
+        // This column overflows a single INT16 partial but fits K512 + K64.
+        if(split && e==1)for(int k=1;k<H;++k)x.g[size_t(k)*2*N]=-8;
         for(size_t i=0;i<x.d.size();++i)x.d[i]=int8_t(int((i*13+i/7+e*5+variant*2)%7)-3);
         (variant?bv:av)[e]={x.g.data(),x.gs.data(),x.d.data(),x.ds.data()};
     }

@@ -385,6 +385,7 @@ struct Weights {
     Buffer gate,down,coeff;
     std::vector<std::shared_ptr<Buffer>> gate_owner,down_owner;
     std::vector<rk_npu_mem> gw,dw;
+    std::vector<int> gate_tiles;
     std::vector<std::vector<float>> gs,ds;
     bool lut_scales=true;
     Mode mode;
@@ -396,8 +397,9 @@ struct Weights {
         const int H=c.hidden,N=c.intermediate,count=c.routed_experts+c.shared_expert;
         std::vector<std::shared_ptr<Buffer>> gate_banks,down_banks;
         const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,c);
-        const int gate_k_tile=gate_tile(mode,H);
         const int w4_count=w4?c.routed_experts+(mode==Mode::W4?c.shared_expert:0):0;
+        gate_tiles.assign(count,H);
+        std::fill_n(gate_tiles.begin(),w4_count,gate_tile(mode,H));
         uint32_t bank_flags=RK_NPU_MEM_DATA_DEFAULT;
         if(device.ctx->iommu_enabled && device.ctx->driver_version>=908)
             bank_flags|=RK_NPU_MEM_IOMMU_LIMIT_IOVA_ALIGNMENT;
@@ -449,7 +451,12 @@ struct Weights {
                 if(!(s>0) || !std::isfinite(s))throw Failure{RK_NPU_ERR_PARAM};
             if(i4) {
                 rknpu2_matmul_open::detail::I4WeightBound bound;
-                check(rknpu2_matmul_open::detail::bound_i4_weights(H,2*N,x.gate_up,gate_k_tile,bound));
+                auto& gate_k_tile=gate_tiles[e];
+                const bool try_full=mode==Mode::RoutedW4SharedW8 && H>gate_k_tile &&
+                    H<=rknpu2_matmul_open::detail::I4_K_TILE_MAX;
+                check(rknpu2_matmul_open::detail::bound_i4_weights(H,2*N,x.gate_up,
+                    try_full?H:gate_k_tile,bound,try_full?gate_k_tile:0));
+                gate_k_tile=bound.k_tile;
                 gcor[e].assign(2*N,0);
                 for(int row=0;row<H;++row)for(int col=0;col<2*N;++col)
                     gcor[e][col]+=8*x.gate_up[size_t(row)*2*N+col];
@@ -493,6 +500,7 @@ struct Weights {
 struct Assignment {int token,slot;};
 struct Job {
     int expert,rows,offset,core;
+    int gate_waves=1;
     bool w4=false;
     rk_npu_matmul_i8_config gcfg{},dcfg{};
     rk_npu_mem ga{},gc{},da{},dc{};
@@ -509,7 +517,6 @@ struct Workspace {
     Commands gather_cmd,gate_cmd,down_cmd,middle_cmd,lut_cmd,gate4_cmd,down4_cmd;
     Buffer input4;
     Mode mode;
-    int gate_k_tile=0,gate_waves=1;
     size_t gate_wave_stride=0;
     std::vector<float> input_scales;
     std::vector<std::vector<Assignment>> groups;
@@ -523,8 +530,7 @@ struct Workspace {
     Workspace(rk_npu_iommu_domain* domain,const rk_npu_moe_w8_config& c,Mode recipe=Mode::W8):device(domain),config(c),mode(recipe) {
         const int H=c.weights.hidden,N=c.weights.intermediate;
         const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,c.weights);
-        gate_k_tile=gate_tile(mode,H);
-        gate_waves=(H+gate_k_tile-1)/gate_k_tile;
+        const int gate_waves=ceil_div(H,gate_tile(mode,H));
         const size_t max=size_t(c.max_rows)*(c.top_k+c.weights.shared_expert);
         gate_wave_stride=max*2*N*4;
         if(has_w8)input.alloc(device,size_t(c.max_rows)*H);
@@ -544,7 +550,7 @@ struct Workspace {
         input_scales.resize(c.max_rows);output_rows.resize(max);
         groups.resize(c.weights.routed_experts+c.weights.shared_expert);
         for(auto& g:groups)g.reserve(max);
-        ordered.reserve(max);jobs.reserve(max);
+        ordered.resize(max);jobs.reserve(max);
         if(c.middle==RK_NPU_MOE_MIDDLE_NPU_LUT) {
             middle_gate.alloc(device,max*N*4);middle_up.alloc(device,max*N*4);
             lut_input.alloc(device,32);lut_output.alloc(device,size_t(c.npu_cores)*32);
@@ -595,12 +601,30 @@ struct Workspace {
                 groups[ids[r*top+slot]].push_back({r,slot});
             if(config.weights.shared_expert)groups[R].push_back({r,top});
         }
-        jobs.clear();ordered.clear();const int tile=w4?64:(native?84:128);
-        for(int e=0;e<int(groups.size());++e)for(size_t first=0;first<groups[e].size();first+=tile) {
-            Job j{};j.expert=e;j.rows=int(std::min<size_t>(tile,groups[e].size()-first));j.offset=int(ordered.size());
-            ordered.insert(ordered.end(),groups[e].begin()+first,groups[e].begin()+first+j.rows);jobs.push_back(j);
+        jobs.clear();
+        const int tile=w4?64:(native?84:128);
+        // Sliced experts occupy the same contiguous prefix in every extra K wave.
+        size_t sliced_offset=0,single_offset=0,gate_tasks=0;
+        if(mode==Mode::RoutedW4SharedW8 && gate_tile(mode,H)<H)
+            for(int e=0;e<R;++e)
+                if(weights.gate_tiles[e]<H)single_offset+=groups[e].size();
+        for(int e=0;e<int(groups.size());++e) {
+            const auto& group=groups[e];
+            if(group.empty())continue;
+            const int waves=ceil_div(H,weights.gate_tiles[e]);
+            auto& offset=waves>1?sliced_offset:single_offset;
+            const bool i4=expert_is_w4(mode,e,R);
+            for(size_t first=0;first<group.size();first+=tile) {
+                Job j{};j.expert=e;j.rows=int(std::min<size_t>(tile,group.size()-first));j.offset=int(offset);
+                j.w4=i4;j.gate_waves=waves;
+                std::copy_n(group.begin()+first,j.rows,ordered.begin()+offset);
+                offset+=j.rows;
+                jobs.push_back(j);
+                if(i4)gate_tasks+=waves;
+            }
         }
-        const size_t assignments=ordered.size();
+        const size_t sliced_assignments=sliced_offset;
+        const size_t assignments=std::max(sliced_offset,single_offset);
         if(!assignments) {
             t.schedule_us=us(at);at=Clock::now();
             std::fill_n(output,size_t(rows)*H,0.f);
@@ -610,7 +634,6 @@ struct Workspace {
         std::stable_sort(jobs.begin(),jobs.end(),[](const Job& a,const Job& b){return a.rows>b.rows;});
         std::array<size_t,3> cost{};
         for(auto& j:jobs) {
-            j.w4=expert_is_w4(mode,j.expert,R);
             j.core=int(std::min_element(cost.begin(),cost.begin()+cores)-cost.begin());
             // Shared N slices use all cores; charging their whole row job
             // to one core would skew the remaining routed placement.
@@ -629,20 +652,21 @@ struct Workspace {
         std::vector<rknpu2_matmul_open::detail::I8GroupItem> gi,di,g4,d4,all;std::vector<std::vector<I8Copy>> copies(jobs.size());
         std::vector<MiddleItem> middle;middle.reserve(npu?size_t(rows)*slots*2:0);
         // Resize once before storing pointers in g4; retain the arena between calls.
-        if(w4)gate_items.resize(jobs.size()*gate_waves);
+        if(w4)gate_items.resize(gate_tasks);
         if(mixed_chain) {
             const size_t shared_tasks=size_t(ceil_div(rows,tile))*cores;
             shared_gate_items.resize(shared_tasks);
             shared_down_items.resize(shared_tasks);
         }
-        size_t shared_index=0;
+        size_t gate_index=0,shared_index=0;
         for(size_t index=0;index<jobs.size();++index) {
             auto& j=jobs[index];
             all.push_back({&j.gcfg,&j.ga,&weights.gw[j.expert],&j.gc,j.core});
             if(j.w4) {
-                for(int wave=0;wave<gate_waves;++wave) {
+                const int gate_k_tile=weights.gate_tiles[j.expert];
+                for(int wave=0;wave<j.gate_waves;++wave) {
                     const int first=wave*gate_k_tile,width=std::min(gate_k_tile,H-first);
-                    auto& item=gate_items[index*gate_waves+wave];
+                    auto& item=gate_items[gate_index++];
                     rk_npu_matmul_i8_config_init(&item.config,j.rows,2*N,width);
                     check(rk_npu_mem_view(&j.ga,size_t(first)*j.rows,size_t(width)*j.rows,&item.input));
                     check(rk_npu_mem_view(&weights.gw[j.expert],size_t(first)*N,size_t(width)*N,&item.weight));
@@ -713,11 +737,16 @@ struct Workspace {
             lut_cmd.run(device,cores,config.timeout_ms);t.lut_load_us=us(at);at=Clock::now();
             middle_cmd.run(device,cores,config.timeout_ms);t.middle_npu_us=us(at);at=Clock::now();
             middle_gate.sync(assignments*N*4,RK_NPU_SYNC_FROM_DEVICE);middle_up.sync(assignments*N*4,RK_NPU_SYNC_FROM_DEVICE);
-        } else if(w4)for(int wave=0;wave<gate_waves;++wave) {
-            auto active=gate_c.view(size_t(wave)*gate_wave_stride,assignments*2*N*4);
-            check(rk_npu_mem_sync(device.ctx,&active,RK_NPU_SYNC_FROM_DEVICE));
+        } else {
+            gate_c.sync(assignments*2*N*4,RK_NPU_SYNC_FROM_DEVICE);
+            if(sliced_assignments) {
+                const int waves=ceil_div(H,gate_tile(mode,H));
+                for(int wave=1;wave<waves;++wave) {
+                    auto active=gate_c.view(size_t(wave)*gate_wave_stride,sliced_assignments*2*N*4);
+                    check(rk_npu_mem_sync(device.ctx,&active,RK_NPU_SYNC_FROM_DEVICE));
+                }
+            }
         }
-        else gate_c.sync(assignments*2*N*4,RK_NPU_SYNC_FROM_DEVICE);
         t.sync_us+=us(at);at=Clock::now();
         workers(threads,[&](int worker){
             alignas(64) float hidden[512];alignas(64) int8_t hidden_q[512];
@@ -739,7 +768,7 @@ struct Workspace {
                     } else {
                         const MiddleRow middle{acc,j.w4?weights.gcor[j.expert].data():nullptr,
                             weights.gs[j.expert].data(),sa,j.rows,row,N,
-                            j.w4?gate_waves:1,size_t(gate_wave_stride),target,
+                            j.gate_waves,size_t(gate_wave_stride),target,
                             j.w4?MiddleLayout::I4Native:native?MiddleLayout::I8Native:MiddleLayout::I8Normal};
                         scale=swiglu_quantize_row(middle);
                     }
@@ -894,7 +923,16 @@ extern "C" int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* w,int
         !rknpu2_matmul_open::moe::expert_is_w4(w->mode,e,w->config.routed_experts))return RK_NPU_ERR_PARAM;
     auto* p=static_cast<uint8_t*>(data);
     auto put=[&](const void* src,size_t n){std::memcpy(p,src,n);p+=n;};
-    put(w->gw[e].vaddr,w->gw[e].size);put(w->dw[e].vaddr,w->dw[e].size);
+    // Blob records always store K512 waves, including records from full-K banks.
+    const int h=w->config.hidden, tile=rknpu2_matmul_open::moe::gate_tile(w->mode,h);
+    if(w->gate_tiles[e]==tile)put(w->gw[e].vaddr,w->gw[e].size);
+    else {
+        const auto* gate=static_cast<const uint8_t*>(w->gw[e].vaddr);
+        for(int k=0;k<h;k+=tile)
+            for(int n=0;n<2*w->config.intermediate;n+=64)
+                put(gate+size_t(n/64)*h*32+size_t(k)*32,size_t(std::min(tile,h-k))*32);
+    }
+    put(w->dw[e].vaddr,w->dw[e].size);
     put(w->gs[e].data(),w->gs[e].size()*4);put(w->ds[e].data(),w->ds[e].size()*4);
     put(w->gcor[e].data(),w->gcor[e].size()*4);
     if(!w->dcor[e].empty())put(w->dcor[e].data(),w->dcor[e].size()*4);
@@ -916,6 +954,7 @@ extern "C" int rk_npu_moe_quant_import_expert_timed(rk_npu_moe_w8_weights* w,int
         const auto* p=static_cast<const uint8_t*>(data);
         auto get=[&](void* dst,size_t n){std::memcpy(dst,p,n);p+=n;};
         get(w->gw[e].vaddr,w->gw[e].size);get(w->dw[e].vaddr,w->dw[e].size);
+        w->gate_tiles[e]=gate_tile(w->mode,w->config.hidden);
         get(w->gs[e].data(),w->gs[e].size()*4);get(w->ds[e].data(),w->ds[e].size()*4);
         get(w->gcor[e].data(),w->gcor[e].size()*4);
         if(!w->dcor[e].empty())get(w->dcor[e].data(),w->dcor[e].size()*4);

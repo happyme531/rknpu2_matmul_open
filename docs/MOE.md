@@ -108,8 +108,10 @@ The public `rk_npu_moe_w4_weights_create` and `rk_npu_moe_w4_workspace_create`
 entries keep routed weights in packed INT4 and the shared expert in INT8.
 They reuse the same run/free functions with compatible mixed handles and
 require H/I multiples of64, H<=8128, normal input and CPU middle.
-Routed gate/up retains certified K<=512 partials
-and bounded weight banks; shared gate/up and Down split N across the active
+Each resident routed expert uses one gate/up K tile when H fits the native
+limit and its weights certify the full INT16 partial. Otherwise it uses
+certified K<=512 partials. Packed expert records retain their K512 layout.
+Shared gate/up and Down split N across the active
 cores and join the mixed command chains. Input quantization and CPU middle
 use the MoE nearest-even rule for both expert types. Shared and routed widths
 must match; routing IDs must be ready before the joint call begins.

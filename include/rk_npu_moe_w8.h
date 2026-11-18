@@ -91,7 +91,8 @@ rk_npu_moe_w8_workspace* rk_npu_moe_quant_workspace_create(rk_npu_iommu_domain* 
     const rk_npu_moe_w8_config* config);
 
 /* Routed W4 plus optional shared W8, jointly scheduled on the active cores.
- * Routed gate/up uses certified K<=512 partials; shared W8 retains full K.
+ * Resident routed gate/up uses full K when the native geometry and INT16
+ * weight bounds permit it, or certified K<=512 partials. Shared W8 uses full K.
  * The W4 geometry, CPU-middle and normal-input requirements above apply.
  * Shared and routed experts must have the same intermediate width.
  * Existing run/free/timing functions accept these mixed handles. */
