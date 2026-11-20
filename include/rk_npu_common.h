@@ -134,6 +134,24 @@ rk_npu_iommu_domain* rk_npu_iommu_domain_create(rk_npu_ctx* ctx,
 void rk_npu_iommu_domain_free(rk_npu_iommu_domain* domain);
 uint32_t rk_npu_iommu_domain_id(const rk_npu_iommu_domain* domain);
 
+/* Successful owner registrations made via this context and domain. Bytes
+ * are allocation capacities or supplied import spans. Views
+ * do not count as owners. This is not an IOVA free-space or RSS query.
+ * Read once submissions and allocation work have joined for a phase snapshot. */
+typedef struct {
+    uint64_t live_bytes, peak_bytes, creates, destroys;
+} rk_npu_domain_memory_stats;
+int rk_npu_iommu_domain_memory_stats(const rk_npu_iommu_domain* domain,
+                                     rk_npu_domain_memory_stats* stats);
+
+/* Optional reclaim hook for idle allocations in this domain. Called after
+ * MEM_CREATE reports memory pressure. The hook may free memory but must
+ * not allocate NPU memory. Install or clear it with allocation callers
+ * quiesced, and keep the cookie alive while the hook is installed. */
+typedef void (*rk_npu_reclaim_idle_fn)(void* cookie);
+void rk_npu_iommu_domain_set_reclaim(rk_npu_iommu_domain* domain,
+                                    rk_npu_reclaim_idle_fn reclaim, void* cookie);
+
 /* Human-readable string for an RK_NPU_ERR_* code. */
 const char* rk_npu_strerror(int code);
 

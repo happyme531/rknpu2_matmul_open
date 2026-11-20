@@ -23,7 +23,9 @@ using Task=detail::RegisterTask;
 // QK output channels are KV positions, independently of the PV K tile.
 constexpr int QK_CHANNEL_TILE=4096;
 struct Error {int code;};
+struct DeviceError : Error {};
 inline void check(int rc){if(rc)throw Error{rc};}
+inline void check_sync(int rc){if(rc)throw DeviceError{{rc}};}
 inline double elapsed(Clock::time_point a,Clock::time_point b){return std::chrono::duration<double,std::micro>(b-a).count();}
 inline uint16_t half(float x){return bits::float_to_half(x);}
 inline float widen(uint16_t x){return bits::half_to_float(x);}
@@ -84,20 +86,23 @@ struct Buffer {
     Buffer& operator=(const Buffer&)=delete;
     ~Buffer(){if(mem.handle)rk_npu_mem_free(domain->ctx,&mem);}
     void swap(Buffer& other){std::swap(domain,other.domain);std::swap(mem,other.mem);}
-    void alloc(rk_npu_iommu_domain* d,uint64_t bytes,uint32_t flags=RK_NPU_MEM_DATA_DEFAULT){
+    void alloc(rk_npu_iommu_domain* d,uint64_t bytes,uint32_t flags=RK_NPU_MEM_DATA_DEFAULT,
+        bool reclaim_on_einval=true){
         if(mem.handle || !bytes)throw Error{RK_NPU_ERR_PARAM};domain=d;
-        check(rk_npu_mem_alloc(d,bytes,flags,&mem));
+        check(reclaim_on_einval?rk_npu_mem_alloc(d,bytes,flags,&mem):
+            detail::alloc_mem(d,bytes,flags,&mem,false));
     }
-    void ensure(rk_npu_iommu_domain* d,uint64_t bytes,uint32_t flags=RK_NPU_MEM_DATA_DEFAULT){
+    void ensure(rk_npu_iommu_domain* d,uint64_t bytes,uint32_t flags=RK_NPU_MEM_DATA_DEFAULT,
+        bool reclaim_on_einval=true){
         if(mem.size>=bytes)return;
-        Buffer next;next.alloc(d,bytes,flags);swap(next);
+        Buffer next;next.alloc(d,bytes,flags,reclaim_on_einval);swap(next);
     }
     uint16_t* data(){return static_cast<uint16_t*>(mem.vaddr);}
     const uint16_t* data()const{return static_cast<const uint16_t*>(mem.vaddr);}
-    void sync(rk_npu_sync_dir dir){check(rk_npu_mem_sync(domain->ctx,&mem,dir));}
+    void sync(rk_npu_sync_dir dir){check_sync(rk_npu_mem_sync(domain->ctx,&mem,dir));}
     void range(uint64_t offset,uint64_t bytes,rk_npu_sync_dir dir=RK_NPU_SYNC_TO_DEVICE){
         if(!bytes)return;rk_npu_mem view{};check(rk_npu_mem_view(&mem,offset,bytes,&view));
-        check(rk_npu_mem_sync(domain->ctx,&view,dir));
+        check_sync(rk_npu_mem_sync(domain->ctx,&view,dir));
     }
     void zero(){std::memset(mem.vaddr,0,mem.size);}
 };
@@ -241,6 +246,10 @@ struct Workspace {
     const bool pipeline_enabled;
     bool poisoned=false;
     bool full_causal_prefill=false; // MLA query chunks reuse one valid-KV graph.
+    template<class F>decltype(auto) protect_device(F&& run){
+        try{return run();}
+        catch(const DeviceError&){poisoned=true;throw;}
+    }
     Workspace(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,Shape s={});
     ~Workspace();
     void geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_timings& t,int query_end=0,Tail* scratch=nullptr);

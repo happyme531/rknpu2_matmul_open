@@ -112,8 +112,7 @@ public:
         plan(cache,rows,start,block_rows);
         // Each slot retains one graph. Prime the first pair; later geometry
         // grows retained buffers on demand instead of replacing these graphs.
-        try{for(int index=0;index<std::min(block_count,2);++index)prepare_slot(cache,index,nullptr,rows,start);}
-        catch(...){owner.poisoned=true;throw;}
+        for(int index=0;index<std::min(block_count,2);++index)prepare_slot(cache,index,nullptr,rows,start);
     }
     rk_npu_attention_f16_timings run(Cache& cache,const uint16_t* query,int rows,int start,
         void* output,const rk_npu_attention_f16_boolean_mask* mask,bool half,int block_rows){
@@ -146,10 +145,10 @@ public:
                 }else finish(b,output,rows,half,total);
             }
         }catch(...){
-            // A CPU sync/allocation can fail while the other slot is on the
-            // device. Drain it before releasing the cache lock or any buffer.
-            auto failure=std::current_exception();try{wait();}catch(...){}
-            owner.poisoned=true;std::rethrow_exception(failure);
+            // Drain the worker before releasing the cache lock or any buffer.
+            auto failure=std::current_exception();
+            try{wait();}catch(const DeviceError&){throw;}catch(...){}
+            std::rethrow_exception(failure);
         }
         total.total_us=elapsed(begin,Clock::now());return total;
     }
@@ -160,13 +159,14 @@ Workspace::Workspace(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c
 Workspace::~Workspace()=default;
 void Workspace::prepare_pipeline(Cache& cache,int rows,int start,int block_rows){
     if(!pipeline)pipeline=std::make_unique<Pipeline>(*this);
-    pipeline->prepare(cache,rows,start,block_rows);
+    protect_device([&]{pipeline->prepare(cache,rows,start,block_rows);});
 }
 rk_npu_attention_f16_timings Workspace::run_pipeline(Cache& cache,const uint16_t* query,int rows,int start,
     void* output,const rk_npu_attention_f16_boolean_mask* mask,bool half,int block_rows){
     const auto begin=Clock::now();
     if(!pipeline)pipeline=std::make_unique<Pipeline>(*this);
-    const auto created=Clock::now();auto result=pipeline->run(cache,query,rows,start,output,mask,half,block_rows);
+    const auto created=Clock::now();
+    auto result=protect_device([&]{return pipeline->run(cache,query,rows,start,output,mask,half,block_rows);});
     result.prepare_us+=elapsed(begin,created);return result;
 }
 } // namespace rknpu2_matmul_open::attention

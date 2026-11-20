@@ -21,6 +21,7 @@
 
 #include "rk_npu_common.h"
 #include <atomic>
+#include <mutex>
 #include <stdint.h>
 #include <vector>
 
@@ -132,16 +133,24 @@ inline int ceil_div(int x, int y) { return (x + y - 1) / y; }
 inline int align_up(int x, int a) { return ceil_div(x, a) * a; }
 
 /* ------------------------------------------------------------- context */
+struct RknpuDomainMemory {
+    std::atomic<uint64_t> live_bytes{0}, peak_bytes{0}, creates{0}, destroys{0};
+};
 struct rk_npu_ctx {
     int fd;
     uint64_t id;
     uint32_t driver_version;
     bool iommu_enabled;
+    RknpuDomainMemory memory[RK_NPU_IOMMU_DOMAIN_COUNT];
 };
 struct rk_npu_iommu_domain {
     rk_npu_ctx* ctx;
     uint32_t id;
     std::atomic<uint32_t> refs;
+    rk_npu_reclaim_idle_fn reclaim_idle = nullptr;
+    void* reclaim_cookie = nullptr;
+    std::mutex reclaim_mutex;
+    std::atomic<uint64_t> reclaim_epoch{0};
 };
 struct rk_npu_matmul_i8_config;
 struct rk_npu_matmul_i8_plan;
@@ -150,6 +159,10 @@ struct rk_npu_matmul_f16_config;
 
 /* ----------------------------------------------- shared core helpers */
 namespace rknpu2_matmul_open::detail {
+
+// Optional mappings may use EINVAL to request a fallback before reclaiming.
+int alloc_mem(rk_npu_iommu_domain* domain, uint64_t size, uint32_t flags,
+              rk_npu_mem* out, bool reclaim_on_einval = true);
 
 /* Experimental same-core graph assembly. Copy a prepared plain FP16 batch's
  * register bodies with bound addresses; the caller owns the final single PC

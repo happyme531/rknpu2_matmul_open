@@ -63,7 +63,7 @@ rk_npu_ctx* open_rknpu_device(const char* dev) {
     action.flags = RKNPU_GET_IOMMU_EN;
     if (::ioctl(fd, IOCTL_ACTION, &action) < 0) return fail(errno);
 
-    rk_npu_ctx* ctx = (rk_npu_ctx*)std::calloc(1, sizeof(rk_npu_ctx));
+    rk_npu_ctx* ctx = new (std::nothrow) rk_npu_ctx{};
     if (!ctx) return fail(ENOMEM);
     ctx->fd = fd;
     ctx->id = ctx_id(ctx);
@@ -120,7 +120,7 @@ extern "C" rk_npu_ctx* rk_npu_open(const char* dev) {
 extern "C" void rk_npu_close(rk_npu_ctx* ctx) {
     if (!ctx) return;
     if (ctx->fd >= 0) ::close(ctx->fd);
-    std::free(ctx);
+    delete ctx;
 }
 
 extern "C" const char* rk_npu_strerror(int code) {
@@ -162,18 +162,79 @@ extern "C" uint32_t rk_npu_iommu_domain_id(
     return domain ? domain->id : UINT32_MAX;
 }
 
+extern "C" int rk_npu_iommu_domain_memory_stats(const rk_npu_iommu_domain* domain,
+                                                  rk_npu_domain_memory_stats* stats) {
+    if (!domain || !domain->ctx || !stats) return RK_NPU_ERR_PARAM;
+    const auto& memory = domain->ctx->memory[domain->id];
+    *stats = {memory.live_bytes.load(std::memory_order_relaxed),
+              memory.peak_bytes.load(std::memory_order_relaxed),
+              memory.creates.load(std::memory_order_relaxed),
+              memory.destroys.load(std::memory_order_relaxed)};
+    return RK_NPU_OK;
+}
+
+extern "C" void rk_npu_iommu_domain_set_reclaim(rk_npu_iommu_domain* domain,
+                                               rk_npu_reclaim_idle_fn reclaim, void* cookie) {
+    domain->reclaim_idle = reclaim;
+    domain->reclaim_cookie = cookie;
+}
+
 /* ------------------------------------------------------------- memory ---- */
+
+namespace {
+void account_create(rk_npu_ctx* ctx, const rk_npu_mem& mem) {
+    auto& memory = ctx->memory[mem.iommu_domain_id];
+    const auto live = memory.live_bytes.fetch_add(mem.capacity, std::memory_order_relaxed)
+                      + mem.capacity;
+    auto peak = memory.peak_bytes.load(std::memory_order_relaxed);
+    while (live > peak &&
+           !memory.peak_bytes.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {}
+    memory.creates.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool reclaim_after_create_failure(rk_npu_iommu_domain* domain, uint64_t epoch, int error) {
+    if (!domain->reclaim_idle) return false;
+    // RKNPU also reports DMA mapping/allocation failures as EFAULT or EINVAL.
+    if (error != ENOMEM && error != ENOSPC && error != EFAULT && error != EINVAL)
+        return false;
+
+    std::lock_guard<std::mutex> lock(domain->reclaim_mutex);
+    if (domain->reclaim_epoch.load(std::memory_order_relaxed) != epoch)
+        return true; // Another lane reclaimed since this allocation started.
+    const auto& destroys = domain->ctx->memory[domain->id].destroys;
+    const auto before = destroys.load(std::memory_order_relaxed);
+    domain->reclaim_idle(domain->reclaim_cookie);
+    if (destroys.load(std::memory_order_relaxed) == before) return false;
+    domain->reclaim_epoch.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+}
+
 
 extern "C" int rk_npu_mem_alloc(rk_npu_iommu_domain* domain, uint64_t size,
                                   uint32_t alloc_flags, rk_npu_mem* out) {
+    return rknpu2_matmul_open::detail::alloc_mem(domain, size, alloc_flags, out);
+}
+
+int rknpu2_matmul_open::detail::alloc_mem(rk_npu_iommu_domain* domain, uint64_t size,
+                                        uint32_t alloc_flags, rk_npu_mem* out,
+                                        bool reclaim_on_einval) {
     if (!domain || !domain->ctx || !out || size == 0) return RK_NPU_ERR_PARAM;
     rk_npu_ctx* ctx = domain->ctx;
     std::memset(out, 0, sizeof(*out));
-    rknpu_mem_create mc; std::memset(&mc, 0, sizeof(mc));
-    mc.flags = alloc_flags;
-    mc.size = size;
-    mc.iommu_domain_id = (int32_t)domain->id;
-    if (ioctl(ctx->fd, IOCTL_MEM_CREATE, &mc) < 0) return RK_NPU_ERR_IOCTL;
+    rknpu_mem_create request{};
+    request.flags = alloc_flags;
+    request.size = size;
+    request.iommu_domain_id = (int32_t)domain->id;
+    auto mc = request;
+    const auto epoch = domain->reclaim_epoch.load(std::memory_order_relaxed);
+    if (ioctl(ctx->fd, IOCTL_MEM_CREATE, &mc) < 0) {
+        const int error = errno;
+        if ((error == EINVAL && !reclaim_on_einval) ||
+            !reclaim_after_create_failure(domain, epoch, error)) return RK_NPU_ERR_IOCTL;
+        mc = request;
+        if (ioctl(ctx->fd, IOCTL_MEM_CREATE, &mc) < 0) return RK_NPU_ERR_IOCTL;
+    }
 
     out->handle   = mc.handle;
     out->flags    = RK_NPU_MEM_F_OWN_RKNPU;
@@ -184,6 +245,7 @@ extern "C" int rk_npu_mem_alloc(rk_npu_iommu_domain* domain, uint64_t size,
     out->capacity = mc.size;
     out->ctx_id   = ctx->id;
     out->iommu_domain_id = domain->id;
+    account_create(ctx, *out);
     if (mc.dma_addr > UINT32_MAX || mc.size == 0 ||
         mc.size - 1 > UINT32_MAX - mc.dma_addr) {
         rk_npu_mem_free(ctx, out);
@@ -232,6 +294,7 @@ extern "C" int rk_npu_mem_import_dmabuf(
     out->capacity = size;
     out->ctx_id = ctx->id;
     out->iommu_domain_id = domain->id;
+    account_create(ctx, *out);
     if (out->dma_addr > UINT32_MAX || out->size == 0 ||
         out->size - 1 > UINT32_MAX - out->dma_addr) {
         rk_npu_mem_free(ctx, out);
@@ -297,7 +360,13 @@ extern "C" int rk_npu_mem_free(rk_npu_ctx* ctx, rk_npu_mem* mem) {
         rknpu_mem_destroy md; std::memset(&md, 0, sizeof(md));
         md.handle = mem->handle;
         md.obj_addr = mem->obj_addr;
-        if (ioctl(ctx->fd, IOCTL_MEM_DESTROY, &md) < 0) rc = RK_NPU_ERR_IOCTL;
+        if (ioctl(ctx->fd, IOCTL_MEM_DESTROY, &md) < 0) {
+            rc = RK_NPU_ERR_IOCTL;
+        } else {
+            auto& memory = ctx->memory[mem->iommu_domain_id];
+            memory.live_bytes.fetch_sub(mem->capacity, std::memory_order_relaxed);
+            memory.destroys.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     std::memset(mem, 0, sizeof(*mem));
     return rc;

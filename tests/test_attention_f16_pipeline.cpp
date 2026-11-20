@@ -16,7 +16,12 @@ namespace {
 // driver, or pause a submit before issuing it. No failing NPU task is created.
 std::atomic<unsigned long> failure_request{0};
 std::atomic<int> failure_at{0},request_count{0};
+std::atomic<int> failure_span{1},failure_errno{EIO};
+std::atomic<bool> reject_next_submit{false};
 std::atomic<bool> reject_wc{false};
+std::atomic<int> wc_rejections{0};
+// Only the caller thread of the serial fallback test modifies staged scores.
+thread_local att::Buffer* nonfinite_score=nullptr;
 std::mutex pause_mutex;
 std::condition_variable pause_cv;
 bool pause_submit=false,submit_entered=false,release_submit=false;
@@ -25,19 +30,33 @@ extern "C" int ioctl(int fd,unsigned long request,...)noexcept{
     va_list args;va_start(args,request);void* argument=va_arg(args,void*);va_end(args);
     if(request==IOCTL_MEM_CREATE && reject_wc.load() &&
         (static_cast<const rknpu_mem_create*>(argument)->flags & RK_NPU_MEM_WRITE_COMBINE)){
+        ++wc_rejections;
         errno=EINVAL;return -1;
     }
-    if(request==failure_request.load() && request_count.fetch_add(1)+1==failure_at.load()){
-        errno=EIO;return -1;
+    if(request==failure_request.load()){
+        const int index=request_count.fetch_add(1)+1;
+        const int first=failure_at.load();
+        if(first>0 && index>=first && index-first<failure_span.load()){
+            errno=failure_errno.load();return -1;
+        }
     }
     if(request==IOCTL_SUBMIT){
+        if(reject_next_submit.exchange(false)){errno=EIO;return -1;}
         std::unique_lock<std::mutex> lock(pause_mutex);
         if(pause_submit){
             submit_entered=true;pause_cv.notify_all();
             pause_cv.wait(lock,[]{return release_submit;});pause_submit=false;
         }
     }
-    return int(syscall(SYS_ioctl,fd,request,argument));
+    const int rc=int(syscall(SYS_ioctl,fd,request,argument));
+    if(!rc && request==IOCTL_MEM_SYNC && nonfinite_score){
+        const auto& sync=*static_cast<const rknpu_mem_sync*>(argument);
+        if((sync.flags & RK_NPU_SYNC_FROM_DEVICE) && sync.obj_addr==nonfinite_score->mem.obj_addr){
+            nonfinite_score->data()[0]=0x7c00;
+            nonfinite_score=nullptr;
+        }
+    }
+    return rc;
 }
 namespace {
 struct Env {
@@ -47,6 +66,22 @@ struct Env {
 };
 using Cache=std::unique_ptr<rk_npu_attention_f16_cache,decltype(&rk_npu_attention_f16_cache_free)>;
 using Work=std::unique_ptr<rk_npu_attention_f16_workspace,decltype(&rk_npu_attention_f16_workspace_free)>;
+struct Idle {
+    mla_test::Device& device;
+    rk_npu_mem mem{};
+    int reclaims=0;
+    explicit Idle(mla_test::Device& dev):device(dev){
+        check(rk_npu_mem_alloc(dev.domain,4096,RK_NPU_MEM_DATA_DEFAULT,&mem));
+        rk_npu_iommu_domain_set_reclaim(dev.domain,[](void* ptr){
+            auto& idle=*static_cast<Idle*>(ptr);
+            if(idle.mem.handle && rk_npu_mem_free(idle.device.ctx,&idle.mem)==RK_NPU_OK)++idle.reclaims;
+        },this);
+    }
+    ~Idle(){
+        rk_npu_iommu_domain_set_reclaim(device.domain,nullptr,nullptr);
+        if(mem.handle)rk_npu_mem_free(device.ctx,&mem);
+    }
+};
 Cache cache(mla_test::Device& d,const rk_npu_attention_f16_config& c){
     rk_npu_attention_f16_cache* raw=nullptr;check(rk_npu_attention_f16_cache_create(d.domain,&c,&raw));
     return Cache(raw,rk_npu_attention_f16_cache_free);
@@ -200,7 +235,66 @@ void streamed_buffers(mla_test::Device& dev){
     same(expected,f.run(dev,fallback.get(),c.get()));
     std::puts("PASS streaming exponent buffer reuse and WC allocation fallback");
 }
+void serial_fallback_failures(mla_test::Device& dev){
+    Env lut("RK_NPU_ATTN_LUT_EXP");setenv(lut.key,"1",1);
+    Env mode("RK_NPU_ATTN_LUT_SUBMIT");setenv(mode.key,"pingpong",1);
+    Fixture f(256,32,3);f.cfg.kv_tile=256;
+    auto c=cache(dev,f.cfg);f.load(dev,c.get(),f.v);
+    auto prepared=[&]{
+        auto w=work(dev,f.cfg,false);
+        check(rk_npu_attention_f16_prepare_query(dev.ctx,w.get(),c.get(),f.rows,f.start));
+        require(w->graph->stream_scores && !w->graph->fallback_tasks,"serial LUT fallback fixture");
+        return w;
+    };
+    {
+        auto w=prepared();nonfinite_score=&w->graph->score;
+        const auto expected=f.run(dev,w.get(),c.get());
+        require(!nonfinite_score && w->graph->fallback_tasks,"expected fallback after real QK");
+        auto failed=prepared();std::vector<float> output(f.q.size());
+        Idle idle(dev);
+        request_count=0;failure_at=1;failure_span=2;failure_errno=ENOMEM;failure_request=IOCTL_MEM_CREATE;
+        nonfinite_score=&failed->graph->score;
+        const int rc=rk_npu_attention_f16_run(dev.ctx,failed.get(),c.get(),f.q.data(),
+            f.rows,f.start,output.data(),nullptr,nullptr);
+        failure_request=0;failure_span=1;failure_errno=EIO;
+        require(!nonfinite_score && idle.reclaims==1 && request_count==2 &&
+            rc==RK_NPU_ERR_IOCTL && !failed->poisoned,"LUT fallback allocation must remain recoverable");
+        check(rk_npu_attention_f16_cache_load(dev.ctx,c.get(),nullptr,nullptr,0));f.load(dev,c.get(),f.v);
+        nonfinite_score=&failed->graph->score;
+        same(expected,f.run(dev,failed.get(),c.get()));
+        require(!nonfinite_score && failed->graph->fallback_tasks,"same workspace completed LUT fallback");
+        std::puts("PASS serial LUT fallback allocation and KV reset");
+    }
+    {
+        const auto expected=f.run(dev,prepared().get(),c.get());
+        auto w=work(dev,f.cfg,false);Idle idle(dev);
+        wc_rejections=0;reject_wc=true;
+        const auto actual=f.run(dev,w.get(),c.get());
+        reject_wc=false;
+        require(wc_rejections==1 && idle.reclaims==0 && idle.mem.handle &&
+            !w->graph->wc_exponent.mem.handle,"WC EINVAL must fall back before reclaim");
+        same(expected,actual);
+        std::puts("PASS optional WC rejection attempted once and preserved idle GEM");
+    }
+}
 #endif
+void serial_graph_sync_failure(mla_test::Device& dev){
+    Fixture f(512,32,480);
+    auto c=cache(dev,f.cfg);f.load(dev,c.get(),f.v);
+    auto w=work(dev,f.cfg,false);
+    // The aligned 512-token span has no staged tail; the first sync is
+    // descriptor publication in the graph constructor.
+    request_count=0;failure_at=1;failure_request=IOCTL_MEM_SYNC;
+    const int rc=rk_npu_attention_f16_prepare_query(dev.ctx,w.get(),c.get(),f.rows,f.start);
+    failure_request=0;
+    require(rc==RK_NPU_ERR_IOCTL && w->poisoned && !w->graph,"serial graph sync must poison");
+    check(rk_npu_attention_f16_cache_load(dev.ctx,c.get(),nullptr,nullptr,0));f.load(dev,c.get(),f.v);
+    std::vector<float> output(f.q.size());
+    require(rk_npu_attention_f16_run(dev.ctx,w.get(),c.get(),f.q.data(),f.rows,f.start,
+        output.data(),nullptr,nullptr)==RK_NPU_ERR_SUBMIT,"KV reset must preserve serial device protection");
+    f.run(dev,work(dev,f.cfg,false).get(),c.get());
+    std::puts("PASS serial graph sync failure stays protected after KV reset");
+}
 void failures(mla_test::Device& dev){
     Fixture f(4096,128,3968);auto c=cache(dev,f.cfg);f.load(dev,c.get(),f.v);
     auto serial=work(dev,f.cfg,false);const auto expected=f.run(dev,serial.get(),c.get());
@@ -223,10 +317,58 @@ void failures(mla_test::Device& dev){
         const int rc=rk_npu_attention_f16_run(dev.ctx,w.get(),c.get(),f.q.data(),f.rows,f.start,output.data(),nullptr,nullptr);
         failure_request=0;
         require(rc==(spec.first==IOCTL_SUBMIT?RK_NPU_ERR_SUBMIT:RK_NPU_ERR_IOCTL),"injected failure returned");
+        f.load(dev,c.get(),f.v);
         require(rk_npu_attention_f16_run(dev.ctx,w.get(),c.get(),f.q.data(),f.rows,f.start,output.data(),nullptr,nullptr)==RK_NPU_ERR_SUBMIT,"failed pipeline poisoned");
         rk_npu_attention_f16_cache_info info{};check(rk_npu_attention_f16_cache_get_info(c.get(),&info));
         w.reset();auto fresh=work(dev,f.cfg,true);same(expected,f.run(dev,fresh.get(),c.get()));
         std::printf("PASS pipeline drained failed request=%lu index=%d\n",spec.first,spec.second);
+    }
+}
+void allocation_failures(mla_test::Device& dev){
+    Env lut("RK_NPU_ATTN_LUT_EXP");setenv(lut.key,"0",1);
+    Fixture f(512,128,384);auto c=cache(dev,f.cfg);f.load(dev,c.get(),f.v);
+    auto serial=work(dev,f.cfg,false);
+    const auto expected=f.run(dev,serial.get(),c.get());
+    int block_rows=0;rk_npu_attention_f16_sizes sizes{};
+    check(att::query_gqa(f.cfg,c->capacity,f.rows,f.length,sizes,block_rows,true));
+    require(block_rows<f.rows,"allocation fixture requires multiple segments");
+    {
+        auto first=work(dev,f.cfg,true);auto cold_cache=cache(dev,f.cfg);
+        f.load(dev,cold_cache.get(),f.v);
+        request_count=0;failure_at=0;failure_request=IOCTL_MEM_CREATE;
+        check(rk_npu_attention_f16_prepare_query(dev.ctx,first.get(),cold_cache.get(),block_rows,f.start));
+        failure_request=0;
+    }
+    // The same first geometry runs before launch; the next allocation is
+    // for slot 1 while the first slot's QK has been handed to the worker.
+    const int second_slot=request_count.load()+1;
+    require(second_slot>1,"first slot did not allocate");
+    for(const auto [prepare_only,count,submit_error,error] : {
+        std::tuple{true,2,false,ENOMEM},std::tuple{false,1,false,ENOMEM},
+        std::tuple{false,2,false,ENOMEM},std::tuple{false,2,true,ENOMEM},
+        std::tuple{false,1,false,EINVAL}}){
+        auto w=work(dev,f.cfg,true);
+        std::vector<float> output(f.q.size());
+        Idle idle(dev);
+        request_count=0;failure_at=second_slot;failure_span=count;failure_errno=error;
+        reject_next_submit=submit_error;failure_request=IOCTL_MEM_CREATE;
+        auto run=[&]{return rk_npu_attention_f16_run(dev.ctx,w.get(),c.get(),f.q.data(),
+            f.rows,f.start,output.data(),nullptr,nullptr);};
+        const int rc=prepare_only?rk_npu_attention_f16_prepare_query(dev.ctx,w.get(),c.get(),
+            f.rows,f.start):run();
+        failure_request=0;failure_span=1;failure_errno=EIO;
+        require(!reject_next_submit.exchange(false),"submit fault did not reach the worker");
+        require(w->pipeline && idle.reclaims==1 && !idle.mem.handle &&
+            request_count.load()>=second_slot+count-1,"slot 1 allocation did not reclaim/retry");
+        const int expected_rc=submit_error?RK_NPU_ERR_SUBMIT:count==1?RK_NPU_OK:RK_NPU_ERR_IOCTL;
+        require(rc==expected_rc,"allocation/submit error returned");
+        if(count==1)same(expected,output);
+        check(rk_npu_attention_f16_cache_load(dev.ctx,c.get(),nullptr,nullptr,0));
+        f.load(dev,c.get(),f.v);
+        if(submit_error)require(run()==RK_NPU_ERR_SUBMIT,"worker failure must still poison the workspace");
+        else same(expected,f.run(dev,w.get(),c.get()));
+        std::printf("PASS pipeline allocation prepare=%d failures=%d errno=%d submit_failure=%d rc=%d\n",
+            prepare_only,count,error,submit_error,rc);
     }
 }
 void busy(mla_test::Device& dev){
@@ -320,11 +462,11 @@ void board(){
     {Fixture f(4096,4,4092);compare_case(dev,f,false);}
 #if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     streamed_scores(dev,1,1);streamed_scores(dev,2,3);streamed_scores(dev,4,7);
-    streamed_buffers(dev);
+    streamed_buffers(dev);serial_fallback_failures(dev);
 #else
     std::puts("SKIP streaming probabilities and buffer reuse: FP16 NEON unavailable");
 #endif
-    mutations(dev);boolean(dev);failures(dev);busy(dev);
+    mutations(dev);boolean(dev);serial_graph_sync_failure(dev);failures(dev);allocation_failures(dev);busy(dev);
     std::puts("Attention pipeline board contract PASS");
 }
 }

@@ -24,6 +24,16 @@ static void cpu_ref(int M, int N, int K, const int8_t* A, const int8_t* B, std::
                 C[(size_t)m * N + n] += (int32_t)A[(size_t)m * K + k] * (int32_t)B[(size_t)k * N + n];
 }
 
+static bool memory_matches(rk_npu_iommu_domain* domain, uint64_t live,
+                           uint64_t creates, uint64_t destroys) {
+    rk_npu_domain_memory_stats stats{};
+    if (rk_npu_iommu_domain_memory_stats(domain, &stats) == RK_NPU_OK &&
+        stats.live_bytes == live && stats.peak_bytes >= live &&
+        stats.creates == creates && stats.destroys == destroys) return true;
+    fprintf(stderr, "domain %u memory accounting mismatch\n", rk_npu_iommu_domain_id(domain));
+    return false;
+}
+
 static int run_case(const char* dev, uint32_t domain_id) {
     rk_npu_ctx* ctx = rk_npu_open(dev);
     if (!ctx) {
@@ -64,6 +74,8 @@ static int run_case(const char* dev, uint32_t domain_id) {
         return 1;
     }
 
+    if (!memory_matches(domain, base.capacity, 1, 0)) return 1;
+
     std::vector<int8_t> A((size_t)M * K), B((size_t)K * N);
     for (size_t i = 0; i < A.size(); ++i) A[i] = (int8_t)((int)(i % 17) - 8);
     for (size_t i = 0; i < B.size(); ++i) B[i] = (int8_t)((int)(i % 13) - 6);
@@ -90,7 +102,12 @@ static int run_case(const char* dev, uint32_t domain_id) {
     rk_npu_mem_free(ctx, &in);
     rk_npu_mem_free(ctx, &wt);
     rk_npu_mem_free(ctx, &out);
+    rk_npu_domain_memory_stats before_free{};
+    if (rk_npu_iommu_domain_memory_stats(domain, &before_free) != RK_NPU_OK ||
+        before_free.live_bytes != base.capacity ||
+        before_free.creates != before_free.destroys + 1) return 1;
     rk_npu_mem_free(ctx, &base);
+    if (!memory_matches(domain, 0, before_free.creates, before_free.creates)) return 1;
     rk_npu_iommu_domain_free(domain);
     rk_npu_close(ctx);
 
@@ -136,6 +153,9 @@ static int run_import_case(const char* dev) {
         return 1;
     }
 
+    if (!memory_matches(producer_domain, base.capacity, 1, 0) ||
+        !memory_matches(consumer_domain, imported.capacity, 1, 0)) return 1;
+
     rk_npu_mem in{}, wt{}, out{};
     rc = rk_npu_mem_view(&imported, in_off, sz.input_bytes, &in);
     rc |= rk_npu_mem_view(&imported, wt_off, sz.weight_bytes, &wt);
@@ -173,6 +193,11 @@ static int run_import_case(const char* dev) {
     rk_npu_mem_free(consumer, &out);
     rk_npu_mem_free(consumer, &imported);
     rk_npu_mem_free(producer, &base);
+    if (!memory_matches(producer_domain, 0, 1, 1)) return 1;
+    rk_npu_domain_memory_stats consumer_memory{};
+    if (rk_npu_iommu_domain_memory_stats(consumer_domain, &consumer_memory) != RK_NPU_OK ||
+        consumer_memory.live_bytes != 0 ||
+        consumer_memory.creates != consumer_memory.destroys) return 1;
     rk_npu_iommu_domain_free(consumer_domain);
     rk_npu_iommu_domain_free(producer_domain);
     rk_npu_close(consumer);

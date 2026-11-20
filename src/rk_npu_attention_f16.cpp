@@ -36,8 +36,10 @@ struct Matmul {
     }
 };
 
-void grow_buffer(rk_npu_iommu_domain* domain,Buffer& buffer,uint64_t bytes,uint32_t flags=RK_NPU_MEM_DATA_DEFAULT){
-    if(buffer.mem.size<bytes)buffer.ensure(domain,std::max(bytes,buffer.mem.size*2),flags);
+void grow_buffer(rk_npu_iommu_domain* domain,Buffer& buffer,uint64_t bytes,
+    uint32_t flags=RK_NPU_MEM_DATA_DEFAULT,bool reclaim_on_einval=true){
+    if(buffer.mem.size<bytes)
+        buffer.ensure(domain,std::max(bytes,buffer.mem.size*2),flags,reclaim_on_einval);
 }
 
 template<class AddTask>
@@ -158,7 +160,8 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
         if(stream_scores){
             try{
                 grow_buffer(d,wc_exponent,sizes.score_bytes,
-                    RK_NPU_MEM_NON_CONTIGUOUS | RK_NPU_MEM_IOMMU | RK_NPU_MEM_WRITE_COMBINE);
+                    RK_NPU_MEM_NON_CONTIGUOUS | RK_NPU_MEM_IOMMU | RK_NPU_MEM_WRITE_COMBINE,
+                    /*reclaim_on_einval=*/false);
             }catch(const Error&){
                 // The optional WC mapping can fail while the ordinary LUT path remains usable.
                 stream_scores=false;
@@ -419,7 +422,7 @@ double Graph::submit(int stage){
     RK_NPU_TRACE_EVENT("rknpu.detail", "attention.graph_submit", "stage", stage,
         "query_rows", rows, "physical_M", m, "compute_length", span, "tasks", submitted_tasks,
         "npu_mask", s.core_mask);
-    if(ioctl(domain->ctx->fd,IOCTL_SUBMIT,&s)<0)throw Error{RK_NPU_ERR_SUBMIT};
+    if(ioctl(domain->ctx->fd,IOCTL_SUBMIT,&s)<0)throw DeviceError{{RK_NPU_ERR_SUBMIT}};
     return s.hw_elapse_time/1000.;
 }
 void Graph::sync_scores(rk_npu_sync_dir direction){
@@ -980,14 +983,17 @@ void Workspace::geometry(Cache& cache,int rows,int start,rk_npu_attention_f16_ti
     // An earlier query into a preloaded cache still needs the causal mask.
     if(rows==1 && cfg.mask_mode==RK_NPU_ATTENTION_F16_CAUSAL && prefix==cache.length)
         graph_cfg.mask_mode=RK_NPU_ATTENTION_F16_NO_MASK;
-    auto a=Clock::now();cache.stage_tail(span,scratch);auto b=Clock::now();
-    { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.graph_prepare", "compute_length", span);
-    if(!graph || graph->rows!=rows || graph->span!=span || graph->cfg.mask_mode!=graph_cfg.mask_mode || graph->lut!=graph->can_lut(cache,bounds)){
-        try{auto next=std::make_unique<Graph>(lease.domain,graph_cfg,rows,span,cache,shape,graph.get(),bounds,scratch);graph.swap(next);}
-        catch(...){poisoned=true;graph.reset();throw;}
-    }else graph->bind(cache,bounds,scratch);
-    }
-    t.tail_stage_us=elapsed(a,b);t.prepare_us=elapsed(begin,a)+elapsed(b,Clock::now());t.compute_length=span;t.tasks=graph->tasks;
+    protect_device([&]{
+        auto a=Clock::now();cache.stage_tail(span,scratch);auto b=Clock::now();
+        { RK_NPU_TRACE_EVENT("rknpu.detail", "attention.graph_prepare", "compute_length", span);
+        if(!graph || graph->rows!=rows || graph->span!=span || graph->cfg.mask_mode!=graph_cfg.mask_mode || graph->lut!=graph->can_lut(cache,bounds)){
+            try{auto next=std::make_unique<Graph>(lease.domain,graph_cfg,rows,span,cache,shape,graph.get(),bounds,scratch);graph.swap(next);}
+            // A failed constructor may already have moved buffers out of the old graph.
+            catch(...){graph.reset();throw;}
+        }else graph->bind(cache,bounds,scratch);
+        }
+        t.tail_stage_us=elapsed(a,b);t.prepare_us=elapsed(begin,a)+elapsed(b,Clock::now());t.compute_length=span;t.tasks=graph->tasks;
+    });
 }
 rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,int rows,int start,void* output,
     const rk_npu_attention_f16_boolean_mask* mask,int tensor_rows,int tensor_offset,bool half_output){
@@ -1000,9 +1006,9 @@ rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,i
     validate_mask(cfg,mask,rows,cache.length);auto begin=Clock::now();rk_npu_attention_f16_timings t{};
     geometry(cache,rows,start,t,tensor_rows?start+tensor_rows-tensor_offset:0);auto prepared=Clock::now();
     const bool stable=cfg.flags==RK_NPU_ATTENTION_F16_STABLE_SOFTMAX;
-    if(!stable)graph->update_mask(start,mask,cache.length);auto masked=Clock::now();
-    graph->pack_q(query,tensor_rows,tensor_offset);auto packed=Clock::now();
-    try{
+    protect_device([&]{
+        if(!stable)graph->update_mask(start,mask,cache.length);auto masked=Clock::now();
+        graph->pack_q(query,tensor_rows,tensor_offset);auto packed=Clock::now();
         if(stable) {
             RK_NPU_TRACE_EVENT("rknpu.detail", "attention.qk_submit");
             t.hardware_us=graph->submit();
@@ -1015,12 +1021,13 @@ rk_npu_attention_f16_timings Workspace::run(Cache& cache,const uint16_t* query,i
             t.tasks=graph->process_scores(start,mask,cache.length);
             t.hardware_us+=graph->submit_pv(start);
         }
-    }catch(...){poisoned=true;throw;}
-    auto computed=Clock::now();
-    graph->sync_output();
-    auto synced=Clock::now();
-    graph->finish(output,tensor_rows,tensor_offset,half_output);auto done=Clock::now();t.mask_update_us=elapsed(prepared,masked);t.query_pack_us=elapsed(masked,packed);
-    t.submit_us=elapsed(packed,computed);t.output_sync_us=elapsed(computed,synced);t.finish_us=elapsed(synced,done);t.total_us=elapsed(begin,done);return t;
+        auto computed=Clock::now();graph->sync_output();auto synced=Clock::now();
+        graph->finish(output,tensor_rows,tensor_offset,half_output);auto done=Clock::now();
+        t.mask_update_us=elapsed(prepared,masked);t.query_pack_us=elapsed(masked,packed);
+        t.submit_us=elapsed(packed,computed);t.output_sync_us=elapsed(computed,synced);
+        t.finish_us=elapsed(synced,done);t.total_us=elapsed(begin,done);
+    });
+    return t;
 }
 
 int query_engine(const rk_npu_attention_f16_config& config,const Shape& shape,
