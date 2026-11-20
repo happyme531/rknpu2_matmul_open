@@ -43,7 +43,7 @@ void grow_buffer(rk_npu_iommu_domain* domain,Buffer& buffer,uint64_t bytes,uint3
 template<class AddTask>
 void emit_lut_tasks(const Graph& graph,int first,int heads,AddTask add){
     // A 2D LUT cube reduces task and graph preparation overhead for M128.
-    const int chunk=graph.m==128?65536:4096;
+    const int chunk=lut_chunk(graph.m);
     auto emit=[&](int hi,int at,int count,bool load,int kind){
         const size_t offset=(size_t(hi)*graph.m*graph.span+at)*2;
         Task task;
@@ -170,7 +170,7 @@ Graph::Graph(rk_npu_iommu_domain* d,const rk_npu_attention_f16_config& c,int qr,
     if(lut)active.resize(size_t(c.kv_heads)*m);
     grow_buffer(d,partial,sizes.partial_bytes);
     if(sizes.mask_bytes)grow_buffer(d,mask,sizes.mask_bytes);
-    const int workers=stream_scores ? 4 : 1;
+    const int workers=score_workers();
     sum.resize(size_t(workers)*m*(shape.value_dim+8));
     // CPU exp and causal LUT prefix sums share scratch. Retain its size across
     // graph changes so switching paths does not reinitialize unused elements.
@@ -451,7 +451,8 @@ static bool center_causal_m128(Graph& g, int start) {
         return vld1q_u16(probabilities);
     };
     int fallback = 0;
-#pragma omp parallel for num_threads(4) schedule(static) reduction(|:fallback)
+    const int workers = g.score_workers();
+#pragma omp parallel for if(workers>1) num_threads(workers) schedule(static) reduction(|:fallback)
     for (int hi = 0; hi < g.cfg.kv_heads; ++hi) {
         const uint16_t* head = g.score.data() + size_t(hi) * group_rows * g.span;
         uint16_t* dest = g.exponent->data() + size_t(hi)*group_rows*g.span;
@@ -930,8 +931,9 @@ void Graph::finish(void* output,int tensor_rows,int tensor_offset,bool half_outp
             }
         }
     };
-    if(stream_scores){
-#pragma omp parallel for num_threads(4) schedule(static)
+    const int workers=score_workers();
+    if(workers>1){
+#pragma omp parallel for num_threads(workers) schedule(static)
         for(int hi=0;hi<cfg.kv_heads;++hi)finish_head(hi,omp_get_thread_num());
     }else{
         for(int hi=0;hi<cfg.kv_heads;++hi)finish_head(hi,0);

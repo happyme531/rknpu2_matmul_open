@@ -57,10 +57,11 @@ inline uint32_t core_mask(const rk_npu_attention_f16_config& c){
     return selected;
 }
 inline float lut_value_limit(int kv_tile){return 32752.f/(kv_tile*1.001f);}
+inline int lut_chunk(int physical_rows){return physical_rows==128?65536:4096;}
 inline bool lut_tasks_fit(const rk_npu_attention_f16_config& cfg,int physical_rows,
     int span,int matmul_tasks,bool split){
     const uint64_t extra=uint64_t(cfg.kv_heads)*
-        ceil_div(uint64_t(physical_rows)*span,uint64_t(4096))+
+        ceil_div(uint64_t(physical_rows)*span,uint64_t(lut_chunk(physical_rows)))+
         (split?__builtin_popcount(core_mask(cfg)):0);
     return uint64_t(matmul_tasks)+extra<=4095;
 }
@@ -195,6 +196,7 @@ struct Graph {
     bool lut=false;
     bool lut_split=false;
     bool stream_scores=false, cpu_probabilities_ready=false;
+    int score_workers()const{return stream_scores?std::min(4,cfg.kv_heads):1;}
     uint32_t lut_flags=RKNPU_JOB_PC;
     std::vector<uint8_t> active;
     std::vector<float> sum;

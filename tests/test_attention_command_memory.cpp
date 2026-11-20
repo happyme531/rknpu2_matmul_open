@@ -58,6 +58,14 @@ void lut_geometry(rk_npu_iommu_domain& domain,const char* mode){
         require(values==uint64_t(graph.m)*span+setup*8,"LUT tiles must cover every score exactly once");
         visible(graph.regs);visible(graph.descriptors);
     }
+    constexpr int length=16384;
+    cfg.kv_heads=8;cfg.query_heads=32;cfg.kv_tile=1024;
+    cfg.initial_capacity=cfg.max_capacity=length;
+    rk_npu_attention_f16_sizes sizes{};
+    require(query_engine(cfg,gqa_shape(cfg),length,32,length,sizes)==RK_NPU_OK &&
+        sizes.physical_rows==128,"long M128 query geometry");
+    require(lut_tasks_fit(cfg,sizes.physical_rows,length,sizes.tasks,!std::strcmp(mode,"split")),
+        "long M128 LUT budget must count two-dimensional cubes");
 }
 }
 extern "C" int __wrap_rk_npu_mem_alloc(rk_npu_iommu_domain* d,uint64_t bytes,uint32_t flags,rk_npu_mem* out){
