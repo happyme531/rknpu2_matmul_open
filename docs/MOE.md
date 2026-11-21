@@ -87,9 +87,9 @@ rounding, FP32 scale vectors, other host containers and thread stacks.
 - `test_moe_w8` checks independent integer/float references, A/B/A weight
   rebinding, batch transitions, duplicates, zero input, nearest-even input,
   invalid arguments, domain mismatch, and fewer jobs than requested cores.
-- `test_moe_quant` also imports existing all-W4 cache records into mixed slot
-  banks, rotates routed slots and compares with independently packed mixed
-  weights at M1/5/128 and 1/2/3 NPU cores. It checks that the shared W8 entry
+- `test_moe_quant` imports certified W4 cache records into mixed slot banks,
+  rotates routed slots and compares with independently packed mixed weights at
+  M1/5/128 and 1/2/3 NPU cores. It checks that the shared W8 entry
   cannot be exported or overwritten as a routed slot. Batch results also match
   single-row controls at H2048, where gathering five rows exceeds one copy.
 - `test_moe_w8 --w4-wide` checks the H8128 boundary against an independent
@@ -108,9 +108,16 @@ The public `rk_npu_moe_w4_weights_create` and `rk_npu_moe_w4_workspace_create`
 entries keep routed weights in packed INT4 and the shared expert in INT8.
 They reuse the same run/free functions with compatible mixed handles and
 require H/I multiples of64, H<=8128, normal input and CPU middle.
+
+Native expert record v3 stores gate/up in its certified execution layout,
+either full K or K slices of at most 512. The low bits of the last down
+correction tag the layout and are masked out on import. Record sizes and
+page strides match v2. Rebuild v2 expert caches with the v3 writer before
+importing them.
+
 Each resident routed expert uses one gate/up K tile when H fits the native
 limit and its weights certify the full INT16 partial. Otherwise it uses
-certified K<=512 partials. Packed expert records retain their K512 layout.
+certified K<=512 partials.
 Shared gate/up and Down split N across the active
 cores and join the mixed command chains. Input quantization and CPU middle
 use the MoE nearest-even rule for both expert types. Shared and routed widths
@@ -123,11 +130,11 @@ and CPU/NPU request overlap are not implemented by this backend.
 
 `rk_npu_moe_w4_slots_create(domain, config, shared)` creates mutable routed W4
 slots plus one immutable shared W8 expert (`shared_expert=1`). It packs shared
-weights once and imports routed weights through the existing quantized cache
-API. Routed records retain blob version 2 and the same byte layout as an
-all-W4 bank; existing stores need no repacking. Only routed indices may be
-imported or exported. Every selected routed slot must be initialized before
-execution, and imports must occur between blocking runs.
+weights once and imports routed weights through the quantized cache API.
+Routed records use the same v3 format as all-W4 slot banks with matching
+geometry. Only routed indices may be imported or exported. Every selected
+routed slot must be initialized before execution, and imports must occur
+between blocking runs.
 
 The shared expert contributes once per input row with coefficient 1. A caller
 that expands one token into separate routed assignments must not attach shared

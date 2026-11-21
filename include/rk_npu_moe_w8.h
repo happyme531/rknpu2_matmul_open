@@ -4,7 +4,7 @@
  */
 #ifndef RK_NPU_MOE_W8_H
 #define RK_NPU_MOE_W8_H
-#define RK_NPU_MOE_QUANT_BLOB_VERSION 2u
+#define RK_NPU_MOE_QUANT_BLOB_VERSION 3u
 #include "rk_npu_common.h"
 #ifdef __cplusplus
 extern "C" {
@@ -87,11 +87,14 @@ void rk_npu_moe_w8_workspace_free(rk_npu_moe_w8_workspace* workspace);
  * CPU middle and normal input are required. */
 rk_npu_moe_w8_weights* rk_npu_moe_quant_weights_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_weight_config* config, const rk_npu_moe_w8_expert* experts);
+/* Same W4 geometry, with full-K gate/up certification during packing. */
+rk_npu_moe_w8_weights* rk_npu_moe_quant_weights_create_full_k(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* config, const rk_npu_moe_w8_expert* experts);
 rk_npu_moe_w8_workspace* rk_npu_moe_quant_workspace_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_config* config);
 
 /* Routed W4 plus optional shared W8, jointly scheduled on the active cores.
- * Resident routed gate/up uses full K when the native geometry and INT16
+ * Routed gate/up supports full K when the native geometry and INT16
  * weight bounds permit it, or certified K<=512 partials. Shared W8 uses full K.
  * The W4 geometry, CPU-middle and normal-input requirements above apply.
  * Shared and routed experts must have the same intermediate width.
@@ -112,8 +115,9 @@ rk_npu_moe_w8_weights* rk_npu_moe_w4_slots_create(rk_npu_iommu_domain* domain,
 /* Mutable physical slot bank for routed experts (shared_expert=0).
  * Every slot must be imported
  * before it is selected. Import only between blocking runs using that bank.
- * Packed records are native cache data for this kernel recipe, not checkpoint
- * tensors. Export/import preserve integer codes, FP32 scales and INT4 corrections.
+ * Packed records are trusted native cache data produced by the matching exporter.
+ * Each record stores gate/up in its execution layout and tags it as full K
+ * or sliced. Import copies that layout directly into the slot.
  * Larger buffers are allowed so a file store can page-align its record stride.
  * The caller owns logical expert -> physical slot mapping and slot lifetimes. */
 rk_npu_moe_w8_weights* rk_npu_moe_quant_slots_create(rk_npu_iommu_domain* domain,

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -265,10 +266,11 @@ int main() try {
         std::printf("W4 slot permutation checks passed\n");
     }
     require(rk_npu_moe_quant_import_expert(slots,0,blob.data(),bytes-1)==RK_NPU_ERR_PARAM,"reject short packed record");
-    check_staged_slots(domain,cfg,weights,work);
-    // Existing W4 cache records must remain usable when a resident shared W8
-    // expert is attached. Compare imports/permutations with independently
-    // packed mixed weights; the shared expert is never a replaceable slot.
+    auto* packed=rk_npu_moe_quant_weights_create_full_k(domain,&cfg.weights,experts.data());
+    require(packed,"prepare certified W4 records");
+    check_staged_slots(domain,cfg,packed,work);
+    // Certified W4 records can also be bound to a shared W8 expert.
+    // Compare imports/permutations with independently packed mixed weights.
     std::vector<int8_t> shared_gate(H*2*F),shared_down(F*H);
     std::vector<float> shared_gs(2*F,.0003f),shared_ds(H,.0004f);
     for(size_t i=0;i<shared_gate.size();++i)shared_gate[i]=int8_t(int((i*11+i/19)%255)-127);
@@ -293,9 +295,9 @@ int main() try {
         for(int rows:{1,5,128,1}) {
             for(int e=0;e<E;++e) {
                 const int slot=(e+rotation)%E;
-                require(!rk_npu_moe_quant_export_expert(weights,e,blob.data(),blob.size()),"export all-W4 routed record");
+                require(!rk_npu_moe_quant_export_expert(packed,e,blob.data(),blob.size()),"export certified W4 routed record");
                 require(!rk_npu_moe_quant_export_expert(mixed,e,roundtrip.data(),roundtrip.size()),"export resident mixed record");
-                require(blob==roundtrip,"resident gate packing changed the K512 record");
+                require(blob==roundtrip,"resident gate packing differs from prepared record");
                 require(!rk_npu_moe_quant_import_expert(mixed_slots,slot,blob.data(),blob.size()),"import mixed routed record");
                 require(!rk_npu_moe_quant_export_expert(mixed_slots,slot,roundtrip.data(),roundtrip.size()),"export mixed routed record");
                 require(blob==roundtrip,"mixed routed byte roundtrip");
@@ -327,9 +329,9 @@ int main() try {
             require(sync_bytes-bytes_before==expected_sync(sliced),"resident mixed gate synced inactive partials");
             bytes_before=sync_bytes.load();
             require(!rk_npu_moe_w8_run_f32(mixed_work,mixed_slots,rows,input.data(),physical.data(),routes.data(),actual.data(),&slot_timing),"run mixed slots");
-            require(sync_bytes-bytes_before==expected_sync(routed),"mixed slot gate synced inactive partials");
+            require(sync_bytes-bytes_before==expected_sync(sliced),"imported gate synced more partials than resident gate");
             require(actual==expected,"mixed slot replacement changed routed/shared output");
-            if(rows==1)require(slot_timing.gemm_tasks==resident_timing.gemm_tasks+3,"expert zero needs one resident gate task or four K512 slot tasks");
+            require(slot_timing.gemm_tasks==resident_timing.gemm_tasks,"import changed mixed GEMM task count");
             require(std::all_of(actual.begin(),actual.end(),[](float v){return std::isfinite(v);}),"nonfinite mixed zero-route output");
             if(rows>2)require(std::any_of(actual.begin()+2*H,actual.begin()+3*H,[](float v){return v!=0.f;}),"zero routed weights incorrectly skipped shared expert");
             for(int row:{0,rows/2,rows-1}) {
@@ -341,6 +343,16 @@ int main() try {
         }
         rk_npu_moe_w8_workspace_free(mixed_work);
     }
+    require(!rk_npu_moe_quant_export_expert(packed,0,blob.data(),blob.size()),"export record for version rejection");
+    // A v2 record ends in an untagged correction even if its buffer is padded.
+    int32_t correction;
+    std::memcpy(&correction,blob.data()+bytes-sizeof(correction),sizeof(correction));
+    correction&=~7;
+    std::memcpy(blob.data()+bytes-sizeof(correction),&correction,sizeof(correction));
+    const auto before=sync_calls.load();
+    require(rk_npu_moe_quant_import_expert(mixed_slots,0,blob.data(),blob.size())==RK_NPU_ERR_PARAM,"reject untagged v2 record");
+    require(sync_calls==before,"invalid record reached device sync");
+    rk_npu_moe_w8_weights_free(packed);
     rk_npu_moe_w8_weights_free(mixed_slots);rk_npu_moe_w8_weights_free(mixed);
     std::puts("Mixed W4/W8 cache import and shared-expert checks passed");
     rk_npu_moe_w8_workspace_free(slot_work);rk_npu_moe_w8_weights_free(slots);

@@ -375,6 +375,12 @@ static bool uses_w8(Mode mode,const rk_npu_moe_w8_weight_config& c) {
 static int gate_tile(Mode mode,int hidden) {
     return mode!=Mode::W8?std::min(hidden,512):hidden;
 }
+static bool can_use_full_gate(int hidden) {
+    return hidden>512 && hidden<=rknpu2_matmul_open::detail::I4_K_TILE_MAX;
+}
+// W4 corrections are multiples of eight. Use the low bits of the last down
+// correction to tag the record without adding a page to its aligned stride.
+constexpr int32_t record_tag_mask=7, record_sliced=1, record_full_k=2;
 static bool valid_w4(const rk_npu_moe_w8_weight_config& c) {
     return valid(c) && c.hidden%64==0 && c.intermediate%64==0 &&
         c.hidden<=rknpu2_matmul_open::detail::I4_N_TILE_MAX;
@@ -393,7 +399,7 @@ struct Weights {
     std::vector<std::vector<int32_t>> gcor,dcor;
     Weights(rk_npu_iommu_domain* domain,const rk_npu_moe_w8_weight_config& c,
             const rk_npu_moe_w8_expert* experts,Mode recipe=Mode::W8,
-            const rk_npu_moe_w8_expert* shared=nullptr):device(domain),config(c),mode(recipe) {
+            const rk_npu_moe_w8_expert* shared=nullptr,bool certify_full_k=false):device(domain),config(c),mode(recipe) {
         const int H=c.hidden,N=c.intermediate,count=c.routed_experts+c.shared_expert;
         std::vector<std::shared_ptr<Buffer>> gate_banks,down_banks;
         const bool w4=mode!=Mode::W8,has_w8=uses_w8(mode,c);
@@ -452,8 +458,7 @@ struct Weights {
             if(i4) {
                 rknpu2_matmul_open::detail::I4WeightBound bound;
                 auto& gate_k_tile=gate_tiles[e];
-                const bool try_full=mode==Mode::RoutedW4SharedW8 && H>gate_k_tile &&
-                    H<=rknpu2_matmul_open::detail::I4_K_TILE_MAX;
+                const bool try_full=(certify_full_k || mode==Mode::RoutedW4SharedW8) && can_use_full_gate(H);
                 check(rknpu2_matmul_open::detail::bound_i4_weights(H,2*N,x.gate_up,
                     try_full?H:gate_k_tile,bound,try_full?gate_k_tile:0));
                 gate_k_tile=bound.k_tile;
@@ -605,8 +610,8 @@ struct Workspace {
         const int tile=w4?64:(native?84:128);
         // Sliced experts occupy the same contiguous prefix in every extra K wave.
         size_t sliced_offset=0,single_offset=0,gate_tasks=0;
-        if(mode==Mode::RoutedW4SharedW8 && gate_tile(mode,H)<H)
-            for(int e=0;e<R;++e)
+        if(w4 && gate_tile(mode,H)<H && (mixed_chain || can_use_full_gate(H)))
+            for(int e=0;e<int(groups.size());++e)
                 if(weights.gate_tiles[e]<H)single_offset+=groups[e].size();
         for(int e=0;e<int(groups.size());++e) {
             const auto& group=groups[e];
@@ -894,6 +899,12 @@ extern "C" rk_npu_moe_w8_weights* rk_npu_moe_quant_weights_create(rk_npu_iommu_d
     if(!domain || !c || !experts || !rknpu2_matmul_open::moe::valid_w4(*c))return nullptr;
     try{return new rk_npu_moe_w8_weights(domain,*c,experts,rknpu2_matmul_open::moe::Mode::W4);}catch(...){return nullptr;}
 }
+extern "C" rk_npu_moe_w8_weights* rk_npu_moe_quant_weights_create_full_k(rk_npu_iommu_domain* domain,
+    const rk_npu_moe_w8_weight_config* c,const rk_npu_moe_w8_expert* experts) {
+    using namespace rknpu2_matmul_open::moe;
+    if(!domain || !c || !experts || !valid_w4(*c))return nullptr;
+    try{return new rk_npu_moe_w8_weights(domain,*c,experts,Mode::W4,nullptr,true);}catch(...){return nullptr;}
+}
 extern "C" rk_npu_moe_w8_workspace* rk_npu_moe_quant_workspace_create(rk_npu_iommu_domain* domain,
     const rk_npu_moe_w8_config* c) {
     if(!domain || !c || !rknpu2_matmul_open::moe::valid(*c) || !rknpu2_matmul_open::moe::valid_w4(c->weights) ||
@@ -918,24 +929,20 @@ extern "C" uint64_t rk_npu_moe_quant_expert_blob_bytes(const rk_npu_moe_w8_weigh
 }
 
 extern "C" int rk_npu_moe_quant_export_expert(const rk_npu_moe_w8_weights* w,int e,void* data,uint64_t bytes) {
+    using namespace rknpu2_matmul_open::moe;
     const uint64_t need=rk_npu_moe_quant_expert_blob_bytes(w);
     if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()) ||
-        !rknpu2_matmul_open::moe::expert_is_w4(w->mode,e,w->config.routed_experts))return RK_NPU_ERR_PARAM;
+        !expert_is_w4(w->mode,e,w->config.routed_experts))return RK_NPU_ERR_PARAM;
     auto* p=static_cast<uint8_t*>(data);
     auto put=[&](const void* src,size_t n){std::memcpy(p,src,n);p+=n;};
-    // Blob records always store K512 waves, including records from full-K banks.
-    const int h=w->config.hidden, tile=rknpu2_matmul_open::moe::gate_tile(w->mode,h);
-    if(w->gate_tiles[e]==tile)put(w->gw[e].vaddr,w->gw[e].size);
-    else {
-        const auto* gate=static_cast<const uint8_t*>(w->gw[e].vaddr);
-        for(int k=0;k<h;k+=tile)
-            for(int n=0;n<2*w->config.intermediate;n+=64)
-                put(gate+size_t(n/64)*h*32+size_t(k)*32,size_t(std::min(tile,h-k))*32);
-    }
+    put(w->gw[e].vaddr,w->gw[e].size);
     put(w->dw[e].vaddr,w->dw[e].size);
     put(w->gs[e].data(),w->gs[e].size()*4);put(w->ds[e].data(),w->ds[e].size()*4);
     put(w->gcor[e].data(),w->gcor[e].size()*4);
-    if(!w->dcor[e].empty())put(w->dcor[e].data(),w->dcor[e].size()*4);
+    put(w->dcor[e].data(),w->dcor[e].size()*4);
+    const int32_t tag=w->gate_tiles[e]>gate_tile(w->mode,w->config.hidden)?record_full_k:record_sliced;
+    const int32_t tagged=w->dcor[e].back()|tag;
+    std::memcpy(p-sizeof(tagged),&tagged,sizeof(tagged));
     return RK_NPU_OK;
 }
 
@@ -944,20 +951,26 @@ extern "C" int rk_npu_moe_quant_import_expert(rk_npu_moe_w8_weights* w,int e,con
 }
 extern "C" int rk_npu_moe_quant_import_expert_timed(rk_npu_moe_w8_weights* w,int e,const void* data,uint64_t bytes,
         rk_npu_moe_import_timings* timings) {
+    using namespace rknpu2_matmul_open::moe;
     const uint64_t need=rk_npu_moe_quant_expert_blob_bytes(w);
     if(!need || !data || bytes<need || e<0 || e>=int(w->gw.size()) ||
-        !rknpu2_matmul_open::moe::expert_is_w4(w->mode,e,w->config.routed_experts))return RK_NPU_ERR_PARAM;
-    using namespace rknpu2_matmul_open::moe;
+        !expert_is_w4(w->mode,e,w->config.routed_experts))return RK_NPU_ERR_PARAM;
     if(timings)*timings={};
     const auto begin=timings?Clock::now():Clock::time_point{};
     try {
         const auto* p=static_cast<const uint8_t*>(data);
+        int32_t tagged;
+        std::memcpy(&tagged,p+need-sizeof(tagged),sizeof(tagged));
+        const int32_t tag=tagged&record_tag_mask;
+        const int hidden=w->config.hidden;
+        if(tag!=record_sliced && !(tag==record_full_k && can_use_full_gate(hidden)))return RK_NPU_ERR_PARAM;
         auto get=[&](void* dst,size_t n){std::memcpy(dst,p,n);p+=n;};
         get(w->gw[e].vaddr,w->gw[e].size);get(w->dw[e].vaddr,w->dw[e].size);
-        w->gate_tiles[e]=gate_tile(w->mode,w->config.hidden);
+        w->gate_tiles[e]=tag==record_full_k?hidden:gate_tile(w->mode,hidden);
         get(w->gs[e].data(),w->gs[e].size()*4);get(w->ds[e].data(),w->ds[e].size()*4);
         get(w->gcor[e].data(),w->gcor[e].size()*4);
-        if(!w->dcor[e].empty())get(w->dcor[e].data(),w->dcor[e].size()*4);
+        get(w->dcor[e].data(),w->dcor[e].size()*4);
+        w->dcor[e].back()=tagged&~record_tag_mask;
         auto at=timings?Clock::now():Clock::time_point{};
         if(timings)timings->copy_us=std::chrono::duration<double,std::micro>(at-begin).count();
         for(const auto* v:{&w->gs[e],&w->ds[e]})for(float s:*v)if(!(s>0) || !std::isfinite(s))return RK_NPU_ERR_PARAM;
@@ -978,6 +991,7 @@ extern "C" int rk_npu_moe_quant_swap_slots(rk_npu_moe_w8_weights* a,int ai,rk_np
         a->device.ctx!=b->device.ctx || a->device.domain->id!=b->device.domain->id ||
         ai<0 || bi<0 || ai>=int(a->gw.size()) || bi>=int(b->gw.size()))return RK_NPU_ERR_PARAM;
     std::swap(a->gw[ai],b->gw[bi]);std::swap(a->dw[ai],b->dw[bi]);
+    std::swap(a->gate_tiles[ai],b->gate_tiles[bi]);
     std::swap(a->gs[ai],b->gs[bi]);std::swap(a->ds[ai],b->ds[bi]);
     std::swap(a->gcor[ai],b->gcor[bi]);std::swap(a->dcor[ai],b->dcor[bi]);
     std::swap(a->gate_owner[ai],b->gate_owner[bi]);std::swap(a->down_owner[ai],b->down_owner[bi]);
