@@ -23,16 +23,29 @@ int validate(const rk_npu_mla_f16_config& c){
         c.mask_mode!=RK_NPU_ATTENTION_F16_BOOLEAN_MASK))return RK_NPU_ERR_PARAM;
     return 0;
 }
+// Absorbed one-row decode is DRAM-bound: a single core streams the latent cache faster than
+// the head split and the outputs are bit-identical across masks, so the split only adds
+// synchronisation. Pick the lowest selected core rather than a fixed one, so an explicit
+// caller mask (0x2, 0x4) still chooses the core the caller asked for.
+//
+// Only this case changes. Expanded attention, absorbed prefill and the absorb/value
+// projections stay compute-bound and keep the caller mask: taking them to one core costs
+// 43-78% there, while paying nothing back.
+static uint32_t decode_core(uint32_t mask){
+    const uint32_t m=mask?mask:1u;
+    return m&(0u-m);
+}
 int group(const rk_npu_mla_f16_config& c,int rows=32){
     if(c.mode==RK_NPU_MLA_F16_ABSORBED && rows==1)
-        return ceil_div(H,__builtin_popcount(c.core_mask?c.core_mask:1));
+        return ceil_div(H,__builtin_popcount(decode_core(c.core_mask)));
     return c.mode==RK_NPU_MLA_F16_ABSORBED?(rows<=16?4:2):1;
 }
 rk_npu_attention_f16_config engine_config(const rk_npu_mla_f16_config& c,int rows=32){
-    const int groups=c.mode==RK_NPU_MLA_F16_ABSORBED && rows==1?
-        __builtin_popcount(c.core_mask?c.core_mask:1):H/group(c,rows);
+    const bool one_row=c.mode==RK_NPU_MLA_F16_ABSORBED && rows==1;
+    const uint32_t cores=one_row?decode_core(c.core_mask):c.core_mask;
+    const int groups=one_row?__builtin_popcount(cores):H/group(c,rows);
     return {H,groups,QK,c.max_query_rows,c.kv_tile,c.initial_capacity,c.max_capacity,
-        c.core_mask,c.timeout_ms,c.flags,c.exp_shift,c.mask_mode,0.f};
+        cores,c.timeout_ms,c.flags,c.exp_shift,c.mask_mode,0.f};
 }
 Shape engine_shape(const rk_npu_mla_f16_config& c,int rows=32){
     return {c.mode==RK_NPU_MLA_F16_ABSORBED?C+R:QK,

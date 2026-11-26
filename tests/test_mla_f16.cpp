@@ -51,8 +51,10 @@ void cpu(){
     c.mode=RK_NPU_MLA_F16_ABSORBED;check(rk_npu_mla_f16_query(&c,8192,5,4097,&s));
     require(s.compute_length==4128 && s.physical_rows==20 && s.key_bytes==8192ull*576*2 && s.value_bytes==8192ull*544*2,"shared latent shape");
     for(int mask:{0,1,2,3,4,7}){c.core_mask=mask;check(rk_npu_mla_f16_query(&c,8192,32,4096,&s));}
-    for(int mask:{1,3,7}){c.core_mask=mask;check(rk_npu_mla_f16_query(&c,8192,1,4096,&s));
-        require(s.physical_rows==(mask==1?16:mask==3?8:6),"decode head grouping");require(s.output_bytes==16*128*4,"logical output heads");}
+    // Absorbed one-row decode runs its attention on the lowest selected core, so the head
+    // grouping is the full H for every valid mask, explicit 0x2 and 0x4 included.
+    for(int mask:{1,2,3,4,7}){c.core_mask=mask;check(rk_npu_mla_f16_query(&c,8192,1,4096,&s));
+        require(s.physical_rows==16,"decode head grouping");require(s.output_bytes==16*128*4,"logical output heads");}
     for(int mask:{5,6,8}){c.core_mask=mask;require(rk_npu_mla_f16_query(&c,8192,1,4096,&s)==RK_NPU_ERR_PARAM,"invalid core");}
     c.core_mask=1;c.max_query_rows=33;require(rk_npu_mla_f16_query(&c,8192,1,4096,&s)==RK_NPU_ERR_PARAM,"row limit");
     c.mode=RK_NPU_MLA_F16_EXPANDED;c.max_query_rows=128;
